@@ -1,0 +1,17 @@
+# Vendored rusty-opus 1.0.2 (BSD-3-Clause, see COPYING).
+# Only change: the decoder no longer clamps float output to ±1.0 (matching libopus's
+# opus_decode_float), so loud masters keep their headroom for volume and EQ.
+[package]
+name = "rusty-opus"
+version = "1.0.2"
+edition = "2024"
+license = "BSD-3-Clause"
+publish = false
+
+[lib]
+name = "rusty_opus"
+path = "src/lib.rs"
+
+[features]
+profile = []
+research = []

@@ -1,0 +1,6 @@
+/target
+/dist
+/spikes
+/.claude/settings.local.json
+/.claude/worktrees
+/secrets.toml
