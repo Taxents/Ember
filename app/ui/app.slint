@@ -1,0 +1,1424 @@
+// The main window: sidebar, content, the docked right panel and the now-playing bar.
+
+import "fonts/Inter-Regular.ttf";
+import "fonts/Inter-Medium.ttf";
+import "fonts/Inter-SemiBold.ttf";
+import "fonts/Inter-Bold.ttf";
+import "fonts/Inter-ExtraBold.ttf";
+import { ListView } from "std-widgets.slint";
+import { Theme, Icon, IconButton, ValueBar, PillButton, Art } from "widgets.slint";
+
+export { Theme }
+
+export enum PageKind {
+    search,
+    home,
+    explore,
+    radio,
+    history,
+    artists,
+    albums,
+    songs,
+    all-playlists,
+    liked,
+    playlist,
+}
+
+export struct SidebarPlaylist {
+    id: string,
+    title: string,
+    cover: image,
+}
+
+export struct TrackRow {
+    title: string,
+    artist: string,
+    album: string,
+    duration: string,
+    plays: string,
+    art: image,
+    explicit: bool,
+    current: bool,
+    unavailable: bool,
+    // The line after the last track ("237 tracks, 6+ hours"); only `title` is used.
+    is-footer: bool,
+}
+
+export struct NowPlaying {
+    active: bool,
+    title: string,
+    artist: string,
+    art: image,
+    duration-ms: int,
+    position-ms: int,
+    playing: bool,
+    loading: bool,
+    liked: bool,
+}
+
+export struct PageState {
+    kind: PageKind,
+    id: string,
+    title: string,
+    subtitle: string,
+    loading: bool,
+    error: string,
+    playable: bool,
+}
+
+// Everything the Rust side reads and drives.
+export global Ui {
+    // Navigation
+    in property <PageState> page;
+    in property <bool> can-back;
+    in property <bool> can-forward;
+    callback navigate(PageKind, string, string);
+    callback back();
+    callback forward();
+    callback search(string);
+
+    // Account
+    in property <bool> signed-in;
+    in property <bool> signing-in;
+    in property <string> account-name;
+    in property <image> account-photo;
+    in property <[SidebarPlaylist]> playlists;
+    callback sign-in();
+    callback sign-out();
+
+    // The current page's tracks (until the real pages arrive)
+    in property <[TrackRow]> tracks;
+    callback play-tracks(int); // index, or -1 to shuffle all
+    callback near-end();
+    callback row-shown(int, int); // list (0 page, 1 queue), index: load its artwork
+
+    // Now playing
+    in property <NowPlaying> np;
+    in property <bool> shuffle;
+    in property <int> repeat; // 0 off, 1 all, 2 one
+    in-out property <float> volume: 1.0;
+    callback play-pause();
+    callback next();
+    callback previous();
+    callback seek(int);
+    callback set-volume(float);
+    callback toggle-shuffle();
+    callback cycle-repeat();
+    callback toggle-like();
+
+    // Right panel
+    in-out property <bool> panel-open;
+    in-out property <int> panel-tab; // 0 lyrics, 1 queue
+    callback panel-changed();
+    in property <[TrackRow]> queue;
+    in property <int> queue-current;
+    callback queue-jump(int);
+    callback queue-remove(int);
+    callback queue-move(int, int);
+
+    // Equalizer
+    in-out property <bool> eq-open;
+    in property <bool> eq-enabled;
+    in property <[float]> eq-gains: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    in property <string> eq-preset;
+    callback eq-toggle();
+    callback eq-set(int, float);
+    callback eq-choose(string);
+
+    in-out property <bool> sidebar-collapsed;
+    callback sidebar-changed();
+}
+
+global Fmt {
+    public pure function time(ms: int) -> string {
+        return floor(ms / 60000) + ":" + (mod(floor(ms / 1000), 60) < 10 ? "0" : "") + mod(floor(ms / 1000), 60);
+    }
+}
+
+// ---- sidebar --------------------------------------------------------------------------------
+
+component SideRow inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> selected;
+    in property <bool> collapsed;
+    in property <bool> has-cover;
+    in property <image> cover;
+    callback clicked();
+    height: 30px;
+    border-radius: 6px;
+    background: selected ? Theme.smoke : ta.has-hover ? Theme.smoke.with-alpha(0.45) : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 8px;
+        spacing: 10px;
+        if root.has-cover: Rectangle {
+            width: 18px;
+            Art {
+                width: 18px;
+                height: 18px;
+                radius: 3px;
+                source: root.cover;
+            }
+        }
+        if !root.has-cover: Rectangle {
+            width: 18px;
+            Icon {
+                name: root.icon;
+                width: 17px;
+                height: 17px;
+                color: Theme.amber;
+            }
+        }
+        if !root.collapsed: Text {
+            text: root.label;
+            color: Theme.ivory;
+            font-size: 13px;
+            font-weight: root.selected ? 600 : 450;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+component SectionHeader inherits Rectangle {
+    in property <string> text;
+    in property <bool> collapsible;
+    in-out property <bool> open: true;
+    height: 26px;
+    TouchArea {
+        enabled: root.collapsible;
+        mouse-cursor: root.collapsible ? pointer : default;
+        clicked => {
+            root.open = !root.open;
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-top: 8px;
+        spacing: 4px;
+        Text {
+            text: root.text;
+            color: Theme.beige;
+            font-size: 11px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+
+        if root.collapsible: Rectangle {
+            width: 12px;
+            Icon {
+                name: root.open ? "chevron-down" : "chevron-right";
+                width: 11px;
+                height: 11px;
+                color: Theme.beige;
+            }
+        }
+        Rectangle { }
+    }
+}
+
+component SearchField inherits Rectangle {
+    in property <bool> collapsed;
+    callback accepted(string);
+    out property <bool> has-focus: input.has-focus;
+    public function focus-input() {
+        input.focus();
+    }
+    height: 30px;
+    border-radius: 8px;
+    background: input.has-focus ? Theme.smoke : Theme.smoke.with-alpha(0.6);
+    border-width: input.has-focus ? 1px : 0;
+    border-color: Theme.amber.with-alpha(0.6);
+    TouchArea {
+        mouse-cursor: text;
+        clicked => {
+            input.focus();
+        }
+    }
+
+    Rectangle {
+        x: 9px;
+        width: 15px;
+        Icon {
+            name: "search";
+            width: 15px;
+            height: 15px;
+            color: Theme.beige;
+        }
+    }
+
+    if !root.collapsed && input.text == "": Text {
+        x: 32px;
+        text: "Search";
+        color: Theme.dim;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+    input := TextInput {
+        x: 32px;
+        width: parent.width - 40px;
+        visible: !root.collapsed;
+        color: Theme.ivory;
+        selection-background-color: Theme.oxide;
+        font-size: 13px;
+        vertical-alignment: center;
+        single-line: true;
+        accepted => {
+            if (self.text != "") {
+                root.accepted(self.text);
+            }
+        }
+    }
+}
+
+component Sidebar inherits Rectangle {
+    in property <bool> collapsed;
+    in-out property <bool> playlists-open: true;
+    public function focus-search() {
+        search.focus-input();
+    }
+    background: Theme.sidebar;
+    Rectangle {
+        x: parent.width - 1px;
+        width: 1px;
+        background: Theme.smoke;
+    }
+
+    VerticalLayout {
+        padding: 10px;
+        padding-top: 12px;
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: 6px;
+            height: 30px;
+            search := SearchField {
+                visible: !root.collapsed;
+                max-width: root.collapsed ? 0px : 1000px;
+                collapsed: root.collapsed;
+                accepted(q) => {
+                    Ui.search(q);
+                }
+            }
+            IconButton {
+                icon: "sidebar";
+                size: 30px;
+                icon-size: 16px;
+                clicked => {
+                    Ui.sidebar-collapsed = !Ui.sidebar-collapsed;
+                    Ui.sidebar-changed();
+                }
+            }
+        }
+
+        Rectangle {
+            height: 8px;
+        }
+
+        SideRow {
+            icon: "home";
+            label: "Home";
+            collapsed: root.collapsed;
+            selected: Ui.page.kind == PageKind.home;
+            clicked => {
+                Ui.navigate(PageKind.home, "", "Home");
+            }
+        }
+
+        SideRow {
+            icon: "explore";
+            label: "Explore";
+            collapsed: root.collapsed;
+            selected: Ui.page.kind == PageKind.explore;
+            clicked => {
+                Ui.navigate(PageKind.explore, "", "Explore");
+            }
+        }
+
+        SideRow {
+            icon: "radio";
+            label: "Radio";
+            collapsed: root.collapsed;
+            selected: Ui.page.kind == PageKind.radio;
+            clicked => {
+                Ui.navigate(PageKind.radio, "", "Radio");
+            }
+        }
+
+        if !root.collapsed: SectionHeader {
+            text: "Library";
+        }
+        if root.collapsed: Rectangle {
+            height: 12px;
+        }
+        SideRow {
+            icon: "history";
+            label: "Recently played";
+            collapsed: root.collapsed;
+            selected: Ui.page.kind == PageKind.history;
+            clicked => {
+                Ui.navigate(PageKind.history, "", "Recently played");
+            }
+        }
+
+        SideRow {
+            icon: "artist";
+            label: "Artists";
+            collapsed: root.collapsed;
+            selected: Ui.page.kind == PageKind.artists;
+            clicked => {
+                Ui.navigate(PageKind.artists, "", "Artists");
+            }
+        }
+
+        SideRow {
+            icon: "album";
+            label: "Albums";
+            collapsed: root.collapsed;
+            selected: Ui.page.kind == PageKind.albums;
+            clicked => {
+                Ui.navigate(PageKind.albums, "", "Albums");
+            }
+        }
+
+        SideRow {
+            icon: "song";
+            label: "Songs";
+            collapsed: root.collapsed;
+            selected: Ui.page.kind == PageKind.songs;
+            clicked => {
+                Ui.navigate(PageKind.songs, "", "Songs");
+            }
+        }
+
+        if !root.collapsed: SectionHeader {
+            text: "Playlists";
+            collapsible: true;
+            open <=> root.playlists-open;
+        }
+        if root.collapsed: Rectangle {
+            height: 12px;
+        }
+        Flickable {
+            vertical-stretch: 1;
+            content-height: list.preferred-height;
+            list := VerticalLayout {
+                alignment: start;
+                spacing: 2px;
+                if root.playlists-open || root.collapsed: SideRow {
+                    icon: "grid";
+                    label: "All playlists";
+                    collapsed: root.collapsed;
+                    selected: Ui.page.kind == PageKind.all-playlists;
+                    clicked => {
+                        Ui.navigate(PageKind.all-playlists, "", "All playlists");
+                    }
+                }
+                if root.playlists-open || root.collapsed: SideRow {
+                    icon: "heart";
+                    label: "Liked songs";
+                    collapsed: root.collapsed;
+                    selected: Ui.page.kind == PageKind.liked;
+                    clicked => {
+                        Ui.navigate(PageKind.liked, "LM", "Liked songs");
+                    }
+                }
+                if root.playlists-open && !root.collapsed: VerticalLayout {
+                    spacing: 2px;
+                    for p in Ui.playlists: SideRow {
+                        has-cover: true;
+                        cover: p.cover;
+                        label: p.title;
+                        selected: Ui.page.kind == PageKind.playlist && Ui.page.id == p.id;
+                        clicked => {
+                            Ui.navigate(PageKind.playlist, p.id, p.title);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Account
+        Rectangle {
+            height: 1px;
+            background: Theme.smoke;
+        }
+
+        Rectangle {
+            height: 48px;
+            border-radius: 8px;
+            background: acct.has-hover ? Theme.hover : transparent;
+            acct := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    if (Ui.signed-in) {
+                        menu.show();
+                    } else if (!Ui.signing-in) {
+                        Ui.sign-in();
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                padding-left: 6px;
+                spacing: 10px;
+                Rectangle {
+                    width: 28px;
+                    Rectangle {
+                        width: 28px;
+                        height: 28px;
+                        border-radius: 14px;
+                        clip: true;
+                        background: Theme.smoke;
+                        Icon {
+                            name: "user";
+                            width: 16px;
+                            height: 16px;
+                            color: Theme.beige;
+                        }
+
+                        Image {
+                            width: 28px;
+                            height: 28px;
+                            source: Ui.account-photo;
+                            image-fit: cover;
+                        }
+                    }
+                }
+
+                if !root.collapsed: Text {
+                    text: Ui.signed-in ? Ui.account-name : Ui.signing-in ? "Signing in…" : "Sign in";
+                    color: Ui.signed-in ? Theme.ivory : Theme.amber;
+                    font-size: 13px;
+                    font-weight: 550;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+
+            menu := PopupWindow {
+                x: 0;
+                y: -44px;
+                width: 180px;
+                height: 40px;
+                Rectangle {
+                    border-radius: 8px;
+                    background: Theme.panel;
+                    border-width: 1px;
+                    border-color: Theme.smoke;
+                    drop-shadow-blur: 16px;
+                    drop-shadow-color: #00000080;
+                    so := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            Ui.sign-out();
+                        }
+                    }
+
+                    Text {
+                        x: 14px;
+                        text: "Sign out";
+                        color: so.has-hover ? Theme.amber : Theme.ivory;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- content --------------------------------------------------------------------------------
+
+component TrackListRow inherits Rectangle {
+    in property <TrackRow> track;
+    in property <int> index;
+    callback activated();
+    height: root.track.is-footer ? 44px : 52px;
+    border-radius: 6px;
+    background: root.track.is-footer ? transparent : root.track.current ? Theme.oxide.with-alpha(0.55) : ta.has-hover ? Theme.hover : transparent;
+    opacity: root.track.unavailable ? 0.45 : 1;
+    if root.track.is-footer: Text {
+        x: 52px;
+        text: root.track.title;
+        color: Theme.beige;
+        font-size: 12px;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        enabled: !root.track.is-footer;
+        double-clicked => {
+            root.activated();
+        }
+    }
+
+    // Title and album share what the fixed columns leave, 3:2, set outright so every row
+    // splits the same way whatever its text.
+    property <length> flex: max(0px, root.width - 10px - 14px - 28px - 38px - 84px - 44px - 5 * 14px);
+    HorizontalLayout {
+        visible: !root.track.is-footer;
+        padding-left: 10px;
+        padding-right: 14px;
+        spacing: 14px;
+        Rectangle {
+            width: 28px;
+            Text {
+                text: root.index + 1;
+                color: root.track.current ? Theme.amber : Theme.beige;
+                font-size: 12px;
+                horizontal-alignment: right;
+                width: 100%;
+            }
+        }
+
+        Rectangle {
+            width: 38px;
+            Art {
+                width: 38px;
+                height: 38px;
+                source: root.track.art;
+            }
+
+            if ta.has-hover: Rectangle {
+                width: 38px;
+                height: 38px;
+                border-radius: 4px;
+                background: #00000080;
+                Icon {
+                    name: "play";
+                    width: 16px;
+                    height: 16px;
+                    color: Theme.ivory;
+                }
+
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.activated();
+                    }
+                }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            width: root.flex * 0.6;
+            Text {
+                text: root.track.title;
+                color: root.track.current ? Theme.amber : Theme.ivory;
+                font-size: 13px;
+                font-weight: 550;
+                overflow: elide;
+            }
+
+            Text {
+                text: (root.track.explicit ? "🅴 " : "") + root.track.artist;
+                color: Theme.beige;
+                font-size: 12px;
+                overflow: elide;
+            }
+        }
+
+        // Album, left-aligned so the column reads as a straight edge.
+        Rectangle {
+            width: root.flex * 0.4;
+            Text {
+                x: 0;
+                width: parent.width;
+                text: root.track.album;
+                color: Theme.beige;
+                font-size: 12px;
+                horizontal-alignment: left;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        Text {
+            width: 84px;
+            text: root.track.plays;
+            color: Theme.beige;
+            font-size: 12px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+
+        Text {
+            width: 44px;
+            text: root.track.duration;
+            color: Theme.beige;
+            font-size: 12px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Stand-in for the real pages (build step 4): a heading and, where the page has them, its tracks.
+component PlaceholderPage inherits Rectangle {
+    VerticalLayout {
+        padding-left: 32px;
+        padding-right: 24px;
+        padding-top: 8px;
+        spacing: 6px;
+        Text {
+            text: Ui.page.title;
+            color: Theme.ivory;
+            font-size: 34px;
+            font-weight: 800;
+            overflow: elide;
+        }
+
+        Text {
+            text: Ui.page.loading ? "Loading…" : Ui.page.error != "" ? Ui.page.error : Ui.page.subtitle;
+            color: Ui.page.error != "" ? Theme.amber : Theme.beige;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+
+        if Ui.page.playable && Ui.tracks.length > 0: HorizontalLayout {
+            padding-top: 10px;
+            padding-bottom: 8px;
+            spacing: 10px;
+            alignment: start;
+            PillButton {
+                text: "Play";
+                icon: "play";
+                clicked => {
+                    Ui.play-tracks(0);
+                }
+            }
+
+            PillButton {
+                text: "Shuffle";
+                icon: "shuffle";
+                primary: false;
+                clicked => {
+                    Ui.play-tracks(-1);
+                }
+            }
+        }
+
+        if Ui.tracks.length > 0: ListView {
+            vertical-stretch: 1;
+            for row[i] in Ui.tracks: TrackListRow {
+                track: row;
+                index: i;
+                activated => {
+                    Ui.play-tracks(i);
+                }
+                init => {
+                    Ui.row-shown(0, i);
+                    if (i >= Ui.tracks.length - 20) {
+                        Ui.near-end();
+                    }
+                }
+                changed index => {
+                    Ui.row-shown(0, self.index);
+                }
+            }
+        }
+        if Ui.tracks.length == 0: Rectangle {
+            vertical-stretch: 1;
+        }
+    }
+}
+
+component TopBar inherits Rectangle {
+    height: 52px;
+    HorizontalLayout {
+        padding-left: 24px;
+        padding-right: 16px;
+        spacing: 4px;
+        alignment: start;
+        Rectangle {
+            width: 32px;
+            IconButton {
+                icon: "back";
+                enabled: Ui.can-back;
+                clicked => {
+                    Ui.back();
+                }
+            }
+        }
+
+        Rectangle {
+            width: 32px;
+            IconButton {
+                icon: "forward";
+                enabled: Ui.can-forward;
+                clicked => {
+                    Ui.forward();
+                }
+            }
+        }
+    }
+}
+
+// ---- right panel ----------------------------------------------------------------------------
+
+component QueueRow inherits Rectangle {
+    in property <TrackRow> track;
+    in property <int> index;
+    in property <length> row-height;
+    in-out property <int> drop-target;
+    height: row-height;
+    border-radius: 6px;
+    background: root.track.current ? Theme.oxide.with-alpha(0.55) : ta.has-hover ? Theme.hover : transparent;
+    opacity: ta.pressed && abs(ta.mouse-y - ta.pressed-y) > 4px ? 0.5 : 1;
+    // Drop indicator above this root.track.
+    if root.drop-target == root.index: Rectangle {
+        y: 0;
+        height: 2px;
+        background: Theme.amber;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        double-clicked => {
+            Ui.queue-jump(root.index);
+        }
+        moved => {
+            if (self.pressed && abs(self.mouse-y - self.pressed-y) > 4px) {
+                root.drop-target = max(0, min(Ui.queue.length, root.index + round((self.mouse-y - self.pressed-y) / root.row-height + (self.mouse-y > self.pressed-y ? 0.5 : -0.5) + (self.mouse-y > self.pressed-y ? 0.5 : 0))));
+            }
+        }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.up) {
+                if (root.drop-target >= 0) {
+                    // Dropping above row t moves the item to t (or t-1 when moving down).
+                    Ui.queue-move(root.index, root.drop-target > root.index ? root.drop-target - 1 : root.drop-target);
+                }
+                root.drop-target = -1;
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 6px;
+        spacing: 10px;
+        Rectangle {
+            width: 36px;
+            Art {
+                width: 36px;
+                height: 36px;
+                source: root.track.art;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.track.title;
+                color: root.track.current ? Theme.amber : Theme.ivory;
+                font-size: 13px;
+                font-weight: 550;
+                overflow: elide;
+            }
+
+            Text {
+                text: root.track.artist;
+                color: Theme.beige;
+                font-size: 12px;
+                overflow: elide;
+            }
+        }
+
+        if ta.has-hover && !root.track.current: Rectangle {
+            width: 26px;
+            IconButton {
+                icon: "close";
+                size: 26px;
+                icon-size: 14px;
+                clicked => {
+                    Ui.queue-remove(root.index);
+                }
+            }
+        }
+        if !ta.has-hover || root.track.current: Text {
+            text: root.track.duration;
+            color: Theme.beige;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component RightPanel inherits Rectangle {
+    property <int> drop-target: -1;
+    background: Theme.panel;
+    Rectangle {
+        x: 0;
+        width: 1px;
+        background: Theme.smoke;
+    }
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 10px;
+        // Segmented switch: Lyrics · Queue
+        Rectangle {
+            height: 30px;
+            border-radius: 8px;
+            background: Theme.smoke.with-alpha(0.6);
+            HorizontalLayout {
+                padding: 2px;
+                for label[i] in ["Lyrics", "Queue"]: Rectangle {
+                    border-radius: 6px;
+                    background: Ui.panel-tab == i ? Theme.smoke : transparent;
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            Ui.panel-tab = i;
+                            Ui.panel-changed();
+                        }
+                    }
+
+                    Text {
+                        text: label;
+                        color: Ui.panel-tab == i ? Theme.ivory : Theme.beige;
+                        font-size: 12px;
+                        font-weight: 600;
+                    }
+                }
+            }
+        }
+
+        if Ui.panel-tab == 0: Rectangle {
+            vertical-stretch: 1;
+            Text {
+                text: "Lyrics arrive in a later build.";
+                color: Theme.beige;
+                font-size: 13px;
+            }
+        }
+        if Ui.panel-tab == 1 && Ui.queue.length == 0: Rectangle {
+            vertical-stretch: 1;
+            Text {
+                text: "Nothing queued.";
+                color: Theme.beige;
+                font-size: 13px;
+            }
+        }
+        if Ui.panel-tab == 1 && Ui.queue.length > 0: ListView {
+            vertical-stretch: 1;
+            for row[i] in Ui.queue: QueueRow {
+                track: row;
+                index: i;
+                row-height: 50px;
+                drop-target <=> root.drop-target;
+                init => {
+                    Ui.row-shown(1, i);
+                }
+                changed index => {
+                    Ui.row-shown(1, self.index);
+                }
+            }
+        }
+    }
+}
+
+// ---- equalizer ------------------------------------------------------------------------------
+
+component EqBand inherits Rectangle {
+    in property <float> gain; // dB, -12..12
+    in property <string> label;
+    callback changed(float);
+    width: 30px;
+    property <length> track: self.height - 24px;
+    property <float> shown: ta.pressed ? max(-12, min(12, round((0.5 - ta.mouse-y / track) * 24 * 2) / 2)) : gain;
+    Rectangle {
+        y: 0;
+        x: (parent.width - 4px) / 2;
+        width: 4px;
+        height: track;
+        border-radius: 2px;
+        background: Theme.smoke;
+    }
+
+    // Fill from the 0 dB line.
+    Rectangle {
+        x: (parent.width - 4px) / 2;
+        width: 4px;
+        y: shown >= 0 ? track / 2 - track * shown / 24 : track / 2;
+        height: abs(track * shown / 24);
+        background: Theme.amber;
+    }
+
+    Rectangle {
+        x: (parent.width - 14px) / 2;
+        y: track / 2 - track * shown / 24 - 7px;
+        width: 14px;
+        height: 14px;
+        border-radius: 7px;
+        background: Theme.ivory;
+        drop-shadow-blur: 6px;
+        drop-shadow-color: #E9A15F80;
+    }
+
+    Text {
+        y: track + 8px;
+        text: root.label;
+        color: Theme.beige;
+        font-size: 10px;
+        horizontal-alignment: center;
+        width: 100%;
+    }
+
+    ta := TouchArea {
+        height: track;
+        y: 0;
+        mouse-cursor: pointer;
+        moved => {
+            if (self.pressed) {
+                root.changed(root.shown);
+            }
+        }
+        double-clicked => {
+            root.changed(0);
+        }
+    }
+}
+
+component EqPanel inherits Rectangle {
+    width: 420px;
+    height: 290px;
+    border-radius: 12px;
+    background: Theme.panel;
+    border-width: 1px;
+    border-color: Theme.smoke;
+    drop-shadow-blur: 30px;
+    drop-shadow-color: #000000a0;
+    TouchArea { } // keeps clicks inside from closing the panel
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Equalizer";
+                color: Theme.ivory;
+                font-size: 15px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+
+            Rectangle { }
+
+            // On/off switch
+            Rectangle {
+                width: 38px;
+                height: 22px;
+                y: 2px;
+                border-radius: 11px;
+                background: Ui.eq-enabled ? Theme.amber : Theme.smoke;
+                Rectangle {
+                    x: Ui.eq-enabled ? parent.width - 20px : 2px;
+                    width: 18px;
+                    height: 18px;
+                    border-radius: 9px;
+                    background: Ui.eq-enabled ? Theme.carbon : Theme.beige;
+                    animate x { duration: 150ms; }
+                }
+
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        Ui.eq-toggle();
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            for p in ["Flat", "Bass", "Vocal", "Treble"]: Rectangle {
+                height: 24px;
+                border-radius: 12px;
+                width: t.preferred-width + 20px;
+                background: Ui.eq-preset == p ? Theme.oxide : pt.has-hover ? Theme.smoke : Theme.smoke.with-alpha(0.5);
+                pt := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        Ui.eq-choose(p);
+                    }
+                }
+
+                t := Text {
+                    text: p;
+                    color: Theme.ivory;
+                    font-size: 12px;
+                }
+            }
+            Rectangle { }
+        }
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+            spacing: 8px;
+            opacity: Ui.eq-enabled ? 1 : 0.45;
+            for label[i] in ["32", "64", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]: EqBand {
+                label: label;
+                gain: Ui.eq-gains[i];
+                changed(g) => {
+                    Ui.eq-set(i, g);
+                }
+            }
+        }
+    }
+}
+
+// ---- now-playing bar ------------------------------------------------------------------------
+
+component NowPlayingBar inherits Rectangle {
+    height: 80px;
+    background: Theme.bar;
+    property <float> progress: Ui.np.duration-ms > 0 ? Ui.np.position-ms / Ui.np.duration-ms : 0;
+
+    // Progress along the top edge.
+    seek := ValueBar {
+        y: -8px;
+        height: 16px;
+        thickness: 3px;
+        knob: Ui.np.active;
+        value: progress;
+        released(v) => {
+            if (Ui.np.duration-ms > 0) {
+                Ui.seek(v * Ui.np.duration-ms);
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        padding-top: 8px;
+        spacing: 12px;
+
+        // Left: artwork and titles
+        HorizontalLayout {
+            horizontal-stretch: 1;
+            spacing: 12px;
+            min-width: 200px;
+            Rectangle {
+                width: 52px;
+                Art {
+                    width: 52px;
+                    height: 52px;
+                    radius: 6px;
+                    source: Ui.np.art;
+                    drop-shadow-blur: 12px;
+                    drop-shadow-color: #00000080;
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                Text {
+                    text: Ui.np.active ? Ui.np.title : "Not playing";
+                    color: Ui.np.active ? Theme.ivory : Theme.beige;
+                    font-size: 13px;
+                    font-weight: 600;
+                    overflow: elide;
+                }
+
+                Text {
+                    text: Ui.np.artist;
+                    color: Theme.beige;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+            }
+        }
+
+        // Centre: transport
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            HorizontalLayout {
+                alignment: center;
+                spacing: 10px;
+                Rectangle {
+                    width: 32px;
+                    IconButton {
+                        icon: "shuffle";
+                        active: Ui.shuffle;
+                        icon-size: 17px;
+                        clicked => {
+                            Ui.toggle-shuffle();
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 36px;
+                    IconButton {
+                        icon: "previous";
+                        size: 36px;
+                        icon-size: 18px;
+                        enabled: Ui.np.active;
+                        clicked => {
+                            Ui.previous();
+                        }
+                    }
+                }
+
+                // Play/pause: the lit control
+                Rectangle {
+                    width: 42px;
+                    height: 42px;
+                    y: 0;
+                    border-radius: 21px;
+                    background: pp.pressed ? Theme.amber.darker(0.15) : pp.has-hover ? Theme.amber.brighter(0.08) : Theme.amber;
+                    drop-shadow-blur: 18px;
+                    drop-shadow-color: #E9A15F66;
+                    pp := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            Ui.play-pause();
+                        }
+                    }
+
+                    Icon {
+                        name: Ui.np.playing ? "pause" : "play";
+                        width: 18px;
+                        height: 18px;
+                        x: Ui.np.playing ? 12px : 13px;
+                        color: Theme.carbon;
+                    }
+                }
+
+                Rectangle {
+                    width: 36px;
+                    IconButton {
+                        icon: "next";
+                        size: 36px;
+                        icon-size: 18px;
+                        enabled: Ui.np.active;
+                        clicked => {
+                            Ui.next();
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 32px;
+                    IconButton {
+                        icon: Ui.repeat == 2 ? "repeat-one" : "repeat";
+                        active: Ui.repeat != 0;
+                        icon-size: 17px;
+                        clicked => {
+                            Ui.cycle-repeat();
+                        }
+                    }
+                }
+            }
+
+            Text {
+                text: Ui.np.active ? Fmt.time(seek.dragging ? seek.drag-value * Ui.np.duration-ms : Ui.np.position-ms) + "  /  " + Fmt.time(Ui.np.duration-ms) : "";
+                color: Theme.beige;
+                font-size: 11px;
+                horizontal-alignment: center;
+            }
+        }
+
+        // Right: like, panels, volume
+        HorizontalLayout {
+            horizontal-stretch: 1;
+            alignment: end;
+            spacing: 4px;
+            min-width: 200px;
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    icon: Ui.np.liked ? "heart-filled" : "heart";
+                    active: Ui.np.liked;
+                    enabled: Ui.np.active && Ui.signed-in;
+                    clicked => {
+                        Ui.toggle-like();
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    icon: "lyrics";
+                    active: Ui.panel-open && Ui.panel-tab == 0;
+                    clicked => {
+                        if (Ui.panel-open && Ui.panel-tab == 0) {
+                            Ui.panel-open = false;
+                        } else {
+                            Ui.panel-open = true;
+                            Ui.panel-tab = 0;
+                        }
+                        Ui.panel-changed();
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    icon: "queue";
+                    active: Ui.panel-open && Ui.panel-tab == 1;
+                    clicked => {
+                        if (Ui.panel-open && Ui.panel-tab == 1) {
+                            Ui.panel-open = false;
+                        } else {
+                            Ui.panel-open = true;
+                            Ui.panel-tab = 1;
+                        }
+                        Ui.panel-changed();
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    icon: "together";
+                    enabled: false;
+                }
+            }
+
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    icon: "eq";
+                    active: Ui.eq-open || Ui.eq-enabled;
+                    clicked => {
+                        Ui.eq-open = !Ui.eq-open;
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 28px;
+                Icon {
+                    name: Ui.volume <= 0.001 ? "mute" : "volume";
+                    color: Theme.beige;
+                }
+            }
+
+            ValueBar {
+                width: 96px;
+                y: (parent.height - 16px) / 2;
+                value: Ui.volume;
+                fill: Theme.ivory;
+                changed(v) => {
+                    Ui.volume = v;
+                    Ui.set-volume(v);
+                }
+            }
+        }
+    }
+}
+
+// ---- window ---------------------------------------------------------------------------------
+
+export component AppWindow inherits Window {
+    title: "Music";
+    preferred-width: 1280px;
+    preferred-height: 800px;
+    min-width: 900px;
+    min-height: 600px;
+    background: Theme.page;
+    default-font-family: "Inter";
+    property <length> sidebar-w: Ui.sidebar-collapsed ? 60px : 228px;
+    property <length> panel-w: Ui.panel-open ? 340px : 0px;
+    animate sidebar-w { duration: 200ms; easing: ease-out; }
+    animate panel-w { duration: 250ms; easing: ease-out; }
+
+    // Facade: faint mullions and a ceiling-light strip. Static, so free per frame.
+    for i in 24: Rectangle {
+        x: i * 140px + 70px;
+        width: 1px;
+        background: Theme.smoke.with-alpha(0.22);
+    }
+    Rectangle {
+        y: 0;
+        height: 1px;
+        background: @linear-gradient(90deg, #E9A15F00 0%, #E9A15F55 50%, #E9A15F00 100%);
+    }
+    Rectangle {
+        background: @radial-gradient(circle, #00000000 60%, #00000070 100%);
+    }
+
+    keys := FocusScope {
+        key-pressed(e) => {
+            if (e.modifiers.control && (e.text == "f" || e.text == "F")) {
+                sidebar.focus-search();
+                return accept;
+            }
+            if (e.text == Key.Escape) {
+                if (Ui.eq-open) {
+                    Ui.eq-open = false;
+                    return accept;
+                }
+                if (Ui.panel-open) {
+                    Ui.panel-open = false;
+                    Ui.panel-changed();
+                    return accept;
+                }
+            }
+            if (e.text == " ") {
+                Ui.play-pause();
+                return accept;
+            }
+            reject
+        }
+
+        sidebar := Sidebar {
+            x: 0;
+            y: 0;
+            width: sidebar-w;
+            height: parent.height - bar.height;
+            collapsed: Ui.sidebar-collapsed;
+        }
+
+        Rectangle {
+            x: sidebar-w;
+            y: 0;
+            width: parent.width - sidebar-w - panel-w;
+            height: parent.height - bar.height;
+            VerticalLayout {
+                TopBar { }
+                PlaceholderPage {
+                    vertical-stretch: 1;
+                }
+            }
+        }
+
+        if panel-w > 0: RightPanel {
+            x: parent.width - panel-w;
+            y: 0;
+            width: 340px;
+            height: parent.height - bar.height;
+        }
+
+        bar := NowPlayingBar {
+            y: parent.height - self.height;
+        }
+
+        if Ui.eq-open: TouchArea {
+            clicked => {
+                Ui.eq-open = false;
+            }
+        }
+        if Ui.eq-open: EqPanel {
+            x: parent.width - self.width - 16px;
+            y: parent.height - bar.height - self.height - 8px;
+        }
+    }
+}

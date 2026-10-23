@@ -357,7 +357,7 @@ FemtoVG is the renderer measured at 54 MB open, 1.6% CPU animating, and 0% idle.
 
 ```
 AppWindow
-├─ Background (immersive)   6 tinted sprites + darkness + vignette + facade lines
+├─ Background (immersive)   lit wall: 5 cone + 5 bounce sprites, wall texture, darkness, vignette
 ├─ Sidebar                  Apple Music style, datacentre palette
 ├─ Content                  router stack with back/forward; one page component per route
 ├─ RightPanel (optional)    Lyrics | Queue; only instantiated when open
@@ -386,8 +386,10 @@ AppWindow
   now-playing track elsewhere.
 - **Palette:** k-means (k=5) on a 64×64 thumbnail, on a net worker, about 1 ms. Each colour is
   pushed ~35% towards tungsten and dimmed slightly ("warm glass").
-- **Drawing:** 6 `Image`s of one 128×128 soft radial sprite, `colorize`d, moved by a 30 fps timer.
-  Then the darkness layer (40%), vignette and static facade lines.
+- **Drawing (lit wall, PLAN R4):** 5 lights at the window edges, each a `colorize`d cone sprite
+  (rotated, swaying ±0.18 rad) plus a `colorize`d soft bounce disc, moved by a 30 fps timer. Then a
+  static grain-and-seams texture that darkens only where it's lit, the darkness layer (30%) and the
+  vignette.
 - **The timer runs only** when the window is visible, focused and no game is detected. Otherwise
   it shows a frozen frame.
 - **Palette change:** a 1.2 s crossfade (colour lerp in the same timer).

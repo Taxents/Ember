@@ -68,6 +68,8 @@ pub struct Track {
     pub like: Option<Like>,
     /// Greyed out (region-locked, removed).
     pub unavailable: bool,
+    /// How many times it was played ("149M plays", or a video's views), when known.
+    pub plays: Option<u64>,
 }
 
 impl Track {

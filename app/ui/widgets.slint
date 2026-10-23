@@ -1,0 +1,212 @@
+// Theme, icons and small controls shared by the whole window.
+
+// "Datacentre at night": warm tungsten light, dark glass, oxide-red feature walls.
+export global Theme {
+    out property <color> carbon: #17110F;
+    out property <color> oxide: #76291E;
+    out property <color> amber: #E9A15F;
+    out property <color> ivory: #F1E5D2;
+    out property <color> smoke: #342520;
+    out property <color> beige: #B7A69A;
+
+    // Derived surfaces: carbon and smoke glass over the background.
+    out property <color> page: #140F0D;
+    out property <color> sidebar: #120D0BE6;
+    out property <color> bar: #0F0A08;
+    out property <color> panel: #120D0B;
+    out property <color> hover: #34252080;
+    out property <color> dim: #B7A69A80;
+}
+
+// Line icons on a 24-unit grid, drawn as paths so they stay sharp at any scale.
+export component Icon inherits Path {
+    in property <string> name;
+    in property <color> color: Theme.ivory;
+    in property <bool> filled: name == "play" || name == "pause" || name == "next" || name == "previous" || name == "heart-filled";
+    width: 18px;
+    height: 18px;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    stroke: filled ? transparent : color;
+    stroke-width: 1.7px;
+    fill: filled ? color : transparent;
+    commands: name == "search" ? "M 10.5 4 A 6.5 6.5 0 1 0 10.5 17 A 6.5 6.5 0 1 0 10.5 4 Z M 15.3 15.3 L 20 20"
+        : name == "home" ? "M 4 11 L 12 4 L 20 11 M 6 9.5 L 6 20 L 18 20 L 18 9.5 M 10 20 L 10 14 L 14 14 L 14 20"
+        : name == "explore" ? "M 12 3 A 9 9 0 1 0 12 21 A 9 9 0 1 0 12 3 Z M 15.5 8.5 L 13.5 13.5 L 8.5 15.5 L 10.5 10.5 Z"
+        : name == "radio" ? "M 4 9 L 20 9 L 20 20 L 4 20 Z M 7 9 L 16 4 M 7 14.5 A 2 2 0 1 0 11 14.5 A 2 2 0 1 0 7 14.5 Z M 14 13 L 17 13 M 14 16 L 17 16"
+        : name == "history" ? "M 12 3 A 9 9 0 1 0 12 21 A 9 9 0 1 0 12 3 Z M 12 7 L 12 12 L 15.5 14"
+        : name == "artist" ? "M 12 3 A 3 3 0 0 0 9 6 L 9 11 A 3 3 0 0 0 15 11 L 15 6 A 3 3 0 0 0 12 3 Z M 6 11 A 6 6 0 0 0 18 11 M 12 17 L 12 21 M 9 21 L 15 21"
+        : name == "album" ? "M 4 4 L 20 4 L 20 20 L 4 20 Z M 9 12 A 3 3 0 1 0 15 12 A 3 3 0 1 0 9 12 Z"
+        : name == "song" ? "M 6.5 18 A 2.5 2.5 0 1 0 11.5 18 A 2.5 2.5 0 1 0 6.5 18 Z M 11.5 18 L 11.5 5 L 18 3.5 L 18 7.5 L 11.5 9"
+        : name == "grid" ? "M 4 4 L 10 4 L 10 10 L 4 10 Z M 14 4 L 20 4 L 20 10 L 14 10 Z M 4 14 L 10 14 L 10 20 L 4 20 Z M 14 14 L 20 14 L 20 20 L 14 20 Z"
+        : name == "heart" || name == "heart-filled" ? "M 12 20 L 4.6 12.6 A 4.3 4.3 0 0 1 12 7.2 A 4.3 4.3 0 0 1 19.4 12.6 Z"
+        : name == "play" ? "M 7.5 4.5 L 19.5 12 L 7.5 19.5 Z"
+        : name == "pause" ? "M 6.5 4.5 L 10 4.5 L 10 19.5 L 6.5 19.5 Z M 14 4.5 L 17.5 4.5 L 17.5 19.5 L 14 19.5 Z"
+        : name == "next" ? "M 5 5 L 15 12 L 5 19 Z M 16.5 5 L 19 5 L 19 19 L 16.5 19 Z"
+        : name == "previous" ? "M 19 5 L 9 12 L 19 19 Z M 7.5 5 L 5 5 L 5 19 L 7.5 19 Z"
+        : name == "shuffle" ? "M 3 7 L 7 7 L 17 17 L 21 17 M 18 14 L 21 17 L 18 20 M 3 17 L 7 17 L 10 14 M 14 10 L 17 7 L 21 7 M 18 4 L 21 7 L 18 10"
+        : name == "repeat" ? "M 4 12 L 4 9 A 3 3 0 0 1 7 6 L 19 6 M 16 3 L 19 6 L 16 9 M 20 12 L 20 15 A 3 3 0 0 1 17 18 L 5 18 M 8 21 L 5 18 L 8 15"
+        : name == "repeat-one" ? "M 4 12 L 4 9 A 3 3 0 0 1 7 6 L 19 6 M 16 3 L 19 6 L 16 9 M 20 12 L 20 15 A 3 3 0 0 1 17 18 L 5 18 M 8 21 L 5 18 L 8 15 M 11 10.5 L 12.5 9.5 L 12.5 14.5"
+        : name == "lyrics" ? "M 4 5 L 20 5 L 20 16 L 10 16 L 6 20 L 6 16 L 4 16 Z M 8 9 L 16 9 M 8 12.5 L 13.5 12.5"
+        : name == "queue" ? "M 4 6 L 16 6 M 4 11 L 16 11 M 4 16 L 11 16 M 15 14 L 15 20 L 20 17 Z"
+        : name == "together" ? "M 9 4 A 3 3 0 1 0 9 10 A 3 3 0 1 0 9 4 Z M 3 20 A 6 6 0 0 1 15 20 M 16 4.5 A 2.8 2.8 0 0 1 16 10 M 18 14 A 5 5 0 0 1 21 20"
+        : name == "volume" ? "M 4 9 L 8 9 L 13 5 L 13 19 L 8 15 L 4 15 Z M 16.5 9 A 4 4 0 0 1 16.5 15 M 19 6.5 A 7.5 7.5 0 0 1 19 17.5"
+        : name == "mute" ? "M 4 9 L 8 9 L 13 5 L 13 19 L 8 15 L 4 15 Z M 16.5 9.5 L 21 14.5 M 21 9.5 L 16.5 14.5"
+        : name == "eq" ? "M 6 4 L 6 20 M 12 4 L 12 20 M 18 4 L 18 20 M 4 15 L 8 15 M 10 8 L 14 8 M 16 13 L 20 13"
+        : name == "back" ? "M 15 5 L 8 12 L 15 19"
+        : name == "forward" ? "M 9 5 L 16 12 L 9 19"
+        : name == "sidebar" ? "M 4 5 L 20 5 L 20 19 L 4 19 Z M 9 5 L 9 19"
+        : name == "chevron-down" ? "M 6 9 L 12 15 L 18 9"
+        : name == "chevron-right" ? "M 9 6 L 15 12 L 9 18"
+        : name == "plus" ? "M 12 5 L 12 19 M 5 12 L 19 12"
+        : name == "close" ? "M 6.5 6.5 L 17.5 17.5 M 17.5 6.5 L 6.5 17.5"
+        : name == "user" ? "M 12 4 A 4 4 0 1 0 12 12 A 4 4 0 1 0 12 4 Z M 4 21 A 8 8 0 0 1 20 21"
+        : name == "handle" ? "M 6 9 L 18 9 M 6 15 L 18 15"
+        : "";
+}
+
+// A round, borderless icon button. `active` lights it in amber.
+export component IconButton inherits Rectangle {
+    in property <string> icon;
+    in property <bool> active;
+    in property <bool> enabled: true;
+    in property <length> size: 32px;
+    in property <length> icon-size: 18px;
+    in property <string> tooltip;
+    callback clicked();
+    width: size;
+    height: size;
+    border-radius: size / 2;
+    background: ta.pressed ? Theme.smoke : ta.has-hover && enabled ? Theme.hover : transparent;
+    opacity: enabled ? 1 : 0.4;
+    ta := TouchArea {
+        mouse-cursor: enabled ? pointer : default;
+        clicked => {
+            if (root.enabled) {
+                root.clicked();
+            }
+        }
+    }
+
+    Icon {
+        name: root.icon;
+        width: root.icon-size;
+        height: root.icon-size;
+        color: root.active ? Theme.amber : ta.has-hover && root.enabled ? Theme.ivory : Theme.beige;
+    }
+}
+
+// A horizontal value bar (progress, volume). Reports drags as 0..1 while dragging and on release.
+export component ValueBar inherits Rectangle {
+    in property <float> value; // 0..1
+    in property <length> thickness: 4px;
+    in property <color> fill: Theme.amber;
+    in property <bool> knob: true;
+    out property <bool> dragging: ta.pressed;
+    out property <float> drag-value: max(0, min(1, ta.mouse-x / self.width));
+    callback changed(float);
+    callback released(float);
+    height: 16px;
+    property <float> shown: ta.pressed ? drag-value : value;
+    property <length> t: ta.has-hover || ta.pressed ? thickness + 2px : thickness;
+
+    Rectangle {
+        y: (parent.height - t) / 2;
+        height: t;
+        border-radius: t / 2;
+        background: Theme.smoke;
+        animate height { duration: 120ms; }
+    }
+
+    Rectangle {
+        x: 0;
+        y: (parent.height - t) / 2;
+        width: parent.width * shown;
+        height: t;
+        border-radius: t / 2;
+        background: root.fill;
+    }
+
+    if root.knob && (ta.has-hover || ta.pressed): Rectangle {
+        x: parent.width * shown - 6px;
+        width: 12px;
+        height: 12px;
+        border-radius: 6px;
+        background: Theme.ivory;
+        drop-shadow-blur: 6px;
+        drop-shadow-color: #E9A15F80;
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        moved => {
+            if (self.pressed) {
+                root.changed(root.drag-value);
+            }
+        }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.changed(root.drag-value);
+            } else if (e.kind == PointerEventKind.up) {
+                root.released(root.drag-value);
+            }
+        }
+    }
+}
+
+// A pill button with a label (Play, Sign in …).
+export component PillButton inherits Rectangle {
+    in property <string> text;
+    in property <string> icon;
+    in property <bool> primary: true;
+    callback clicked();
+    height: 34px;
+    min-width: label.preferred-width + (icon != "" ? 54px : 36px);
+    border-radius: 17px;
+    background: primary ? (ta.pressed ? Theme.amber.darker(0.2) : ta.has-hover ? Theme.amber.brighter(0.08) : Theme.amber)
+        : (ta.has-hover ? Theme.smoke : Theme.smoke.with-alpha(0.6));
+    drop-shadow-blur: primary ? 18px : 0;
+    drop-shadow-color: primary ? #E9A15F55 : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: 8px;
+        if root.icon != "": Rectangle {
+            width: 16px;
+            Icon {
+                name: root.icon;
+                width: 16px;
+                height: 16px;
+                color: root.primary ? Theme.carbon : Theme.ivory;
+            }
+        }
+        label := Text {
+            text: root.text;
+            color: root.primary ? Theme.carbon : Theme.ivory;
+            font-size: 13px;
+            font-weight: 650;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Artwork with a rounded frame and a placeholder tone while loading.
+export component Art inherits Rectangle {
+    in property <image> source;
+    in property <length> radius: 4px;
+    border-radius: radius;
+    clip: true;
+    background: Theme.smoke;
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: root.source;
+        image-fit: cover;
+    }
+}

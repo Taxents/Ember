@@ -54,6 +54,96 @@ impl Player {
         &self.queue
     }
 
+    /// The queue in play order, and the position of the current track in it.
+    pub fn up_next(&self) -> (Vec<&str>, usize) {
+        (
+            self.order.iter().map(|&i| self.queue[i].as_str()).collect(),
+            self.at,
+        )
+    }
+
+    pub fn shuffle(&self) -> bool {
+        self.shuffle
+    }
+
+    /// Restores a saved queue without starting playback (`play_current` starts it).
+    pub fn restore(&mut self, ids: Vec<String>, at: usize) {
+        self.queue = ids;
+        self.order = (0..self.queue.len()).collect();
+        self.at = at.min(self.queue.len().saturating_sub(1));
+    }
+
+    /// Plays the current track from the start (after `restore`, or to retry).
+    pub fn play_current(&mut self) {
+        if let Some(id) = self.current().map(str::to_string) {
+            self.engine.play(&id);
+        }
+    }
+
+    /// Inserts tracks right after the current one ("play next").
+    pub fn insert_next(&mut self, ids: Vec<String>) {
+        if self.order.is_empty() {
+            return self.play_queue(ids, 0);
+        }
+        let first = self.queue.len();
+        let n = ids.len();
+        self.queue.extend(ids);
+        let at = self.at + 1;
+        self.order.splice(at..at, first..first + n);
+        self.update_next();
+    }
+
+    /// Appends tracks to the end of the queue.
+    pub fn append(&mut self, ids: Vec<String>) {
+        if self.order.is_empty() {
+            return self.play_queue(ids, 0);
+        }
+        let first = self.queue.len();
+        self.queue.extend(ids);
+        self.order.extend(first..self.queue.len());
+        self.update_next();
+    }
+
+    /// Plays the track at `pos` in play order.
+    pub fn jump(&mut self, pos: usize) {
+        if pos < self.order.len() {
+            self.at = pos;
+            self.play_current();
+        }
+    }
+
+    /// Removes the track at `pos` in play order. The current track can't be removed.
+    pub fn remove(&mut self, pos: usize) {
+        if pos >= self.order.len() || pos == self.at {
+            return;
+        }
+        self.order.remove(pos);
+        if pos < self.at {
+            self.at -= 1;
+        }
+        self.update_next();
+    }
+
+    /// Moves the track at play-order position `from` to `to`.
+    pub fn move_item(&mut self, from: usize, to: usize) {
+        let n = self.order.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        let item = self.order.remove(from);
+        self.order.insert(to, item);
+        self.at = if self.at == from {
+            to
+        } else if from < self.at && to >= self.at {
+            self.at - 1
+        } else if from > self.at && to <= self.at {
+            self.at + 1
+        } else {
+            self.at
+        };
+        self.update_next();
+    }
+
     pub fn next(&mut self) {
         if let Some(i) = self.step(1, true) {
             self.at = i;
@@ -115,12 +205,6 @@ impl Player {
             Event::Failed { id, .. } if self.current() == Some(id.as_str()) => self.next(),
             Event::Failed { .. } => self.update_next(),
             _ => {}
-        }
-    }
-
-    fn play_current(&mut self) {
-        if let Some(id) = self.current().map(str::to_string) {
-            self.engine.play(&id);
         }
     }
 

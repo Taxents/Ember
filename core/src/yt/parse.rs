@@ -113,6 +113,40 @@ pub fn parse_duration(s: &str) -> Option<u64> {
     )
 }
 
+/// "149M plays", "48M views", "5.8K", "1.2B plays" → an approximate count.
+pub fn parse_count(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let num = s.split_whitespace().next()?.replace(',', "");
+    let (digits, mult) = match num.chars().last()? {
+        'K' => (&num[..num.len() - 1], 1e3),
+        'M' => (&num[..num.len() - 1], 1e6),
+        'B' => (&num[..num.len() - 1], 1e9),
+        _ => (num.as_str(), 1.0),
+    };
+    let rest = s[s.find(' ').map(|i| i + 1).unwrap_or(s.len())..].trim();
+    if !(rest.is_empty() || rest.starts_with("play") || rest.starts_with("view")) {
+        return None;
+    }
+    if rest.is_empty() && mult == 1.0 {
+        return None; // a bare number isn't a count
+    }
+    Some((digits.parse::<f64>().ok()? * mult).round() as u64)
+}
+
+/// The play or view count among subtitle segments.
+fn plays_in<'a>(parts: impl IntoIterator<Item = &'a String>) -> Option<u64> {
+    parts
+        .into_iter()
+        .flat_map(|s| s.split(SEP))
+        .filter(|p| {
+            p.ends_with("plays")
+                || p.ends_with("play")
+                || p.ends_with("views")
+                || p.ends_with("view")
+        })
+        .find_map(parse_count)
+}
+
 fn year_in(s: &str) -> Option<u32> {
     s.split(|c: char| !c.is_ascii_digit())
         .find(|w| w.len() == 4)
@@ -377,6 +411,7 @@ fn responsive(r: &Value) -> Option<Item> {
         like: like_status(&r["menu"]),
         unavailable: r["musicItemRendererDisplayPolicy"]
             == "MUSIC_ITEM_RENDERER_DISPLAY_POLICY_GREY_OUT",
+        plays: plays_in(rest_text.iter()),
     }))
 }
 
@@ -409,6 +444,7 @@ fn panel_track(r: &Value) -> Option<Track> {
         set_video_id: str_of(&r["playlistSetVideoId"]),
         like: None,
         unavailable: false,
+        plays: plays_in([text(&r["longBylineText"])].iter()),
     })
 }
 
@@ -946,6 +982,16 @@ pub fn playback_url(v: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts() {
+        assert_eq!(parse_count("149M plays"), Some(149_000_000));
+        assert_eq!(parse_count("5.8K views"), Some(5_800));
+        assert_eq!(parse_count("1.2B plays"), Some(1_200_000_000));
+        assert_eq!(parse_count("1,234 views"), Some(1_234));
+        assert_eq!(parse_count("2013"), None);
+        assert_eq!(parse_count("10 songs"), None);
+    }
 
     #[test]
     fn durations() {

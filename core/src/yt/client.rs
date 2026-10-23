@@ -428,6 +428,15 @@ impl Client {
         Ok(())
     }
 
+    /// How many times a track was played (its video's view count), for lists whose rows
+    /// don't say. Doesn't count as a play.
+    pub fn play_count(&self, video_id: &str) -> Result<Option<u64>> {
+        let v = self.call("player", json!({ "videoId": video_id }), "")?;
+        Ok(v["videoDetails"]["viewCount"]
+            .as_str()
+            .and_then(|s| s.parse().ok()))
+    }
+
     // ---- history ---------------------------------------------------------------------------
 
     /// Records a play in the account's YouTube Music history, as the website does when a track

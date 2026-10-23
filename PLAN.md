@@ -126,39 +126,55 @@ discover and sound-search.
 **Legacy:** a 48×48 pre-blurred cover drawn as 3 drifting textured quads, music-reactive through
 a ≤20 Hz meter. It was cheap and effective, and we keep that core idea.
 
-**Look: dark, with distinct colour moving around, not a gradient wash.**
+**Look: the background is a wall, lit by coloured fixtures just out of view** *(2026-10-23,
+replaces the free-floating blobs)*.
 
-- **Base:** near-black. A darkness layer (default ~45%) sits over the colour, plus a vignette.
-- **Colour:** 5–6 soft colour **blobs**, each taken from one of the cover's dominant colours.
-  They drift, slowly orbit and gently pulse. They're individually visible as coloured light
-  moving in the dark, not blended into one gradient.
+- **Base:** the dark page colour (#140F0D), the same on every page and for every song: the wall
+  itself never changes, only the lights falling on it. A darkness layer and a vignette sit over
+  everything.
+- **Lights:** 5 sources, each one of the cover's palette colours, placed just past the window
+  edges (two along the top, one at the bottom, one each side). Each throws a soft **cone** across
+  the wall: brightest where it enters, fading as it travels. Lights mix additively where they
+  overlap.
+- **Bounce:** each light also lays a much wider, dimmer wash, ~40% desaturated, centred about
+  halfway along its cone: the colour reflected back off the room.
+- **The wall's surface:** a faint concrete grain and thin panel seams are *multiplied* over the
+  light, so they only show where light lands and vanish in the dark. Seams get a 1 px warm
+  highlight on one side, as if catching the light.
+- **Motion:** the fixtures stay put; their cones sway slowly (±0.18 rad) and their brightness
+  breathes (±15%). Nothing floats. Music-reactive pulses add to the brightness.
 - **Tuned defaults (from the mockup, 2026-10-23):**
-  - Blur 85: very soft edges, blobs still distinct.
-  - Darkness 40%.
-  - Motion 0.3×: slow, calm drift.
+  - Light strength 60%.
+  - Bounce 45%.
+  - Cone width 55% (cone breadth relative to its length).
+  - Wall texture 40%, panel seams 35%.
+  - Darkness 30%.
+  - Motion 0.3×.
 
-  Mockup units: blur is in px on a ~680×420 stage with blobs 180–340 px across, so in the app it
-  scales with window size. Music-reactive pulses ride on top of the slow base drift.
+  Mockup units: a ~680×400 stage with cones 1.25× the stage height long, so in the app they
+  scale with the window.
 
 **How it's drawn (cheap, no shaders; Slint has no custom shaders anyway):**
 
-- **One shared 128×128 soft radial sprite**, generated once at startup. The "blur" is baked into
-  its falloff. Each blob is that sprite, tinted with a palette colour, then positioned, scaled
-  and faded.
-- **Blur amount** = sprite falloff curve plus blob size, so changing it costs nothing at runtime.
-- **Per frame:** 6 tinted quads + 1 darkness quad + 1 vignette quad. Negligible GPU work even at
-  1440p.
+- **Two shared sprites**, generated once at startup: a soft cone (a radial falloff squashed
+  into a half-ellipse) and a large soft disc for the bounce. Each light is the cone sprite
+  tinted, rotated and scaled, plus the disc tinted with its desaturated colour.
+- **Wall texture:** one static greyscale image (grain + seams) at window size, regenerated only
+  on resize, drawn with multiply-style darkening over the lights.
+- **Per frame:** 5 cone quads + 5 bounce quads + 1 texture quad + 1 darkness quad + 1 vignette
+  quad. Negligible GPU work even at 1440p.
 - **Palette:** 4–6 colours extracted once per track on a worker (k-means on a 64×64 thumbnail).
   Darkness/saturation are clamped so white text is always legible.
+- **Off / reduced motion:** the same picture, frozen.
 
 **Incorporated into the UI, not just behind it.** Every surface reads the live palette and the
-blob positions:
+light positions:
 
 1. **Glass panels pick up nearby colour.**
-   - The edge/border gradient of each panel (sidebar, cards, player bar) is tinted by the blob
-     colours closest to it.
+   - The edge/border gradient of each panel (sidebar, cards, player bar) is tinted by the lights
+     nearest it.
    - Panels look lit by the background, the way glass catches coloured light.
-   - Updated at a low rate (≈ 4 Hz) from the blob positions: a handful of colour lerps, no
+   - Updated at a low rate (≈ 4 Hz) from the light positions: a handful of colour lerps, no
      per-pixel work.
 2. **Accent colour per track** *(superseded 2026-10-23: controls use fixed tungsten amber, see
    R7. The track palette still drives the background and glows)*. The most legible palette
@@ -171,11 +187,11 @@ blob positions:
    background, so the page and the background read as one surface.
 5. **Lyrics.** The active line takes the accent with a faint glow. Past and future lines are white
    at reduced opacity, letting the colour show through.
-6. **Music-reactive motion (optional).** Blob drift follows tempo, and bass makes the blobs
+6. **Music-reactive motion (optional).** Cone sway follows tempo, and bass makes the lights
    "breathe". The meter comes from our own engine at no extra cost.
-7. **Track change.** Blobs recolour with a ~1.2 s crossfade while staying in motion, so the room
+7. **Track change.** The lights recolour with a ~1.2 s crossfade while staying in motion, so the room
    changes colour instead of cutting.
-8. **Fullscreen.** The same blobs, bigger and slightly brighter. Motion artwork can sit on top (R9).
+8. **Fullscreen.** The same lit wall, with stronger, wider lights. Motion artwork can sit on top (R9).
 
 **Settings:** blur, darkness and motion speed sliders (defaults 85 / 40% / 0.3×), plus
 "Background motion: Everywhere / Now Playing & fullscreen only / Off".
@@ -299,14 +315,15 @@ page, content rows that lift on hover, minimal chrome.
 
 **Where the immersive background is used, and what colours it**
 
-The background is the room every page sits in. Its colours come from whatever the page is about:
+The background is the room every page sits in. The wall stays the same; the lights' colours come
+from whatever the page is about:
 
-| Page | Background colours | Behaviour |
+| Page | Light colours | Behaviour |
 |---|---|---|
-| Album, playlist, artist | **That page's artwork** | The hero dissolves into blobs of the same colours, so the page and the room are one surface. Crossfades ~1.2 s on navigation. |
-| Listen now, Browse, Library, Search | **The now-playing song** | Hovering a tile for more than 400 ms gently pulls one blob towards that tile's colours as a preview, then lets it go. |
-| Now Playing, fullscreen | **The now-playing song** at full intensity | Bigger, brighter blobs; music-reactive motion if enabled; motion artwork on top. |
-| Nothing playing | A neutral deep-blue/violet palette | |
+| Album, playlist, artist | **That page's artwork** | The hero dissolves into light of the same colours, so the page and the room are one surface. Crossfades ~1.2 s on navigation. |
+| Listen now, Browse, Library, Search | **The now-playing song** | Hovering a tile for more than 400 ms gently pulls one light towards that tile's colours as a preview, then lets it go. |
+| Now Playing, fullscreen | **The now-playing song** at full intensity | Stronger, wider lights; music-reactive motion if enabled; motion artwork on top. |
+| Nothing playing | No lights: just the wall | The lights fade in when something starts playing. |
 
 **Always in the accent colour** of the current room: the play button, the artist link, the
 playing row, focus rings and the progress bar.
@@ -635,7 +652,7 @@ music (workspace)
 └─ app/           Slint UI. On minimize: drops textures and caches, then trims the working set.
     ├─ ui/*.slint design system (tokens, Glass, Card, Shelf, PlayerBar, LyricsView, Stage)
     ├─ bridge     core state snapshot → Slint models; UI actions → core commands
-    ├─ immersive  palette extraction, blob layers, motion
+    ├─ immersive  palette extraction, lit-wall layers, motion
     └─ video      Media Foundation motion-art player (optional)
 ```
 
