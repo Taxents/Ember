@@ -8,8 +8,16 @@
 //!       concatenation, for comparison with ffmpeg.
 //!   music-cli seekcheck <videoId> [--itag 140]
 //!       Seeks to several positions and compares against a straight decode.
+//!   music-cli raw <endpoint> <json-body> [--out file.json]
+//!       Calls an InnerTube endpoint (signed in if a session exists) and prints or saves the
+//!       raw response. Used to record parser fixtures.
 //!   music-cli resolve <videoId>
 //!       Prints the chosen stream and timings.
+//!   music-cli login [--cookie-file <file>]
+//!       Opens the sign-in window (or reads a browser `Cookie:` header from a file) and stores
+//!       the session encrypted. `logout` forgets it.
+//!   music-cli yt <command> … [--json]
+//!       Browsing, library and account actions through the InnerTube client (`yt help`).
 
 use music_core::audio::resample::Resampler;
 use music_core::audio::source;
@@ -20,6 +28,8 @@ use music_core::yt::Resolver;
 use std::io::{BufRead, Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod yt;
 
 struct Logger;
 impl log::Log for Logger {
@@ -74,6 +84,21 @@ fn main() {
         ),
         Some("resolve") if !positional.is_empty() => resolve(&positional[0]),
         Some("seekcheck") if !positional.is_empty() => seekcheck(&positional[0], flag("--itag")),
+        Some("raw") if positional.len() >= 2 => raw(&positional[0], &positional[1], flag("--out")),
+        Some("login") => login(flag("--cookie-file")),
+        Some("logout") => {
+            music_core::yt::Session::delete();
+            println!("signed out");
+            Ok(())
+        }
+        Some("yt") => yt::run(
+            &args[1..]
+                .iter()
+                .filter(|a| *a != "--json")
+                .cloned()
+                .collect::<Vec<_>>(),
+            args.iter().any(|a| a == "--json"),
+        ),
         _ => {
             eprintln!("usage: music-cli play <id>... | decode <dir> <id>... | resolve <id>");
             std::process::exit(2);
@@ -361,6 +386,57 @@ fn seekcheck(id: &str, itag: Option<String>) -> music_core::Result<()> {
             best.0,
             10.0 * (sig / noise.max(1e-30)).log10()
         );
+    }
+    Ok(())
+}
+
+fn login(cookie_file: Option<String>) -> music_core::Result<()> {
+    use music_core::yt::{Client, Session};
+    let session = match cookie_file {
+        Some(p) => {
+            let text = std::fs::read_to_string(&p)
+                .map_err(|e| music_core::Error::Unavailable(format!("{p}: {e}")))?;
+            Session::from_cookie_header(&text)?
+        }
+        None => {
+            let dir = music_core::paths::cache_dir()
+                .parent()
+                .expect("cache dir")
+                .join("webview");
+            let cookies =
+                signin::sign_in(&dir).map_err(|e| music_core::Error::Unavailable(e.to_string()))?;
+            Session::new(cookies)?
+        }
+    };
+    let client = Client::new(Some(session.clone()));
+    let account = client.account()?;
+    session.save()?;
+    println!(
+        "signed in as {} {} ({:?})",
+        account.name,
+        account.handle.unwrap_or_default(),
+        session
+    );
+    Ok(())
+}
+
+fn raw(endpoint: &str, body: &str, out: Option<String>) -> music_core::Result<()> {
+    let client = music_core::yt::Client::from_disk();
+    let body: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| music_core::Error::Media(format!("bad JSON body: {e}")))?;
+    let t = Instant::now();
+    let v = client.call(endpoint, body, "")?;
+    let text = serde_json::to_string(&v).expect("json");
+    match out {
+        Some(p) => {
+            std::fs::write(&p, &text).expect("write");
+            eprintln!(
+                "{endpoint}: {} KB in {} ms -> {p}",
+                text.len() / 1024,
+                t.elapsed().as_millis()
+            );
+        }
+        None => println!("{text}"),
     }
     Ok(())
 }

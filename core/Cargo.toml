@@ -7,10 +7,6 @@ publish.workspace = true
 [lib]
 name = "music_core"
 
-[[bin]]
-name = "music-cli"
-path = "src/bin/music-cli.rs"
-
 [dependencies]
 ureq = { version = "3.5", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
@@ -23,3 +19,5 @@ rtrb = "0.4"
 crossbeam-channel = "0.5"
 log = "0.4"
 dirs = "7"
+sha1 = "0.10"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
