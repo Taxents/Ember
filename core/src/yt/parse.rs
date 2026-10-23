@@ -239,6 +239,42 @@ fn like_status(menu: &Value) -> Option<Like> {
         })
 }
 
+/// A song menu's "Save to library" toggle.
+fn library(menu: &Value) -> Option<Library> {
+    arr(&menu["menuRenderer"]["items"]).iter().find_map(|i| {
+        let t = &i["toggleMenuServiceItemRenderer"];
+        if t["defaultIcon"]["iconType"].as_str() != Some("BOOKMARK_BORDER") {
+            return None;
+        }
+        let token = |k: &str| str_of(&t[k]["feedbackEndpoint"]["feedbackToken"]);
+        Some(Library {
+            saved: t["isToggled"].as_bool().unwrap_or(false),
+            add: token("defaultServiceEndpoint")?,
+            remove: token("toggledServiceEndpoint")?,
+        })
+    })
+}
+
+/// Whether a header's "Save to library" button is on (`None` without one).
+fn saved(h: &Value) -> Option<bool> {
+    arr(&h["buttons"]).iter().find_map(|b| {
+        let t = &b["toggleButtonRenderer"];
+        (t["defaultIcon"]["iconType"].as_str() == Some("BOOKMARK_BORDER"))
+            .then(|| t["isToggled"].as_bool().unwrap_or(false))
+    })
+}
+
+/// The token a menu's "Not interested" sends (Home recommendations).
+fn not_interested(menu: &Value) -> Option<String> {
+    arr(&menu["menuRenderer"]["items"]).iter().find_map(|i| {
+        let s = &i["menuServiceItemRenderer"];
+        if s["icon"]["iconType"].as_str() != Some("NOT_INTERESTED") {
+            return None;
+        }
+        str_of(&s["serviceEndpoint"]["feedbackEndpoint"]["feedbackToken"])
+    })
+}
+
 fn browse_ref(endpoint: &Value) -> Option<BrowseRef> {
     let b = &endpoint["browseEndpoint"];
     Some(BrowseRef {
@@ -260,6 +296,16 @@ pub fn item(v: &Value) -> Option<Item> {
         "playlistPanelVideoWrapperRenderer" => item(&r["primaryRenderer"]),
         _ => None,
     };
+    let token = not_interested(&r["menu"]);
+    match &mut i {
+        Some(Item::Track(t)) => {
+            t.not_interested = token;
+            t.library = library(&r["menu"]);
+        }
+        Some(Item::Album(a)) => a.not_interested = token,
+        Some(Item::Playlist(p)) => p.not_interested = token,
+        _ => {}
+    }
     // Library artist rows link a library-only page (`MPLA` + channel id); the app opens the
     // artist's own page instead.
     if let Some(Item::Artist(a)) = &mut i
@@ -303,6 +349,7 @@ fn two_row(r: &Value) -> Option<Item> {
                 kind: album_kind(&sub_text),
                 thumbs: th,
                 explicit: explicit(&r["subtitleBadges"]),
+                not_interested: None,
             }))
         }
         pt if is_artist_page(pt) => Some(Item::Artist(ArtistCard {
@@ -316,6 +363,7 @@ fn two_row(r: &Value) -> Option<Item> {
             title,
             subtitle: strip_label(&sub_text),
             thumbs: th,
+            not_interested: None,
         })),
         _ => None,
     }
@@ -355,6 +403,7 @@ fn responsive(r: &Value) -> Option<Item> {
                 kind: album_kind(&sub),
                 thumbs: th,
                 explicit: explicit(&r["badges"]),
+                not_interested: None,
             })),
             pt if is_artist_page(pt) => Some(Item::Artist(ArtistCard {
                 id,
@@ -367,6 +416,7 @@ fn responsive(r: &Value) -> Option<Item> {
                 title,
                 subtitle: strip_label(&sub),
                 thumbs: th,
+                not_interested: None,
             })),
             _ => None,
         };
@@ -412,6 +462,8 @@ fn responsive(r: &Value) -> Option<Item> {
         unavailable: r["musicItemRendererDisplayPolicy"]
             == "MUSIC_ITEM_RENDERER_DISPLAY_POLICY_GREY_OUT",
         plays: plays_in(rest_text.iter()),
+        not_interested: None,
+        library: None,
     }))
 }
 
@@ -445,6 +497,8 @@ fn panel_track(r: &Value) -> Option<Track> {
         like: None,
         unavailable: false,
         plays: plays_in([text(&r["longBylineText"])].iter()),
+        not_interested: None,
+        library: None,
     })
 }
 
@@ -696,12 +750,14 @@ fn top_card(r: &Value) -> Option<Item> {
             kind: album_kind(&sub),
             thumbs: th,
             explicit: false,
+            not_interested: None,
         })),
         Some("MUSIC_PAGE_TYPE_PLAYLIST") => Some(Item::Playlist(PlaylistCard {
             id,
             title,
             subtitle: strip_label(&sub),
             thumbs: th,
+            not_interested: None,
         })),
         _ => None,
     }
@@ -765,6 +821,7 @@ pub fn album(id: &str, v: &Value) -> AlbumPage {
         description: description(h),
         summary: text(&h["secondSubtitle"]),
         playlist_id,
+        saved: saved(h),
         ..Default::default()
     };
     let me = Named {
@@ -848,6 +905,7 @@ pub fn playlist(id: &str, v: &Value) -> PlaylistPage {
         }) || !v["contents"]["twoColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]
             ["sectionListRenderer"]["contents"][0]["musicEditablePlaylistDetailHeaderRenderer"]
             .is_null(),
+        saved: saved(h),
         ..Default::default()
     };
     if page.thumbs.is_empty() {
@@ -952,16 +1010,38 @@ pub fn watch_next(v: &Value) -> WatchNext {
     let panel = &tabs[0]["tabRenderer"]["content"]["musicQueueRenderer"]["content"]["playlistPanelRenderer"];
     let cont = &v["continuationContents"]["playlistPanelContinuation"];
     let p = if panel.is_object() { panel } else { cont };
-    let lyrics_id = arr(tabs).iter().find_map(|t| {
-        let b = &t["tabRenderer"]["endpoint"]["browseEndpoint"];
-        let id = b["browseId"].as_str()?;
-        id.starts_with("MPLY").then(|| id.to_string())
-    });
+    let chips = arr(
+        &tabs[0]["tabRenderer"]["content"]["musicQueueRenderer"]["subHeaderChipCloud"]["chipCloudRenderer"]["chips"],
+    )
+    .iter()
+    .filter_map(|c| {
+        let c = &c["chipCloudChipRenderer"];
+        let w = &c["navigationEndpoint"]["queueUpdateCommand"]["fetchContentsCommand"]["watchEndpoint"];
+        Some(Chip {
+            label: opt_text(&c["text"])?,
+            selected: c["isSelected"].as_bool().unwrap_or(false),
+            watch: WatchRef {
+                video_id: str_of(&w["videoId"]),
+                playlist_id: str_of(&w["playlistId"])?,
+                params: str_of(&w["params"]),
+            },
+        })
+    })
+    .collect();
+    let tab = |prefix: &str| {
+        arr(tabs).iter().find_map(|t| {
+            let id = t["tabRenderer"]["endpoint"]["browseEndpoint"]["browseId"].as_str()?;
+            id.starts_with(prefix).then(|| id.to_string())
+        })
+    };
+    let (lyrics_id, related_id) = (tab("MPLY"), tab("MPTR"));
     WatchNext {
         tracks: tracks(&p["contents"]),
         playlist_id: str_of(&p["playlistId"]),
         continuation: continuation(p, &p["contents"]),
         lyrics_id,
+        related_id,
+        chips,
     }
 }
 
@@ -1013,4 +1093,86 @@ mod tests {
         assert_eq!(album_kind("Single • 2024"), AlbumKind::Single);
         assert_eq!(year_in("Album • 1973"), Some(1973));
     }
+}
+
+/// The lyrics tab: the words and their source ("Source: Musixmatch" → "Musixmatch").
+pub fn lyrics(v: &Value) -> Option<(String, String)> {
+    section_lists(v)
+        .into_iter()
+        .chain(Some(&v["contents"]["sectionListRenderer"]))
+        .flat_map(|s| arr(&s["contents"]))
+        .find_map(|sec| {
+            let d = &sec["musicDescriptionShelfRenderer"];
+            let words = opt_text(&d["description"])?;
+            let source = text(&d["footer"]);
+            let source = source.trim_start_matches("Source:").trim().to_string();
+            Some((words, source))
+        })
+}
+
+/// A timed lyric line: start and end in milliseconds, and the words.
+pub type TimedLine = (u64, u64, String);
+
+/// The Android app's timed lyrics, in order, and their source ("Musixmatch").
+pub fn timed_lyrics(v: &Value) -> Option<(Vec<TimedLine>, String)> {
+    let d = &v["contents"]["elementRenderer"]["newElement"]["type"]["componentType"]["model"]
+        ["timedLyricsModel"]["lyricsData"];
+    let ms = |x: &Value| {
+        x.as_str()
+            .and_then(|s| s.parse().ok())
+            .or_else(|| x.as_u64())
+    };
+    let mut lines: Vec<TimedLine> = arr(&d["timedLyricsData"])
+        .iter()
+        .filter_map(|l| {
+            let c = &l["cueRange"];
+            let text = l["lyricLine"].as_str()?.trim();
+            (!text.is_empty()).then(|| {
+                let start = ms(&c["startTimeMilliseconds"]).unwrap_or(0);
+                let end = ms(&c["endTimeMilliseconds"]).unwrap_or(start);
+                (start, end, text.to_string())
+            })
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort_by_key(|l| l.0);
+    let source = d["sourceMessage"].as_str().unwrap_or("");
+    let source = source.trim_start_matches("Source:").trim().to_string();
+    Some((lines, source))
+}
+
+/// "View song credits": a dialog of roles and names.
+pub fn credits(v: &Value) -> Credits {
+    let d = &v["onResponseReceivedActions"][0]["openPopupAction"]["popup"]["dismissableDialogRenderer"];
+    Credits {
+        sections: arr(&d["sections"])
+            .iter()
+            .filter_map(|s| {
+                let s = &s["dismissableDialogContentSectionRenderer"];
+                let names: Vec<String> = runs(&s["subtitle"])
+                    .iter()
+                    .filter_map(|r| r["text"].as_str())
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                Some(CreditSection {
+                    role: opt_text(&s["title"])?,
+                    names,
+                })
+            })
+            .filter(|s| !s.names.is_empty())
+            .collect(),
+    }
+}
+
+/// The Related tab's "About the artist" text.
+pub fn about(v: &Value) -> Option<String> {
+    section_lists(v)
+        .into_iter()
+        .chain(Some(&v["contents"]["sectionListRenderer"]))
+        .flat_map(|s| arr(&s["contents"]))
+        .find_map(|sec| opt_text(&sec["musicDescriptionShelfRenderer"]["description"]))
 }

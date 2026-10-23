@@ -1,6 +1,7 @@
 //! The queue on top of the engine: what plays now, what plays next.
 
 use crate::audio::{Engine, Event};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Repeat {
@@ -20,6 +21,10 @@ pub struct Player {
     pub repeat: Repeat,
     shuffle: bool,
     seed: u64,
+    /// What failed to open ahead since the last track started: not opened ahead again.
+    skip: HashSet<String>,
+    /// Tracks that failed in a row, so a queue where nothing plays stops instead of looping.
+    failures: usize,
 }
 
 impl Player {
@@ -32,12 +37,15 @@ impl Player {
             repeat: Repeat::Off,
             shuffle: false,
             seed: 0x9E3779B97F4A7C15,
+            skip: HashSet::new(),
+            failures: 0,
         }
     }
 
     /// Replace the queue and start playing item `start`.
     pub fn play_queue(&mut self, ids: Vec<String>, start: usize) {
         self.queue = ids;
+        self.failures = 0;
         self.order = (0..self.queue.len()).collect();
         self.at = start.min(self.queue.len().saturating_sub(1));
         if self.shuffle {
@@ -105,6 +113,18 @@ impl Player {
     }
 
     /// Plays the track at `pos` in play order.
+    /// Keeps the current song playing and makes `ids` everything after it (autoplay).
+    pub fn replace_rest(&mut self, ids: Vec<String>) {
+        let Some(cur) = self.current().map(str::to_string) else {
+            return self.play_queue(ids, 0);
+        };
+        self.queue = std::iter::once(cur).chain(ids).collect();
+        self.order = (0..self.queue.len()).collect();
+        self.at = 0;
+        self.shuffle = false;
+        self.update_next();
+    }
+
     pub fn jump(&mut self, pos: usize) {
         if pos < self.order.len() {
             self.at = pos;
@@ -153,7 +173,9 @@ impl Player {
 
     /// Previous track, or restart this one if more than 3 s in.
     pub fn previous(&mut self) {
-        if self.engine.position().is_some_and(|p| p.ms > 3000)
+        // Live radio has nothing to restart: always the previous station.
+        let live = self.current().is_some_and(crate::radio::is_station);
+        if !live && self.engine.position().is_some_and(|p| p.ms > 3000)
             || self.at == 0 && self.repeat != Repeat::All
         {
             self.engine.seek(0);
@@ -200,18 +222,31 @@ impl Player {
                         self.at = i;
                     }
                 }
+                self.failures = 0;
+                self.skip.clear();
                 self.update_next();
             }
-            Event::Failed { id, .. } if self.current() == Some(id.as_str()) => self.next(),
-            Event::Failed { .. } => self.update_next(),
+            Event::Failed { id, .. } if self.current() == Some(id.as_str()) => {
+                self.failures += 1;
+                if self.failures < self.order.len() {
+                    self.next();
+                }
+            }
+            Event::Failed { id, .. } => {
+                self.skip.insert(id.clone());
+                self.update_next();
+            }
             _ => {}
         }
     }
 
     fn update_next(&mut self) {
-        let next = self
-            .step(1, false)
-            .map(|i| self.queue[self.order[i]].clone());
+        // A station never ends by itself, so nothing is opened ahead after it.
+        let next = (1..=self.order.len() as i64)
+            .map_while(|d| self.step(d, false))
+            .map(|i| self.queue[self.order[i]].clone())
+            .find(|id| !self.skip.contains(id))
+            .filter(|_| !self.current().is_some_and(crate::radio::is_station));
         self.engine.set_next(next.as_deref());
     }
 

@@ -284,8 +284,10 @@ impl<R: Read + Seek> WebmDemuxer<R> {
             }
             let (eid, size) = match read_header(&mut self.r) {
                 Ok(h) => h,
-                // A clean end of file (or a truncated final element) ends the stream.
-                Err(_) => return Ok(None),
+                // A clean end of file (or a truncated final element) ends the stream; the
+                // download giving up doesn't (that comes back as the stream's own error).
+                Err(Error::Media(_)) => return Ok(None),
+                Err(e) => return Err(e),
             };
             // Cluster children are read flat, so clusters of unknown size work too.
             match eid {

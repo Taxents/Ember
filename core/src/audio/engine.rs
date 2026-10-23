@@ -10,7 +10,7 @@ use super::resample::Resampler;
 use super::source::{self, Source};
 use super::stream::HttpStream;
 use crate::audio::eq::EqSettings;
-use crate::yt::{Resolver, StreamInfo};
+use crate::yt::Resolver;
 use crate::{Error, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rtrb::{Producer, RingBuffer};
@@ -29,6 +29,13 @@ const IDLE_STOP: Duration = Duration::from_secs(5);
 /// Wake-up bounds while playing (the ring holds a second, so waking at half is plenty).
 const TICK_MIN: Duration = Duration::from_millis(20);
 const TICK_MAX: Duration = Duration::from_millis(250);
+/// After a device error, wait this long before reopening: Windows reports a switch as a burst
+/// (old endpoint invalidated, new default, …) and a fresh endpoint (Bluetooth especially) may
+/// refuse a client for a moment.
+const REOPEN_SETTLE: Duration = Duration::from_millis(150);
+/// Retry a failed reopen after this long, times the attempts so far (capped).
+const REOPEN_RETRY: Duration = Duration::from_millis(500);
+const REOPEN_RETRY_MAX: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -43,6 +50,8 @@ pub enum Event {
     Failed { id: String, error: Error },
     /// The output device changed or failed.
     Device(String),
+    /// A live station said what it plays now (its ICY `StreamTitle`; empty: nothing said).
+    Title { id: String, title: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,23 +144,57 @@ impl Engine {
     pub fn events(&self) -> &Receiver<Event> {
         &self.events
     }
+    /// How loud the last moment of audio was in four bands, bass first (RMS, before volume).
+    pub fn levels(&self) -> [f32; 4] {
+        self.shared
+            .levels
+            .each_ref()
+            .map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
+    }
+
     pub fn underruns(&self) -> u64 {
         self.shared.underruns.load(Ordering::Relaxed)
     }
 
     /// What is audible right now.
     pub fn position(&self) -> Option<Position> {
-        let tl = self.timeline.lock().unwrap();
-        let played = self.shared.played.load(Ordering::Relaxed);
-        let m = tl.audible(played)?;
-        let frames = played - m.at + m.offset;
-        Some(Position {
-            id: m.id.clone(),
-            ms: frames * 1000 / tl.rate.max(1) as u64,
-            duration_ms: m.duration_ms,
-            paused: self.shared.paused.load(Ordering::Relaxed),
-        })
+        position(&self.shared, &self.timeline)
     }
+
+    /// A handle that reads the position from another thread (a video kept in step with the
+    /// audio).
+    pub fn clock(&self) -> Clock {
+        Clock {
+            shared: self.shared.clone(),
+            timeline: self.timeline.clone(),
+        }
+    }
+}
+
+/// Reads what is audible, from any thread. Cheap: a lock held for a few loads.
+#[derive(Clone)]
+pub struct Clock {
+    shared: Arc<Shared>,
+    timeline: Arc<Mutex<Timeline>>,
+}
+
+impl Clock {
+    pub fn position(&self) -> Option<Position> {
+        position(&self.shared, &self.timeline)
+    }
+}
+
+fn position(shared: &Shared, timeline: &Mutex<Timeline>) -> Option<Position> {
+    let tl = timeline.lock().unwrap();
+    let played = shared.played.load(Ordering::Relaxed);
+    let m = tl.audible(played)?;
+    let frames = played - m.at + m.offset;
+    Some(Position {
+        id: m.id.clone(),
+        ms: frames * 1000 / tl.rate.max(1) as u64,
+        duration_ms: m.duration_ms,
+        paused: shared.paused.load(Ordering::Relaxed),
+    })
 }
 
 impl Drop for Engine {
@@ -192,7 +235,8 @@ impl Timeline {
 
 /// A track opened off-thread, before the device rate is applied.
 struct Loaded {
-    info: StreamInfo,
+    /// The length YouTube reported (live radio: none).
+    duration_ms: Option<u64>,
     src: Box<dyn Source>,
 }
 
@@ -213,7 +257,7 @@ impl Track {
             .src
             .total_frames()
             .map(|f| f * 1000 / rate as u64)
-            .or(l.info.duration_ms);
+            .or(l.duration_ms);
         Track {
             id,
             rs: (rate != dev_rate).then(|| Resampler::new(rate, dev_rate)),
@@ -227,6 +271,13 @@ impl Track {
     /// Reposition to `ms`; returns the exact position used, in device frames.
     fn seek(&mut self, ms: u64, dev_rate: u32) -> Result<u64> {
         let rate = self.src.rate() as u64;
+        if self.src.live() {
+            // Live radio carries on from where the stream is (after a device change).
+            if self.rs.is_some() {
+                self.rs = Some(Resampler::new(rate as u32, dev_rate));
+            }
+            return Ok(0);
+        }
         let mut frame = ms * rate / 1000;
         if let Some(t) = self.src.total_frames() {
             frame = frame.min(t.saturating_sub(1));
@@ -274,6 +325,9 @@ struct Worker {
     generation: u64,
     finished_sent: bool,
     idle_since: Option<Instant>,
+    /// The output must be (re)opened at this time (device changed or lost, or none yet).
+    reopen_at: Option<Instant>,
+    reopen_failures: u32,
 }
 
 impl Worker {
@@ -307,42 +361,62 @@ impl Worker {
             generation: 0,
             finished_sent: true,
             idle_since: Some(Instant::now()),
+            reopen_at: None,
+            reopen_failures: 0,
         };
-        w.open_output()?;
+        // No device yet (none plugged in, or busy): keep trying, playback starts once one is.
+        if let Err(e) = w.open_output() {
+            log::warn!("no output device yet: {e}");
+            w.reopen_failed();
+        }
         Ok(w)
     }
 
-    fn open_output(&mut self) -> Result<()> {
+    /// Opens a stopped stream on the current default device. Returns whether the ring had to be
+    /// rebuilt (the device rate changed), dropping what was queued in it. On failure only the
+    /// old stream is gone: ring, timeline and position stay as they were.
+    fn open_output(&mut self) -> Result<bool> {
         self.output = None;
         let (dev, cfg) = output::device_format()?;
         let rate = cfg.sample_rate();
         let cap = ((rate as f64 * RING_SECONDS) as usize) * CH;
-        let (p, c) = RingBuffer::new(cap);
-        self.producer = p;
-        *self.consumer.lock().unwrap() = c;
-        // Everything in flight is gone with the old ring.
-        self.shared.played.store(self.written, Ordering::Relaxed);
-        self.carry.clear();
-        self.dev_rate = rate;
-        self.timeline.lock().unwrap().rate = rate;
+        // Same rate: the queued audio is still right for the new device, so keep it (seamless).
+        let keep = rate == self.dev_rate && self.producer.buffer().capacity() == cap;
+        let (producer, consumer) = if keep {
+            (None, self.consumer.clone())
+        } else {
+            let (p, c) = RingBuffer::new(cap);
+            (Some(p), Arc::new(Mutex::new(c)))
+        };
         let tx = self.cmd_tx.clone();
         let out = Output::open(
             &dev,
             &cfg,
             self.shared.clone(),
-            self.consumer.clone(),
+            consumer.clone(),
             move |e| {
                 let _ = tx.send(Cmd::DeviceError(e.to_string()));
             },
         )?;
+        if let Some(p) = producer {
+            self.producer = p;
+            self.consumer = consumer;
+            // Everything in flight is gone with the old ring.
+            self.shared.played.store(self.written, Ordering::Relaxed);
+            self.carry.clear();
+            self.dev_rate = rate;
+            self.timeline.lock().unwrap().rate = rate;
+            self.shared.reset_eq.store(true, Ordering::Relaxed);
+        }
         log::info!(
-            "output: {} Hz, {} ch, format {}",
+            "output: {} Hz, {} ch, format {}{}",
             rate,
             out.channels,
-            cfg.sample_format()
+            cfg.sample_format(),
+            if keep { "" } else { " (ring rebuilt)" }
         );
         self.output = Some(out);
-        Ok(())
+        Ok(!keep)
     }
 
     fn run(&mut self, rx: Receiver<Cmd>) {
@@ -365,6 +439,9 @@ impl Worker {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
+            }
+            if self.reopen_at.is_some_and(|t| t <= Instant::now()) {
+                self.reopen();
             }
             self.pump();
             self.announce();
@@ -448,6 +525,13 @@ impl Worker {
             .unwrap()
             .audible(played)
             .map(|m| m.id.clone());
+        // Live radio can't be sought: keep playing.
+        if let (Some(a), Some(t)) = (&audible, &self.cur)
+            && *a == t.id
+            && t.src.live()
+        {
+            return;
+        }
         self.seek_audible(audible, ms);
     }
 
@@ -511,10 +595,11 @@ impl Worker {
         let generation = self.generation;
         let tx = self.cmd_tx.clone();
         let resolver = self.resolver.clone();
+        let events = self.events.clone();
         std::thread::Builder::new()
             .name("track-load".into())
             .spawn(move || {
-                let result = load(&resolver, &id);
+                let result = load(&resolver, &id, events);
                 let _ = tx.send(Cmd::Loaded {
                     generation,
                     next,
@@ -562,6 +647,13 @@ impl Worker {
 
     /// How long the loop may sleep; `None` = until the next command.
     fn wait_time(&self) -> Option<Duration> {
+        let t = self.decode_wait();
+        let Some(at) = self.reopen_at else { return t };
+        let r = at.saturating_duration_since(Instant::now());
+        Some(t.map_or(r, |t| t.min(r)))
+    }
+
+    fn decode_wait(&self) -> Option<Duration> {
         if self.can_decode() {
             return Some(Duration::ZERO);
         }
@@ -590,7 +682,7 @@ impl Worker {
     fn can_decode(&self) -> bool {
         let room = self.ring_free() > self.dev_rate as usize / 4 * CH;
         let work = !self.carry.is_empty()
-            || self.cur.as_ref().is_some_and(|t| !t.eof)
+            || self.cur.as_ref().is_some_and(|t| !t.eof && !t.src.stalled())
             || (self.cur.as_ref().is_some_and(|t| t.eof) && self.next.is_some());
         room && work
     }
@@ -619,6 +711,10 @@ impl Worker {
                     continue;
                 }
                 self.maybe_preload();
+                return;
+            }
+            // A live stream waiting for the network: come back on the next wake-up.
+            if t.src.stalled() {
                 return;
             }
             self.pcm.clear();
@@ -656,6 +752,8 @@ impl Worker {
             return;
         };
         let due = match &self.cur {
+            // Nothing follows live radio by itself.
+            Some(t) if t.src.live() => false,
             Some(t) => t.eof || t.remaining().is_none_or(|r| r <= PRELOAD_BEFORE),
             None => false,
         };
@@ -730,10 +828,28 @@ impl Worker {
         }
     }
 
-    /// Device lost or changed: reopen on the (new) default device and resume where we were.
+    /// Device lost or changed: reopen on the (new) default device shortly. Errors come in
+    /// bursts, so they are coalesced into one reopen.
     fn device_error(&mut self, e: String) {
         log::warn!("output device error: {e}");
         let _ = self.events.send(Event::Device(e));
+        if self.reopen_at.is_none() {
+            self.reopen_at = Some(Instant::now() + REOPEN_SETTLE);
+        }
+    }
+
+    fn reopen_failed(&mut self) {
+        self.reopen_failures += 1;
+        let wait = (REOPEN_RETRY * self.reopen_failures).min(REOPEN_RETRY_MAX);
+        self.reopen_at = Some(Instant::now() + wait);
+    }
+
+    /// Reopens on the current default device and carries on where we were: same track and
+    /// position, paused stays paused. Volume and EQ live in `Shared` and carry over by themselves.
+    fn reopen(&mut self) {
+        self.reopen_at = None;
+        // Stop the old stream first so the position read below is final.
+        self.output = None;
         let played = self.shared.played.load(Ordering::Relaxed);
         let resume = {
             let tl = self.timeline.lock().unwrap();
@@ -744,31 +860,62 @@ impl Worker {
                 )
             })
         };
-        let was_running = self.output.as_ref().is_some_and(|o| o.is_running());
-        if let Err(e) = self.open_output() {
-            log::error!("reopening output failed: {e}");
-            return;
+        let rebuilt = match self.open_output() {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!(
+                    "reopening output failed (attempt {}): {e}",
+                    self.reopen_failures + 1
+                );
+                self.reopen_failed();
+                return;
+            }
+        };
+        self.reopen_failures = 0;
+        if rebuilt {
+            // The ring was rebuilt at the new rate: resamplers must match it, and what was queued
+            // is gone, so decode again from the audible position (live radio just carries on).
+            for t in [&mut self.cur, &mut self.next, &mut self.prev]
+                .into_iter()
+                .flatten()
+            {
+                let rate = t.src.rate();
+                t.rs = (rate != self.dev_rate).then(|| Resampler::new(rate, self.dev_rate));
+            }
+            if let Some((id, ms)) = resume {
+                self.seek_audible(Some(id), ms);
+            }
         }
-        // The ring was rebuilt at the new rate: resamplers must match it.
-        for t in [&mut self.cur, &mut self.next, &mut self.prev]
-            .into_iter()
-            .flatten()
-        {
-            let rate = t.src.rate();
-            t.rs = (rate != self.dev_rate).then(|| Resampler::new(rate, self.dev_rate));
-        }
-        if let Some((id, ms)) = resume {
-            self.seek_audible(Some(id), ms);
-        }
-        if was_running && let Some(o) = &mut self.output {
-            o.start();
+        let paused = self.shared.paused.load(Ordering::Relaxed);
+        let played = self.shared.played.load(Ordering::Relaxed);
+        let busy = self.cur.is_some() || played < self.written || !self.carry.is_empty();
+        if let Some(o) = &mut self.output {
+            if busy && !paused {
+                o.start();
+            } else {
+                // Paused or idle: `Resume` / `Play` start it.
+                o.stop();
+            }
         }
     }
 }
 
 /// Resolve, open the stream and parse headers: everything up to the first decodable packet.
-fn load(resolver: &Arc<Resolver>, id: &str) -> Result<Loaded> {
+fn load(resolver: &Arc<Resolver>, id: &str, events: Sender<Event>) -> Result<Loaded> {
     let t0 = Instant::now();
+    if crate::radio::is_station(id) {
+        let src = crate::radio::live::open(id, Some(events))?;
+        log::info!(
+            "{id}: live {} ready in {} ms ({} bytes buffered)",
+            src.quality,
+            t0.elapsed().as_millis(),
+            src.buffered()
+        );
+        return Ok(Loaded {
+            duration_ms: None,
+            src: Box::new(src),
+        });
+    }
     let info = resolver.resolve(id)?;
     let t_resolve = t0.elapsed();
     let r = resolver.clone();
@@ -791,5 +938,8 @@ fn load(resolver: &Arc<Resolver>, id: &str) -> Result<Loaded> {
         t0.elapsed().as_millis(),
         t_resolve.as_millis()
     );
-    Ok(Loaded { info, src })
+    Ok(Loaded {
+        duration_ms: info.duration_ms,
+        src,
+    })
 }

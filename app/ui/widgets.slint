@@ -10,7 +10,7 @@ export global Theme {
     out property <color> beige: #B7A69A;
 
     // Derived surfaces: carbon and smoke glass over the background.
-    out property <color> page: #140F0D;
+    out property <color> page: #0B0807;
     out property <color> sidebar: #120D0BE6;
     out property <color> bar: #0F0A08;
     out property <color> panel: #120D0B;
@@ -39,6 +39,10 @@ export component Icon inherits Path {
         : name == "album" ? "M 4 4 L 20 4 L 20 20 L 4 20 Z M 9 12 A 3 3 0 1 0 15 12 A 3 3 0 1 0 9 12 Z"
         : name == "song" ? "M 6.5 18 A 2.5 2.5 0 1 0 11.5 18 A 2.5 2.5 0 1 0 6.5 18 Z M 11.5 18 L 11.5 5 L 18 3.5 L 18 7.5 L 11.5 9"
         : name == "grid" ? "M 4 4 L 10 4 L 10 10 L 4 10 Z M 14 4 L 20 4 L 20 10 L 14 10 Z M 4 14 L 10 14 L 10 20 L 4 20 Z M 14 14 L 20 14 L 20 20 L 14 20 Z"
+        : name == "edit" ? "M 4 20 L 4 16.5 L 15.5 5 A 1.8 1.8 0 0 1 18 5 L 19 6 A 1.8 1.8 0 0 1 19 8.5 L 7.5 20 Z M 13.5 7 L 17 10.5"
+        : name == "check" ? "M 5 12.5 L 10 17.5 L 19 7"
+        : name == "link" ? "M 10 14 A 4 4 0 0 0 15.7 14 L 18.5 11.2 A 4 4 0 0 0 12.8 5.5 L 11.5 6.8 M 14 10 A 4 4 0 0 0 8.3 10 L 5.5 12.8 A 4 4 0 0 0 11.2 18.5 L 12.5 17.2"
+        : name == "dislike" ? "M 9.5 14.5 L 9.5 18.5 A 2.2 2.2 0 0 0 11.7 20.7 L 15.5 13.5 L 15.5 3.5 L 7.4 3.5 A 2 2 0 0 0 5.4 5.2 L 3.8 12.2 A 2 2 0 0 0 5.8 14.5 Z M 15.5 3.5 L 20 3.5 L 20 13.5 L 15.5 13.5"
         : name == "heart" || name == "heart-filled" ? "M 12 20 L 4.6 12.6 A 4.3 4.3 0 0 1 12 7.2 A 4.3 4.3 0 0 1 19.4 12.6 Z"
         : name == "play" ? "M 7.5 4.5 L 19.5 12 L 7.5 19.5 Z"
         : name == "pause" ? "M 6.5 4.5 L 10 4.5 L 10 19.5 L 6.5 19.5 Z M 14 4.5 L 17.5 4.5 L 17.5 19.5 L 14 19.5 Z"
@@ -52,6 +56,7 @@ export component Icon inherits Path {
         : name == "together" ? "M 9 4 A 3 3 0 1 0 9 10 A 3 3 0 1 0 9 4 Z M 3 20 A 6 6 0 0 1 15 20 M 16 4.5 A 2.8 2.8 0 0 1 16 10 M 18 14 A 5 5 0 0 1 21 20"
         : name == "volume" ? "M 4 9 L 8 9 L 13 5 L 13 19 L 8 15 L 4 15 Z M 16.5 9 A 4 4 0 0 1 16.5 15 M 19 6.5 A 7.5 7.5 0 0 1 19 17.5"
         : name == "mute" ? "M 4 9 L 8 9 L 13 5 L 13 19 L 8 15 L 4 15 Z M 16.5 9.5 L 21 14.5 M 21 9.5 L 16.5 14.5"
+        : name == "settings" ? "M 12 8.8 A 3.2 3.2 0 1 0 12 15.2 A 3.2 3.2 0 1 0 12 8.8 Z M 12 2.8 L 12 5.4 M 12 18.6 L 12 21.2 M 2.8 12 L 5.4 12 M 18.6 12 L 21.2 12 M 5.5 5.5 L 7.3 7.3 M 16.7 16.7 L 18.5 18.5 M 5.5 18.5 L 7.3 16.7 M 16.7 7.3 L 18.5 5.5"
         : name == "eq" ? "M 6 4 L 6 20 M 12 4 L 12 20 M 18 4 L 18 20 M 4 15 L 8 15 M 10 8 L 14 8 M 16 13 L 20 13"
         : name == "back" ? "M 15 5 L 8 12 L 15 19"
         : name == "forward" ? "M 9 5 L 16 12 L 9 19"
@@ -73,6 +78,7 @@ export component IconButton inherits Rectangle {
     in property <length> size: 32px;
     in property <length> icon-size: 18px;
     in property <string> tooltip;
+    out property <bool> hovered: ta.has-hover;
     callback clicked();
     width: size;
     height: size;
@@ -145,7 +151,8 @@ export component ValueBar inherits Rectangle {
             }
         }
         pointer-event(e) => {
-            if (e.kind == PointerEventKind.down) {
+            if (e.button != PointerEventButton.left) {
+            } else if (e.kind == PointerEventKind.down) {
                 root.changed(root.drag-value);
             } else if (e.kind == PointerEventKind.up) {
                 root.released(root.drag-value);
@@ -164,7 +171,9 @@ export component PillButton inherits Rectangle {
     min-width: label.preferred-width + (icon != "" ? 54px : 36px);
     border-radius: 17px;
     background: primary ? (ta.pressed ? Theme.amber.darker(0.2) : ta.has-hover ? Theme.amber.brighter(0.08) : Theme.amber)
-        : (ta.has-hover ? Theme.smoke : Theme.smoke.with-alpha(0.6));
+        : (ta.pressed ? #F1E5D214 : ta.has-hover ? #F1E5D224 : #F1E5D21A);
+    border-width: primary ? 0 : 1px;
+    border-color: #F1E5D214;
     drop-shadow-blur: primary ? 18px : 0;
     drop-shadow-color: primary ? #E9A15F55 : transparent;
     ta := TouchArea {
@@ -208,5 +217,152 @@ export component Art inherits Rectangle {
         height: parent.height;
         source: root.source;
         image-fit: cover;
+        // Fades in as it arrives (one already here shows at once).
+        opacity: self.source.width > 0 ? 1 : 0;
+        animate opacity { duration: 220ms; easing: ease-out; }
+    }
+}
+
+// The playing song's mark in a track list: four bars following the music, bass on the left,
+// treble on the right (`levels`, 0..1). They rest low while paused.
+export component MiniVisualizer inherits Rectangle {
+    in property <bool> playing;
+    in property <[float]> levels;
+    in property <color> bar-color: Theme.amber;
+    width: 14px;
+    height: 14px;
+    for i in 4: Rectangle {
+        property <float> level: root.playing ? 0.15 + 0.85 * root.levels[i] : [0.35, 0.6, 0.45, 0.3][i];
+        x: i * 3.5px;
+        width: 2.5px;
+        height: max(2px, root.height * self.level);
+        y: root.height - self.height;
+        border-radius: 1px;
+        background: root.bar-color;
+        animate height { duration: 70ms; }
+    }
+}
+
+// The small "E" beside an explicit song's title.
+export component ExplicitBadge inherits Rectangle {
+    width: 15px;
+    height: 15px;
+    y: 2px;
+    border-radius: 3px;
+    background: Theme.beige.with-alpha(0.55);
+    Text {
+        text: "E";
+        color: #120D0B;
+        font-size: 10px;
+        font-weight: 800;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// An overlay scroll bar for a list: a slim pill that shows while you scroll or hover near it,
+// then fades away. Hovering widens it; dragging the thumb scrolls with no jump; clicking the
+// track jumps there. Put it on top of the list, bound to the list's content-y.
+// A ListView with rows of different heights only estimates its content-height (and rescales
+// content-y with it) from the rows on screen, so both wobble as you scroll. The bar works in
+// fractions of the scroll range, and its size only follows big changes, gliding to them.
+export component ScrollBar inherits Rectangle {
+    in-out property <length> content-y;
+    in property <length> content-height;
+    in property <length> visible-height;
+    property <length> maximum: max(0px, root.content-height - root.visible-height);
+    property <length> pad: 6px;
+    property <length> track: root.height - 2 * root.pad;
+    // How far down the list is, 0 to 1.
+    property <float> at: root.maximum <= 0px ? 0 : clamp(-root.content-y / root.maximum, 0, 1);
+    property <float> ratio-now: root.content-height <= 0px ? 1 : min(1, root.visible-height / root.content-height);
+    property <float> ratio: 1;
+    property <length> thumb-h: root.maximum <= 0px ? 0px : min(root.track, max(36px, root.track * root.ratio));
+    property <bool> awake;
+    property <bool> active: ta.has-hover || ta.pressed;
+
+    init => {
+        root.ratio = root.ratio-now;
+    }
+    // Ignore the estimate's small wobbles, and hold the size still while dragging.
+    changed ratio-now => {
+        if !ta.pressed && abs(root.ratio-now - root.ratio) > root.ratio * 0.2 {
+            root.ratio = root.ratio-now;
+        }
+    }
+
+    width: 16px;
+    visible: root.maximum > 0px;
+
+    // Scrolling wakes it; it sleeps again a moment after.
+    changed content-y => {
+        root.awake = true;
+        idle.restart();
+    }
+    idle := Timer {
+        interval: 1200ms;
+        running: false;
+        triggered => {
+            root.awake = false;
+            self.stop();
+        }
+    }
+
+    // The faint groove, only while hovered.
+    Rectangle {
+        x: parent.width - self.width - 4px;
+        y: root.pad;
+        width: 8px;
+        height: root.track;
+        border-radius: 4px;
+        background: #FFFFFF;
+        opacity: root.active ? 0.05 : 0;
+        animate opacity { duration: 150ms; }
+    }
+
+    thumb := Rectangle {
+        width: root.active ? 8px : 4px;
+        x: parent.width - 4px - (root.active ? 8px : 6px);
+        height: root.thumb-h;
+        // While dragging it follows the pointer, not the list's re-estimated position.
+        y: root.pad + (root.track - self.height) * (ta.pressed ? ta.drag-at : root.at);
+        border-radius: self.width / 2;
+        background: ta.pressed ? Theme.amber : Theme.ivory;
+        opacity: ta.pressed ? 0.9 : root.active ? 0.45 : root.awake ? 0.28 : 0;
+        animate width, x { duration: 120ms; easing: ease-out; }
+        animate height { duration: 250ms; easing: ease-out; }
+        animate opacity { duration: 220ms; }
+        animate background { duration: 120ms; }
+    }
+
+    ta := TouchArea {
+        property <length> grab;
+        property <float> start-at;
+        property <float> drag-at;
+
+        // Drags in fractions of the range: pixel offsets go stale whenever the list re-estimates.
+        pointer-event(e) => {
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.down {
+                if self.mouse-y >= thumb.y && self.mouse-y <= thumb.y + thumb.height {
+                    // On the thumb: hold where it was grabbed.
+                    self.start-at = root.at;
+                } else {
+                    // On the track: jump so the thumb centres there, then drag from there.
+                    self.start-at = clamp((self.mouse-y - root.pad - thumb.height / 2) / max(1px, root.track - thumb.height), 0, 1);
+                    root.content-y = -root.maximum * self.start-at;
+                }
+                self.grab = self.mouse-y;
+                self.drag-at = self.start-at;
+            }
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.up {
+                root.ratio = root.ratio-now;
+            }
+        }
+        moved => {
+            if self.pressed && root.track > thumb.height {
+                self.drag-at = clamp(self.start-at + (self.mouse-y - self.grab) / (root.track - thumb.height), 0, 1);
+                root.content-y = -root.maximum * self.drag-at;
+            }
+        }
     }
 }

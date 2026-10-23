@@ -70,6 +70,20 @@ pub struct Track {
     pub unavailable: bool,
     /// How many times it was played ("149M plays", or a video's views), when known.
     pub plays: Option<u64>,
+    /// The token "Not interested" sends, on Home recommendations.
+    #[serde(default)]
+    pub not_interested: Option<String>,
+    /// Saving the song to the library, when it can be (signed in).
+    #[serde(default)]
+    pub library: Option<Library>,
+}
+
+/// A song's place in the library, and the tokens that change it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Library {
+    pub saved: bool,
+    pub add: String,
+    pub remove: String,
 }
 
 impl Track {
@@ -99,6 +113,9 @@ pub struct AlbumCard {
     pub kind: AlbumKind,
     pub thumbs: Vec<Thumb>,
     pub explicit: bool,
+    /// The token "Not interested" sends, on Home recommendations.
+    #[serde(default)]
+    pub not_interested: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -118,6 +135,9 @@ pub struct PlaylistCard {
     /// e.g. "YouTube Music • 40 songs".
     pub subtitle: String,
     pub thumbs: Vec<Thumb>,
+    /// The token "Not interested" sends, on Home recommendations.
+    #[serde(default)]
+    pub not_interested: Option<String>,
 }
 
 /// A tile leading to another browse page (moods, genres).
@@ -188,6 +208,8 @@ pub struct AlbumPage {
     pub tracks: Vec<Track>,
     /// The album as a playlist (`OLAK5uy_…`): what "play all" and "save" act on.
     pub playlist_id: Option<String>,
+    /// In the library; `None` when it can't be saved (signed out).
+    pub saved: Option<bool>,
     pub shelves: Vec<Shelf>,
 }
 
@@ -230,6 +252,8 @@ pub struct PlaylistPage {
     pub continuation: Option<Continuation>,
     /// The signed-in user can edit it.
     pub owned: bool,
+    /// In the library; `None` when it can't be saved (yours, or signed out).
+    pub saved: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -257,6 +281,18 @@ pub struct WatchNext {
     pub continuation: Option<Continuation>,
     /// Browse id of the lyrics tab, for the YouTube lyrics source.
     pub lyrics_id: Option<String>,
+    /// Browse id of the Related tab (similar songs, other performances, similar artists).
+    pub related_id: Option<String>,
+    /// The autoplay choices above the queue (All, Popular, Discover, Deep cuts…).
+    pub chips: Vec<Chip>,
+}
+
+/// One autoplay choice: what the rest of the queue is drawn from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Chip {
+    pub label: String,
+    pub selected: bool,
+    pub watch: WatchRef,
 }
 
 /// How to fetch the next part of a long list. YouTube uses two schemes.
@@ -273,4 +309,25 @@ pub struct Account {
     pub name: String,
     pub handle: Option<String>,
     pub photo: Vec<Thumb>,
+}
+
+/// A song's credits ("Written by": Max Martin, …), as YouTube Music's "View song credits".
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Credits {
+    pub sections: Vec<CreditSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CreditSection {
+    pub role: String,
+    pub names: Vec<String>,
+}
+
+/// What the player says about a song that lists leave out.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct VideoStats {
+    pub plays: Option<u64>,
+    pub duration_ms: Option<u64>,
+    /// When it came out, "2019-11-28".
+    pub published: Option<String>,
 }

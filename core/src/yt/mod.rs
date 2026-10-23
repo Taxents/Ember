@@ -7,5 +7,5 @@ pub mod resolver;
 pub mod session;
 
 pub use client::Client;
-pub use resolver::{Resolver, StreamInfo};
+pub use resolver::{Resolver, StreamInfo, VideoInfo};
 pub use session::Session;

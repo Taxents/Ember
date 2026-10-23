@@ -1,9 +1,12 @@
 //! Music core: audio engine, YouTube Music client and player logic. No UI dependencies.
 
 pub mod audio;
+pub mod lyrics;
 pub mod net;
 pub mod paths;
 pub mod player;
+pub mod radio;
+pub mod video;
 pub mod yt;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

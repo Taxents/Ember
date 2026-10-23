@@ -17,6 +17,9 @@ pub fn agent() -> &'static ureq::Agent {
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_recv_response(Some(Duration::from_secs(15)))
             .timeout_recv_body(Some(Duration::from_secs(30)))
+            // Artwork loads eight at a time from a few hosts: keep those connections open.
+            .max_idle_connections(32)
+            .max_idle_connections_per_host(8)
             .build()
             .into()
     })
@@ -36,6 +39,26 @@ pub fn post_json(url: &str, headers: &[(&str, &str)], body: &Value) -> Result<Va
         .body_mut()
         .with_config()
         .limit(32 << 20)
+        .read_to_vec()
+        .map_err(|e| Error::Net(e.to_string()))?;
+    if !(200..300).contains(&status) {
+        return Err(Error::Net(format!("HTTP {status} from {}", short(url))));
+    }
+    serde_json::from_slice(&bytes).map_err(|e| Error::Net(format!("bad JSON: {e}")))
+}
+
+/// GET and parse a JSON reply. Non-2xx statuses become `Error::Net` ("HTTP 404 from …").
+pub fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<Value> {
+    let mut rb = agent().get(url);
+    for (k, v) in headers {
+        rb = rb.header(*k, *v);
+    }
+    let mut r = rb.call().map_err(|e| Error::Net(e.to_string()))?;
+    let status = r.status().as_u16();
+    let bytes = r
+        .body_mut()
+        .with_config()
+        .limit(8 << 20)
         .read_to_vec()
         .map_err(|e| Error::Net(e.to_string()))?;
     if !(200..300).contains(&status) {

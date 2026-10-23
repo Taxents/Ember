@@ -19,6 +19,8 @@ pub struct Settings {
     pub sidebar_collapsed: bool,
     pub panel_open: bool,
     pub panel_tab: i32,
+    /// Playlists hidden from the app (YouTube playlists that aren't music), by id.
+    pub hidden_playlists: Vec<String>,
 }
 
 impl Default for Settings {
@@ -31,6 +33,7 @@ impl Default for Settings {
             sidebar_collapsed: false,
             panel_open: false,
             panel_tab: 1,
+            hidden_playlists: Vec::new(),
         }
     }
 }

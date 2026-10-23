@@ -1,7 +1,15 @@
 /target
 /dist
 /spikes
-/.claude/settings.local.json
-/.claude/worktrees
 /secrets.toml
 /core/tests/fixtures/private
+
+# Local only: what the release build doesn't need.
+/.claude
+/PLAN.md
+/IMPLEMENTATION.md
+# The audio test harness (cargo run --manifest-path cli/Cargo.toml).
+/cli
+# Dev scripts; cutting a release stays.
+/tools/*
+!/tools/release.ps1

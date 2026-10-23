@@ -1,0 +1,54 @@
+// The Radio page's station search: a rounded field like the sidebar's.
+
+import { Theme, Icon } from "widgets.slint";
+
+export component RadioSearch inherits Rectangle {
+    in property <string> placeholder: "Search stations, cities, countries";
+    callback accepted(string);
+    height: 36px;
+    border-radius: 10px;
+    background: input.has-focus ? Theme.smoke : Theme.smoke.with-alpha(0.6);
+    border-width: input.has-focus ? 1px : 0;
+    border-color: Theme.amber.with-alpha(0.6);
+    TouchArea {
+        mouse-cursor: text;
+        clicked => {
+            input.focus();
+        }
+    }
+
+    Rectangle {
+        x: 11px;
+        width: 16px;
+        Icon {
+            name: "search";
+            width: 16px;
+            height: 16px;
+            color: Theme.beige;
+        }
+    }
+
+    if input.text == "": Text {
+        x: 36px;
+        width: parent.width - 46px;
+        text: root.placeholder;
+        overflow: elide;
+        color: Theme.dim;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+    input := TextInput {
+        x: 36px;
+        width: parent.width - 46px;
+        color: Theme.ivory;
+        selection-background-color: Theme.oxide;
+        font-size: 13px;
+        vertical-alignment: center;
+        single-line: true;
+        accepted => {
+            if (self.text != "") {
+                root.accepted(self.text);
+            }
+        }
+    }
+}

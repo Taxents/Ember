@@ -219,6 +219,19 @@ fn radio() {
     );
     assert!(w.continuation.is_some());
     assert!(w.lyrics_id.is_some());
+    assert!(
+        w.related_id
+            .as_deref()
+            .is_some_and(|r| r.starts_with("MPTR"))
+    );
+    assert!(w.chips.len() >= 4, "{} chips", w.chips.len());
+    assert_eq!(w.chips[0].label, "All");
+    assert!(w.chips[0].selected && w.chips.iter().filter(|c| c.selected).count() == 1);
+    assert!(
+        w.chips
+            .iter()
+            .all(|c| c.watch.playlist_id.starts_with("RD"))
+    );
     for t in &w.tracks {
         assert!(!t.artists.is_empty(), "{t:?}");
         assert!(t.duration_ms.is_some(), "{t:?}");
@@ -272,9 +285,112 @@ fn liked_songs() {
 }
 
 #[test]
+fn home_not_interested() {
+    let Some(v) = private("home_signed_in.json") else {
+        return;
+    };
+    let f = parse::feed(&v);
+    let tokens = f
+        .shelves
+        .iter()
+        .flat_map(|s| &s.items)
+        .filter(|i| match i {
+            Item::Track(t) => t.not_interested.is_some(),
+            Item::Album(a) => a.not_interested.is_some(),
+            Item::Playlist(p) => p.not_interested.is_some(),
+            _ => false,
+        })
+        .count();
+    assert!(tokens > 0, "recommendations carry a Not interested token");
+}
+
+#[test]
+fn related() {
+    let Some(v) = private("related.json") else {
+        return;
+    };
+    let f = parse::feed(&v);
+    assert!(f.shelves.len() >= 4, "{} shelves", f.shelves.len());
+    assert!(
+        f.shelves
+            .iter()
+            .all(|s| !s.items.is_empty() && !s.title.is_empty())
+    );
+    assert!(parse::about(&v).is_some_and(|a| a.len() > 40));
+}
+
+#[test]
+fn library_state() {
+    let Some(v) = private("album_signed_in.json") else {
+        return;
+    };
+    let a = parse::album("MPREb_FWIMEPTHFsY", &v);
+    assert!(
+        a.saved.is_some(),
+        "signed-in albums say whether they're saved"
+    );
+    assert!(
+        a.tracks.iter().all(|t| t.library.is_some()),
+        "songs can be saved"
+    );
+    if let Some(v) = private("playlist_other.json") {
+        let p = parse::playlist("VLRDCLAK5uy_ls6pkxsVNi5b3e1B3qZnRDamY6siJ-nj8", &v);
+        assert!(!p.owned && p.saved.is_some());
+    }
+}
+
+#[test]
 fn account() {
     let Some(v) = private("account.json") else {
         return;
     };
     assert!(parse::account(&v).is_some());
+}
+
+#[test]
+fn lyrics() {
+    let Some(v) = private("lyrics.json") else {
+        return;
+    };
+    let (words, source) = parse::lyrics(&v).unwrap();
+    assert!(words.lines().count() > 10);
+    assert_eq!(source, "Musixmatch");
+}
+
+#[test]
+fn timed_lyrics() {
+    let Some(v) = private("timed_lyrics.json") else {
+        return;
+    };
+    let (lines, source) = parse::timed_lyrics(&v).unwrap();
+    assert!(lines.len() > 10);
+    assert!(lines.windows(2).all(|w| w[0].0 <= w[1].0 && w[0].0 <= w[0].1));
+    assert_eq!(source, "Musixmatch");
+}
+
+/// A real Unison TTML file (word and syllable timed, with background vocals).
+#[test]
+fn unison_ttml() {
+    let Ok(s) = std::fs::read_to_string(dir().join("private").join("unison.ttml")) else {
+        return;
+    };
+    let l = music_core::lyrics::parse_ttml(&s);
+    assert_eq!(l.timing, music_core::lyrics::Timing::Word);
+    assert!(l.lines.len() > 20);
+    assert!(l.lines.iter().any(|x| x.background));
+    for x in &l.lines {
+        assert!(!x.text().is_empty() && x.start <= x.end, "{x:?}");
+        assert!(x.words.iter().all(|w| w.start <= w.end && !w.text.contains("  ")));
+    }
+}
+
+#[test]
+fn credits() {
+    let Some(v) = private("credits.json") else {
+        return;
+    };
+    let c = parse::credits(&v);
+    let roles: Vec<_> = c.sections.iter().map(|s| s.role.as_str()).collect();
+    assert!(roles.contains(&"Written by"), "{roles:?}");
+    assert!(c.sections.iter().all(|s| s.names.iter().all(|n| !n.trim().is_empty())));
 }

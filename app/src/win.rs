@@ -24,7 +24,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, HICON, ICONINFO, IsIconic, RegisterWindowMessageW, SIZE_MAXIMIZED,
-    SIZE_MINIMIZED, SIZE_RESTORED, WM_COMMAND, WM_SIZE,
+    SIZE_MINIMIZED, SIZE_RESTORED, WM_COMMAND, WM_SIZE, WM_XBUTTONUP,
 };
 use windows::core::{HSTRING, w};
 
@@ -38,6 +38,9 @@ pub enum Remote {
     Previous,
     Minimized,
     Restored,
+    /// The mouse's back and forward side buttons.
+    Back,
+    Forward,
 }
 
 /// Draw at the display's real resolution instead of letting Windows stretch a 96-DPI bitmap.
@@ -158,6 +161,15 @@ unsafe extern "system" fn subclass(
             }
             _ => {}
         },
+        // Side buttons: XBUTTON1 is back, XBUTTON2 forward.
+        WM_XBUTTONUP => {
+            match (wp.0 >> 16) & 0xFFFF {
+                1 => emit(Remote::Back),
+                2 => emit(Remote::Forward),
+                _ => {}
+            }
+            return LRESULT(1);
+        }
         WM_COMMAND if (wp.0 >> 16) as u32 == THBN_CLICKED => match (wp.0 & 0xFFFF) as u32 {
             ID_PREV => emit(Remote::Previous),
             ID_PLAY => emit(Remote::PlayPause),
@@ -388,5 +400,32 @@ fn glyph(g: Glyph) -> HICON {
         let _ = DeleteObject(color.into());
         let _ = DeleteObject(mask.into());
         icon
+    }
+}
+
+/// Puts text on the clipboard.
+pub fn copy_text(hwnd: HWND, text: &str) {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+    let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        if OpenClipboard(Some(hwnd)).is_err() {
+            return;
+        }
+        let _ = EmptyClipboard();
+        if let Ok(mem) = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2) {
+            let p = GlobalLock(mem) as *mut u16;
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
+                let _ = GlobalUnlock(mem);
+                // The clipboard owns the memory from here.
+                let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(mem.0)));
+            }
+        }
+        let _ = CloseClipboard();
     }
 }

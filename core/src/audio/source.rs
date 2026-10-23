@@ -26,6 +26,14 @@ pub trait Source: Send {
     fn read(&mut self, out: &mut Vec<f32>) -> Result<bool>;
     /// Repositions so the next frame read is exactly `frame`.
     fn seek(&mut self, frame: u64) -> Result<()>;
+    /// An endless live stream (radio): no seeking, no length, no preloading after it.
+    fn live(&self) -> bool {
+        false
+    }
+    /// Reading now would wait on the network: the decoder comes back later instead.
+    fn stalled(&self) -> bool {
+        false
+    }
 }
 
 pub fn open(info: &StreamInfo, stream: HttpStream) -> Result<Box<dyn Source>> {
@@ -37,7 +45,7 @@ pub fn open(info: &StreamInfo, stream: HttpStream) -> Result<Box<dyn Source>> {
 }
 
 /// Appends `frames` frames of `ch`-channel audio as stereo, scaled by `gain`.
-fn push_stereo(out: &mut Vec<f32>, src: &[f32], ch: usize, gain: f32) {
+pub(crate) fn push_stereo(out: &mut Vec<f32>, src: &[f32], ch: usize, gain: f32) {
     if ch == 2 {
         if gain == 1.0 {
             out.extend_from_slice(src);
@@ -191,6 +199,7 @@ impl AacSource {
         let track_id = track.id;
         let rate = params
             .sample_rate
+            .filter(|&r| r > 0)
             .ok_or_else(|| Error::Media("mp4: no sample rate".into()))?;
         let dec = symphonia::default::get_codecs()
             .make_audio_decoder(&params, &AudioDecoderOptions::default())

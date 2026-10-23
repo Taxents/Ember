@@ -15,6 +15,8 @@ const API: &str = "https://music.youtube.com/youtubei/v1";
 const CLIENT_NAME: &str = "WEB_REMIX";
 const CLIENT_ID: &str = "67";
 pub const CLIENT_VERSION: &str = "1.20260707.12.00";
+/// The Android app, for timed lyrics.
+const ANDROID_VERSION: &str = "7.21.50";
 
 pub struct Client {
     session: RwLock<Option<Session>>,
@@ -335,6 +337,12 @@ impl Client {
         Ok(())
     }
 
+    /// Sends a feedback token: a recommendation's "Not interested".
+    pub fn feedback(&self, token: &str) -> Result<()> {
+        self.call_signed_in("feedback", json!({ "feedbackTokens": [token] }), "")?;
+        Ok(())
+    }
+
     /// Adds or removes an album/playlist from the library (`playlist_id` of an album is its
     /// `OLAK5uy_…` id).
     pub fn save_playlist(&self, playlist_id: &str, save: bool) -> Result<()> {
@@ -405,6 +413,22 @@ impl Client {
         )
     }
 
+    /// Moves the track at `set_video_id` (its position id) to just before `before` (another
+    /// track's position id), or to the end when `None`.
+    pub fn move_in_playlist(
+        &self,
+        playlist_id: &str,
+        set_video_id: &str,
+        before: Option<&str>,
+    ) -> Result<()> {
+        let mut action =
+            json!({ "action": "ACTION_MOVE_VIDEO_BEFORE", "setVideoId": set_video_id });
+        if let Some(b) = before {
+            action["movedSetVideoIdSuccessor"] = json!(b);
+        }
+        self.edit_playlist(playlist_id, vec![action])
+    }
+
     fn edit_playlist(&self, playlist_id: &str, actions: Vec<Value>) -> Result<()> {
         let id = playlist_id.trim_start_matches("VL");
         let v = self.call_signed_in(
@@ -428,13 +452,70 @@ impl Client {
         Ok(())
     }
 
-    /// How many times a track was played (its video's view count), for lists whose rows
-    /// don't say. Doesn't count as a play.
-    pub fn play_count(&self, video_id: &str) -> Result<Option<u64>> {
+    /// A song's play count, length and release date, for lists that leave them out. Doesn't
+    /// count as a play.
+    pub fn video_stats(&self, video_id: &str) -> Result<VideoStats> {
         let v = self.call("player", json!({ "videoId": video_id }), "")?;
-        Ok(v["videoDetails"]["viewCount"]
-            .as_str()
-            .and_then(|s| s.parse().ok()))
+        let num = |k: &str| {
+            v["videoDetails"][k]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+        };
+        let m = &v["microformat"]["microformatDataRenderer"];
+        Ok(VideoStats {
+            plays: num("viewCount"),
+            duration_ms: num("lengthSeconds").map(|s| s * 1000),
+            published: m["publishDate"]
+                .as_str()
+                .or(m["uploadDate"].as_str())
+                .map(|d| d.chars().take(10).collect()),
+        })
+    }
+
+    /// YouTube Music's own lyrics, from the watch page's lyrics tab (`WatchNext::lyrics_id`).
+    pub fn lyrics(&self, browse_id: &str) -> Result<Option<crate::lyrics::Lyrics>> {
+        Ok(parse::lyrics(&self.browse(browse_id, None)?)
+            .map(|(words, source)| crate::lyrics::plain(&words, &source)))
+    }
+
+    /// The same tab's time-synced lines, which only the Android app is given
+    /// (`timedLyricsModel`). Asked signed out: lyrics aren't personal. The reply is large
+    /// (~650 KB, mostly unrelated framework data), so callers cache the result.
+    pub fn timed_lyrics(&self, browse_id: &str) -> Result<Option<crate::lyrics::Lyrics>> {
+        let body = json!({
+            "browseId": browse_id,
+            "context": {"client": {
+                "clientName": "ANDROID_MUSIC",
+                "clientVersion": ANDROID_VERSION,
+                "androidSdkVersion": 34,
+                "hl": "en",
+            }},
+        });
+        let ua = format!(
+            "com.google.android.apps.youtube.music/{ANDROID_VERSION} (Linux; U; Android 14) gzip"
+        );
+        let v = net::post_json(
+            &format!("{API}/browse?prettyPrint=false"),
+            &[
+                ("User-Agent", &ua),
+                ("X-YouTube-Client-Name", "21"),
+                ("X-YouTube-Client-Version", ANDROID_VERSION),
+            ],
+            &body,
+        )?;
+        Ok(parse::timed_lyrics(&v)
+            .map(|(lines, source)| crate::lyrics::from_lines(lines, &source)))
+    }
+
+    /// "View song credits".
+    pub fn credits(&self, video_id: &str) -> Result<Credits> {
+        Ok(parse::credits(&self.browse(&format!("MPTC{video_id}"), None)?))
+    }
+
+    /// The Related tab: its shelves, and the "About the artist" text.
+    pub fn related(&self, browse_id: &str) -> Result<(Feed, Option<String>)> {
+        let v = self.browse(browse_id, None)?;
+        Ok((parse::feed(&v), parse::about(&v)))
     }
 
     // ---- history ---------------------------------------------------------------------------

@@ -1,0 +1,48 @@
+# Builds a release when a version tag (v1.2.3) is pushed: ember.exe and its SHA-256, which the
+# app's updater downloads and checks. The tag must match the app's Cargo.toml version.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag matches the app version
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path app/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne "${{ github.ref_name }}") { throw "tag ${{ github.ref_name }} but app/Cargo.toml says $v" }
+
+      # The fanart.tv key comes from the repository secret FANART_KEY; without it the build has no
+      # artist logos but works.
+      - name: Write secrets.toml
+        shell: pwsh
+        env:
+          FANART_KEY: ${{ secrets.FANART_KEY }}
+        run: Set-Content -Path secrets.toml -Value "fanart_key = `"$env:FANART_KEY`"" -Encoding utf8NoBOM
+
+      - name: Build
+        run: cargo build --release -p music-app
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item target/release/ember.exe ember.exe
+          (Get-FileHash ember.exe -Algorithm SHA256).Hash.ToLower() | Set-Content ember.exe.sha256 -NoNewline -Encoding ascii
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" ember.exe ember.exe.sha256 --generate-notes --title "${{ github.ref_name }}"

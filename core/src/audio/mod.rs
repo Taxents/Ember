@@ -8,5 +8,5 @@ pub mod source;
 pub mod stream;
 pub mod webm;
 
-pub use engine::{Engine, Event, Position};
+pub use engine::{Clock, Engine, Event, Position};
 pub use eq::EqSettings;

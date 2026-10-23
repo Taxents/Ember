@@ -3,7 +3,8 @@
 //! The render callback is wait-free: it never blocks, allocates or logs. It pops stereo frames
 //! from the ring, runs the EQ (skipped when flat) and volume (skipped at 100%), and writes them
 //! to the device. With a flat EQ, full volume and a matching rate, samples pass through
-//! untouched: bit-perfect.
+//! untouched: bit-perfect. On the way it measures four bands (bass to treble) for the visualizer,
+//! reading the samples without changing them.
 
 use super::eq::{Eq, SharedEq};
 use crate::{Error, Result};
@@ -31,6 +32,8 @@ pub struct Shared {
     pub underruns: AtomicU64,
     /// Ask the callback to clear filter state (after a flush).
     pub reset_eq: AtomicBool,
+    /// f32 bits: the last buffer's loudness (RMS) in four bands, bass first, before volume.
+    pub levels: [AtomicU32; 4],
 }
 
 impl Shared {
@@ -63,7 +66,8 @@ pub fn device_format() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
 }
 
 impl Output {
-    /// Builds a stopped stream on `dev`. `on_error` is told about device loss/changes.
+    /// Builds a stopped stream on `dev`. `on_error` is told about device loss/changes: errors
+    /// after which the stream must be rebuilt (see [`needs_rebuild`]).
     pub fn open(
         dev: &cpal::Device,
         cfg: &cpal::SupportedStreamConfig,
@@ -123,6 +127,14 @@ where
 {
     let dev_ch = config.channels as usize;
     let mut r = Render::new(rate);
+    let mut on_error = on_error;
+    let on_error = move |e: cpal::Error| {
+        if needs_rebuild(e.kind()) {
+            on_error(e);
+        } else {
+            log::debug!("output: {e}");
+        }
+    };
     dev.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| r.fill(data, dev_ch, &shared, &ring),
@@ -132,11 +144,62 @@ where
     .map_err(|e| Error::Device(e.to_string()))
 }
 
+/// Whether a stream error means the stream is dead or on the wrong device. Glitches, a refused
+/// real-time priority and a route the backend already followed by itself don't.
+pub fn needs_rebuild(kind: cpal::ErrorKind) -> bool {
+    use cpal::ErrorKind as K;
+    !matches!(kind, K::Xrun | K::RealtimeDenied | K::DeviceChanged)
+}
+
 /// The callback's private state.
 pub struct Render {
     eq: Eq,
     scratch: Vec<f32>,
-    gain: f32,
+    /// The gain last applied; `None` until the first buffer, which starts at the set volume
+    /// (a fresh stream, e.g. after a device change, must not ramp down from full volume).
+    gain: Option<f32>,
+    meter: Meter,
+}
+
+/// Splits mono into four bands with one-pole low-passes at 150 Hz, 600 Hz and 2.5 kHz (each
+/// band is the difference between neighbours) and keeps each band's RMS.
+struct Meter {
+    k: [f32; 3],
+    lp: [f32; 3],
+}
+
+impl Meter {
+    fn new(rate: u32) -> Self {
+        let k = [150.0f32, 600.0, 2500.0]
+            .map(|f| 1.0 - (-2.0 * std::f32::consts::PI * f / rate.max(1) as f32).exp());
+        Meter { k, lp: [0.0; 3] }
+    }
+
+    fn measure(&mut self, buf: &[f32], out: &[AtomicU32; 4]) {
+        let frames = buf.len() / CH;
+        if frames == 0 {
+            return;
+        }
+        let mut sum = [0f32; 4];
+        for f in buf.as_chunks::<CH>().0 {
+            let x = (f[0] + f[1]) * 0.5;
+            for i in 0..3 {
+                self.lp[i] += self.k[i] * (x - self.lp[i]);
+            }
+            let bands = [
+                self.lp[0],
+                self.lp[1] - self.lp[0],
+                self.lp[2] - self.lp[1],
+                x - self.lp[2],
+            ];
+            for i in 0..4 {
+                sum[i] += bands[i] * bands[i];
+            }
+        }
+        for i in 0..4 {
+            out[i].store((sum[i] / frames as f32).sqrt().to_bits(), Ordering::Relaxed);
+        }
+    }
 }
 
 impl Render {
@@ -144,7 +207,8 @@ impl Render {
         Render {
             eq: Eq::new(rate, STEP),
             scratch: vec![0.0; STEP * CH],
-            gain: 1.0,
+            gain: None,
+            meter: Meter::new(rate),
         }
     }
 
@@ -177,8 +241,9 @@ impl Render {
             }
             let buf = &mut self.scratch[..got * CH];
             self.eq.process(&shared.eq, buf);
+            self.meter.measure(buf, &shared.levels);
             let target = f32::from_bits(shared.volume.load(Ordering::Relaxed));
-            ramp_gain(buf, &mut self.gain, target);
+            ramp_gain(buf, self.gain.get_or_insert(target), target);
             write_out(out, buf, dev_ch);
         }
     }
@@ -255,5 +320,50 @@ mod tests {
                 .all(|(a, b)| a.to_bits() == b.to_bits())
         );
         assert_eq!(shared.played.load(Ordering::Relaxed), 10000);
+    }
+
+    #[test]
+    fn fresh_stream_starts_at_the_set_volume() {
+        let shared = Shared::new();
+        shared.volume.store(0.25f32.to_bits(), Ordering::Relaxed);
+        let (mut p, c) = rtrb::RingBuffer::<f32>::new(1 << 12);
+        let _ = p.push_partial_slice(&[1.0; 512]);
+        let ring = Arc::new(Mutex::new(c));
+        let mut r = Render::new(48000);
+        let mut out = vec![0f32; 512];
+        r.fill(&mut out, 2, &shared, &ring);
+        assert!(out.iter().all(|&s| s == 0.25), "{:?}", &out[..4]);
+    }
+
+    #[test]
+    fn only_dead_streams_are_rebuilt() {
+        use cpal::ErrorKind as K;
+        assert!(needs_rebuild(K::StreamInvalidated));
+        assert!(needs_rebuild(K::DeviceNotAvailable));
+        assert!(needs_rebuild(K::BackendError));
+        assert!(!needs_rebuild(K::Xrun));
+        assert!(!needs_rebuild(K::RealtimeDenied));
+        assert!(!needs_rebuild(K::DeviceChanged));
+    }
+
+    #[test]
+    fn meter_sorts_bass_from_treble() {
+        let rate = 48000.0;
+        let level = |hz: f32| {
+            let mut m = Meter::new(rate as u32);
+            let tone: Vec<f32> = (0..9600)
+                .flat_map(|i| {
+                    let s = (i as f32 * hz * 2.0 * std::f32::consts::PI / rate).sin();
+                    [s, s]
+                })
+                .collect();
+            let out: [AtomicU32; 4] = Default::default();
+            m.measure(&tone, &out);
+            out.map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
+        };
+        let low = level(60.0);
+        let high = level(8000.0);
+        assert!(low[0] > low[3] * 4.0, "{low:?}");
+        assert!(high[3] > high[0] * 4.0, "{high:?}");
     }
 }
