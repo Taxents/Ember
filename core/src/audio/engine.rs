@@ -151,7 +151,11 @@ enum Cmd {
         id: String,
         result: Result<Loaded>,
     },
-    DeviceError(String),
+    /// From the stream opened as output number `output`.
+    DeviceError {
+        output: u64,
+        error: String,
+    },
     Quit,
 }
 
@@ -522,6 +526,8 @@ struct Worker {
     play_load: Option<(u64, Cancel)>,
     /// Numbers loads: a result that is no longer wanted matches neither of the above.
     load_serial: u64,
+    /// Outputs opened so far; the current one is number `outputs`.
+    outputs: u64,
     finished_sent: bool,
     idle_since: Option<Instant>,
     /// The output must be (re)opened at this time (device changed or lost, or none yet).
@@ -572,6 +578,7 @@ impl Worker {
             next_load: None,
             play_load: None,
             load_serial: 0,
+            outputs: 0,
             finished_sent: true,
             idle_since: Some(Instant::now()),
             reopen_at: None,
@@ -611,10 +618,15 @@ impl Worker {
             (Some(p), Arc::new(Mutex::new(c)))
         };
         let tx = self.cmd_tx.clone();
+        self.outputs += 1;
+        let output = self.outputs;
         let out = match &dev {
             Some((dev, cfg)) => {
                 Output::open(dev, cfg, self.shared.clone(), consumer.clone(), move |e| {
-                    let _ = tx.send(Cmd::DeviceError(e.to_string()));
+                    let _ = tx.send(Cmd::DeviceError {
+                        output,
+                        error: e.to_string(),
+                    });
                 })?
             }
             None => Output::null(rate),
@@ -722,7 +734,7 @@ impl Worker {
             Cmd::Announce => {}
             Cmd::Stop => self.stop(),
             Cmd::Loaded { serial, id, result } => self.loaded(serial, id, result),
-            Cmd::DeviceError(e) => self.device_error(e),
+            Cmd::DeviceError { output, error } => self.device_error(output, error),
         }
         true
     }
@@ -1215,8 +1227,13 @@ impl Worker {
     }
 
     /// Device lost or changed: reopen on the (new) default device shortly. Errors come in
-    /// bursts, so they are coalesced into one reopen.
-    fn device_error(&mut self, e: String) {
+    /// bursts, so they are coalesced into one reopen; those from a stream already replaced are
+    /// old news.
+    fn device_error(&mut self, output: u64, e: String) {
+        if output != self.outputs {
+            log::debug!("output device error from a replaced stream: {e}");
+            return;
+        }
         log::warn!("output device error: {e}");
         let _ = self.events.send(Event::Device(e));
         if self.reopen_at.is_none() {
@@ -1737,6 +1754,26 @@ mod tests {
         assert_eq!(r.events(), ["started a", "started b"]);
         assert_eq!(r.loads(), ["a", "b"]);
         assert!(r.cancelled.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_error_from_a_replaced_output_is_ignored() {
+        let mut r = Rig::new();
+        let old = r.w.outputs;
+        r.w.reopen();
+        assert_eq!(r.w.outputs, old + 1);
+        r.w.handle(Cmd::DeviceError {
+            output: old,
+            error: "gone".into(),
+        });
+        assert!(r.w.reopen_at.is_none());
+        assert!(r.events().is_empty());
+        r.w.handle(Cmd::DeviceError {
+            output: old + 1,
+            error: "gone".into(),
+        });
+        assert!(r.w.reopen_at.is_some());
+        assert_eq!(r.events().len(), 1);
     }
 
     #[test]
