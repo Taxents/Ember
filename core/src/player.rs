@@ -100,8 +100,36 @@ impl<E: Playback> Player<E> {
         )
     }
 
+    /// The queue played to its end (nothing after the last song).
+    pub fn ended(&self) -> bool {
+        self.ended
+    }
+
     pub fn shuffle(&self) -> bool {
         self.shuffle
+    }
+
+    /// Where each track in play order sits in the queue as it was before shuffling.
+    pub fn order(&self) -> &[usize] {
+        &self.order
+    }
+
+    /// Restores a shuffled queue exactly: `queue` in its own order, `order` the play order as
+    /// indices into it. False (and nothing changed) when `order` isn't a reordering of `queue`.
+    pub fn restore_shuffled(&mut self, queue: Vec<String>, order: Vec<usize>, at: usize) -> bool {
+        let mut seen = vec![false; queue.len()];
+        if order.len() != queue.len()
+            || !order
+                .iter()
+                .all(|&i| i < seen.len() && !std::mem::replace(&mut seen[i], true))
+        {
+            return false;
+        }
+        self.queue = queue;
+        self.order = order;
+        self.at = at.min(self.queue.len().saturating_sub(1));
+        self.shuffle = true;
+        true
     }
 
     /// Restores a saved queue without starting playback (`play_current` starts it).
@@ -426,6 +454,23 @@ mod tests {
         let mut p = Player::new(Fake::default());
         p.play_queue(ids(list), start);
         p
+    }
+
+    #[test]
+    fn a_shuffled_queue_comes_back_as_it_was() {
+        let mut p = Player::new(Fake::default());
+        assert!(p.restore_shuffled(ids("a b c d"), vec![2, 0, 3, 1], 1));
+        assert_eq!(shown(&p), "c [a] d b");
+        assert!(p.shuffle());
+        // Shuffle off: the order from before shuffling, still on the same song.
+        p.set_shuffle(false);
+        assert_eq!(shown(&p), "[a] b c d");
+        // Not a reordering of the queue: refused, nothing changed.
+        let mut q = Player::new(Fake::default());
+        assert!(!q.restore_shuffled(ids("a b c"), vec![0, 0, 1], 0));
+        assert!(!q.restore_shuffled(ids("a b c"), vec![0, 1], 0));
+        assert!(!q.restore_shuffled(ids("a b"), vec![0, 5], 0));
+        assert_eq!(shown(&q), "");
     }
 
     /// The queue as shown: play order, the current one in brackets.

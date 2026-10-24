@@ -72,6 +72,9 @@ pub struct SavedQueue {
     pub repeat: Repeat,
     /// The queue is a radio: the song it grows from, its choices and the one picked.
     pub autoplay: Option<(String, Vec<Chip>, usize)>,
+    /// Shuffled: where each of `tracks` (play order) was in the queue before shuffling, so
+    /// turning shuffle off after a restart goes back to that order. Empty when not shuffled.
+    pub shuffled_from: Vec<usize>,
 }
 
 fn load<T: for<'a> Deserialize<'a> + Default>(name: &str) -> T {

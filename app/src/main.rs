@@ -763,11 +763,26 @@ impl App {
             for t in q.tracks {
                 self.known.insert(t.video_id.clone(), t);
             }
-            self.player.restore(ids, q.at);
-            self.player.set_repeat(q.repeat);
-            if q.shuffle {
-                self.player.set_shuffle(true);
+            // Shuffled: the queue's own order back from where each song came from, so it plays
+            // on in the same order and shuffle off goes back to the one before.
+            let mut queue = vec![String::new(); ids.len()];
+            let exact = q.shuffle
+                && q.shuffled_from.len() == ids.len()
+                && q.shuffled_from.iter().all(|&i| i < ids.len())
+                && {
+                    for (k, &i) in q.shuffled_from.iter().enumerate() {
+                        queue[i] = ids[k].clone();
+                    }
+                    self.player
+                        .restore_shuffled(queue, q.shuffled_from.clone(), q.at)
+                };
+            if !exact {
+                self.player.restore(ids, q.at);
+                if q.shuffle {
+                    self.player.set_shuffle(true);
+                }
             }
+            self.player.set_repeat(q.repeat);
             self.resume_at = Some(q.position_ms);
             // Still a radio: its choices show, and it isn't started again from scratch.
             self.autoplay = q.autoplay.map(|(seed, chips, picked)| Autoplay {
@@ -2981,10 +2996,13 @@ impl App {
                 m.timeline(np.position_ms.max(0) as u64, dur);
             }
         }
-        g.set_np(np);
         // A song that's current but not audible yet (loading, seeking, a skip) keeps the clock
-        // asking for a while: its start can come without an event that would wake it again.
-        let waiting = pos.is_none() && self.player.current().is_some();
+        // asking for a while: its start can come without an event that would wake it again. A
+        // queue restored at start isn't waited for until it's played, nor one played to its end.
+        let waiting = pos.is_none()
+            && self.player.current().is_some()
+            && self.resume_at.is_none()
+            && !self.player.ended();
         let waited = if waiting {
             self.waiting_since
                 .get_or_insert_with(std::time::Instant::now)
@@ -2993,6 +3011,9 @@ impl App {
             self.waiting_since = None;
             Duration::ZERO
         };
+        // The play button spins while it waits (not forever: 20 s, as the clock does).
+        np.loading = waiting && waited < Duration::from_secs(20);
+        g.set_np(np);
         if waiting && (3000..3250).contains(&waited.as_millis()) {
             log::warn!(
                 "{}: no audible position after 3 s",
@@ -3086,15 +3107,23 @@ impl App {
 
     fn save_queue(&self) {
         let (order, at) = self.player.up_next();
+        let tracks: Vec<Track> = order
+            .iter()
+            .filter_map(|id| {
+                let mut t = self.known.get(*id).cloned()?;
+                t.duration_ms = t.duration_ms.or_else(|| self.lengths.get(*id).copied());
+                Some(t)
+            })
+            .collect();
+        // Only when every song made it: a gap would shift the positions.
+        let shuffled_from = if self.player.shuffle() && tracks.len() == order.len() {
+            self.player.order().to_vec()
+        } else {
+            Vec::new()
+        };
         SavedQueue {
-            tracks: order
-                .iter()
-                .filter_map(|id| {
-                    let mut t = self.known.get(*id).cloned()?;
-                    t.duration_ms = t.duration_ms.or_else(|| self.lengths.get(*id).copied());
-                    Some(t)
-                })
-                .collect(),
+            tracks,
+            shuffled_from,
             at,
             position_ms: self
                 .player
