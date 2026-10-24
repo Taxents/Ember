@@ -285,6 +285,30 @@ fn liked_songs() {
 }
 
 #[test]
+fn home_undo_tokens() {
+    let v = load("home.json");
+    let undo = parse::feedback_undo(&v);
+    assert!(!undo.is_empty(), "Not interested carries an Undo token");
+    for (t, u) in &undo {
+        assert!(!t.is_empty() && !u.is_empty() && t != u);
+    }
+    // Each pairs with a token the parsed items carry.
+    let f = parse::feed(&v);
+    let item_tokens: Vec<&str> = f
+        .shelves
+        .iter()
+        .flat_map(|s| &s.items)
+        .filter_map(|i| match i {
+            Item::Track(t) => t.not_interested.as_deref(),
+            Item::Album(a) => a.not_interested.as_deref(),
+            Item::Playlist(p) => p.not_interested.as_deref(),
+            _ => None,
+        })
+        .collect();
+    assert!(undo.iter().any(|(t, _)| item_tokens.contains(&t.as_str())));
+}
+
+#[test]
 fn home_not_interested() {
     let Some(v) = private("home_signed_in.json") else {
         return;

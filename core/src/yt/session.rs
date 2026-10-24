@@ -10,7 +10,8 @@ pub const ORIGIN: &str = "https://music.youtube.com";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
-    /// name → value, for `.youtube.com` / `music.youtube.com` / `.google.com` as captured.
+    /// name → value: the cookies the sign-in browser would send to `https://music.youtube.com`
+    /// (set for `.youtube.com` or `music.youtube.com`; Google's own are left behind).
     pub cookies: Vec<(String, String)>,
     /// Unix seconds when signed in.
     pub created: u64,
