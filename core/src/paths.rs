@@ -111,9 +111,15 @@ mod tests {
         std::fs::write(base.join(APP_DIR).join("settings.json"), b"stray").unwrap();
         let dir = home(base.clone());
         assert_eq!(dir, base.join(APP_DIR));
-        assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), b"current");
+        assert_eq!(
+            std::fs::read(dir.join("settings.json")).unwrap(),
+            b"current"
+        );
         let aside = base.join(format!("{APP_DIR} (before {OLD_DIR} moved in)"));
-        assert_eq!(std::fs::read(aside.join("settings.json")).unwrap(), b"stray");
+        assert_eq!(
+            std::fs::read(aside.join("settings.json")).unwrap(),
+            b"stray"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
