@@ -18,7 +18,8 @@ pub struct EqSettings {
     pub enabled: bool,
     /// Per band, dB.
     pub gains: [f32; 10],
-    /// dB. `None` = automatic: minus the largest boost, so boosts can't clip.
+    /// dB. `None` = automatic: minus the loudest point of the whole curve, so boosts can't
+    /// clip (neighbouring bands overlap, so their boosts add up).
     pub preamp: Option<f32>,
 }
 
@@ -29,7 +30,7 @@ impl EqSettings {
 
     pub fn preamp_db(&self) -> f32 {
         self.preamp
-            .unwrap_or_else(|| -self.gains.iter().cloned().fold(0.0, f32::max))
+            .unwrap_or_else(|| -peak_db(&self.gains).max(0.0) as f32)
             .clamp(-24.0, MAX_DB)
     }
 
@@ -42,6 +43,89 @@ impl EqSettings {
             _ => return None,
         })
     }
+}
+
+/// Where the response is checked: log-spaced over the audible range.
+const CURVE_POINTS: usize = 256;
+/// The rate the curve is checked at (below 20 kHz the device rate barely matters).
+const CURVE_RATE: f64 = 48000.0;
+
+/// The filter kind of band `i`: low shelf, peaks, high shelf.
+fn kind(i: usize) -> usize {
+    match i {
+        0 => 0,
+        9 => 2,
+        _ => 1,
+    }
+}
+
+/// The gain of all bands together at `freq`, dB.
+fn response_db(gains: &[f32; 10], freq: f64) -> f64 {
+    let w = 2.0 * std::f64::consts::PI * freq / CURVE_RATE;
+    gains
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| **g != 0.0)
+        .map(|(i, g)| {
+            let [b0, b1, b2, a1, a2] = coeffs(kind(i), BANDS[i], *g as f64, CURVE_RATE);
+            let mag2 = |c0: f64, c1: f64, c2: f64| {
+                let re = c0 + c1 * w.cos() + c2 * (2.0 * w).cos();
+                let im = c1 * w.sin() + c2 * (2.0 * w).sin();
+                re * re + im * im
+            };
+            10.0 * (mag2(b0, b1, b2) / mag2(1.0, a1, a2)).log10()
+        })
+        .sum()
+}
+
+/// The loudest point of the curve, dB.
+fn peak_db(gains: &[f32; 10]) -> f64 {
+    (0..CURVE_POINTS)
+        .map(|i| 20.0 * 1000f64.powf(i as f64 / (CURVE_POINTS - 1) as f64))
+        .map(|f| response_db(gains, f))
+        .fold(f64::MIN, f64::max)
+}
+
+/// RBJ biquad coefficients, normalised: `[b0, b1, b2, a1, a2]`. `kind`: 0 low shelf, 1 peak,
+/// 2 high shelf.
+fn coeffs(kind: usize, freq: f64, db: f64, rate: f64) -> [f64; 5] {
+    let a = 10f64.powf(db / 40.0);
+    let w0 = 2.0 * std::f64::consts::PI * (freq / rate).min(0.49);
+    let (sin, cos) = w0.sin_cos();
+    let alpha = sin / (2.0 * Q);
+    let (b0, b1, b2, a0, a1, a2) = match kind {
+        0 => {
+            let k = 2.0 * a.sqrt() * alpha;
+            (
+                a * ((a + 1.0) - (a - 1.0) * cos + k),
+                2.0 * a * ((a - 1.0) - (a + 1.0) * cos),
+                a * ((a + 1.0) - (a - 1.0) * cos - k),
+                (a + 1.0) + (a - 1.0) * cos + k,
+                -2.0 * ((a - 1.0) + (a + 1.0) * cos),
+                (a + 1.0) + (a - 1.0) * cos - k,
+            )
+        }
+        2 => {
+            let k = 2.0 * a.sqrt() * alpha;
+            (
+                a * ((a + 1.0) + (a - 1.0) * cos + k),
+                -2.0 * a * ((a - 1.0) + (a + 1.0) * cos),
+                a * ((a + 1.0) + (a - 1.0) * cos - k),
+                (a + 1.0) - (a - 1.0) * cos + k,
+                2.0 * ((a - 1.0) - (a + 1.0) * cos),
+                (a + 1.0) - (a - 1.0) * cos - k,
+            )
+        }
+        _ => (
+            1.0 + alpha * a,
+            -2.0 * cos,
+            1.0 - alpha * a,
+            1.0 + alpha / a,
+            -2.0 * cos,
+            1.0 - alpha / a,
+        ),
+    };
+    [b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0]
 }
 
 /// Lock-free hand-over of settings from the UI to the audio callback.
@@ -91,48 +175,13 @@ struct Biquad {
 
 impl Biquad {
     fn design(kind: usize, freq: f64, db: f64, rate: f64) -> Self {
-        let a = 10f64.powf(db / 40.0);
-        let w0 = 2.0 * std::f64::consts::PI * (freq / rate).min(0.49);
-        let (sin, cos) = w0.sin_cos();
-        let alpha = sin / (2.0 * Q);
-        let (b0, b1, b2, a0, a1, a2) = match kind {
-            0 => {
-                let k = 2.0 * a.sqrt() * alpha;
-                (
-                    a * ((a + 1.0) - (a - 1.0) * cos + k),
-                    2.0 * a * ((a - 1.0) - (a + 1.0) * cos),
-                    a * ((a + 1.0) - (a - 1.0) * cos - k),
-                    (a + 1.0) + (a - 1.0) * cos + k,
-                    -2.0 * ((a - 1.0) + (a + 1.0) * cos),
-                    (a + 1.0) + (a - 1.0) * cos - k,
-                )
-            }
-            2 => {
-                let k = 2.0 * a.sqrt() * alpha;
-                (
-                    a * ((a + 1.0) + (a - 1.0) * cos + k),
-                    -2.0 * a * ((a - 1.0) + (a + 1.0) * cos),
-                    a * ((a + 1.0) + (a - 1.0) * cos - k),
-                    (a + 1.0) - (a - 1.0) * cos + k,
-                    2.0 * ((a - 1.0) - (a + 1.0) * cos),
-                    (a + 1.0) - (a - 1.0) * cos - k,
-                )
-            }
-            _ => (
-                1.0 + alpha * a,
-                -2.0 * cos,
-                1.0 - alpha * a,
-                1.0 + alpha / a,
-                -2.0 * cos,
-                1.0 - alpha / a,
-            ),
-        };
+        let [b0, b1, b2, a1, a2] = coeffs(kind, freq, db, rate).map(|c| c as f32);
         Biquad {
-            b0: (b0 / a0) as f32,
-            b1: (b1 / a0) as f32,
-            b2: (b2 / a0) as f32,
-            a1: (a1 / a0) as f32,
-            a2: (a2 / a0) as f32,
+            b0,
+            b1,
+            b2,
+            a1,
+            a2,
             ..Default::default()
         }
     }
@@ -208,12 +257,7 @@ impl Eq {
             let (on, pre_db, gains) = shared.snapshot();
             let mut next = self.bank;
             for (i, (f, g)) in next.filters.iter_mut().zip(gains).enumerate() {
-                let kind = match i {
-                    0 => 0,
-                    9 => 2,
-                    _ => 1,
-                };
-                f.retune(&Biquad::design(kind, BANDS[i], g as f64, self.rate));
+                f.retune(&Biquad::design(kind(i), BANDS[i], g as f64, self.rate));
                 next.active[i] = g != 0.0;
             }
             next.pre = 10f32.powf(pre_db / 20.0);
@@ -287,6 +331,61 @@ mod tests {
                 .zip(&buf)
                 .all(|(a, b)| a.to_bits() == b.to_bits())
         );
+    }
+
+    #[test]
+    fn auto_preamp_covers_overlapping_boosts() {
+        let mut one = [0.0; 10];
+        one[5] = 6.0;
+        let single = EqSettings {
+            enabled: true,
+            gains: one,
+            preamp: None,
+        };
+        assert!(
+            (single.preamp_db() + 6.0).abs() < 0.2,
+            "{}",
+            single.preamp_db()
+        );
+        // Neighbouring boosts add up past the largest one.
+        let bass = EqSettings {
+            gains: EqSettings::preset("bass").unwrap(),
+            ..single
+        };
+        assert!(bass.preamp_db() < -6.5, "{}", bass.preamp_db());
+        assert!(peak_db(&bass.gains) + (bass.preamp_db() as f64) < 0.01);
+        // Cuts need next to none (only the shelves' small overshoot).
+        let cut = EqSettings {
+            gains: [-6.0; 10],
+            ..single
+        };
+        assert!(cut.preamp_db() > -0.5, "{}", cut.preamp_db());
+    }
+
+    #[test]
+    fn a_full_scale_tone_at_the_loudest_point_does_not_clip() {
+        let gains = EqSettings::preset("bass").unwrap();
+        let loudest = (0..CURVE_POINTS)
+            .map(|i| 20.0 * 1000f64.powf(i as f64 / (CURVE_POINTS - 1) as f64))
+            .max_by(|a, b| response_db(&gains, *a).total_cmp(&response_db(&gains, *b)))
+            .unwrap();
+        let shared = SharedEq::default();
+        shared.set(&EqSettings {
+            enabled: true,
+            gains,
+            preamp: None,
+        });
+        let mut eq = Eq::new(48000, 48000);
+        let mut buf: Vec<f32> = (0..48000)
+            .flat_map(|i| {
+                let s = (2.0 * std::f64::consts::PI * loudest * i as f64 / 48000.0).sin() as f32;
+                [s, s]
+            })
+            .collect();
+        eq.process(&shared, &mut buf[..2]);
+        eq.process(&shared, &mut buf[2..]);
+        let peak = buf[48000..].iter().fold(0f32, |m, s| m.max(s.abs()));
+        assert!(peak <= 1.01, "peak {peak} at {loudest:.0} Hz");
     }
 
     #[test]
