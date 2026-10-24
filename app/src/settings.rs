@@ -28,6 +28,8 @@ pub struct Settings {
     pub playlist_order: Vec<String>,
     /// Your name in Listen Along.
     pub together_name: String,
+    /// Lyrics are also looked up on Unison and LRCLIB, which are sent the song's details.
+    pub lyrics_third_party: bool,
 }
 
 impl Default for Settings {
@@ -44,6 +46,7 @@ impl Default for Settings {
             hidden_playlists: Vec::new(),
             playlist_order: Vec::new(),
             together_name: default_name(),
+            lyrics_third_party: true,
         }
     }
 }

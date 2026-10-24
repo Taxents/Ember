@@ -649,6 +649,10 @@ fn song(client: &Client, id: &str) -> Result<Loaded> {
     })
 }
 
+/// Whether lyrics may come from Unison and LRCLIB too (Settings > Lyrics).
+pub static THIRD_PARTY_LYRICS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 /// A song's lyrics (`lyrics::find`: Unison, YouTube's timed ones, LRCLIB, then plain; cached).
 /// `lyrics_id` is the watch page's lyrics tab when the caller has it.
 pub fn lyrics_for(client: &Client, t: &Track, lyrics_id: Option<&str>) -> Option<Lyrics> {
@@ -664,7 +668,7 @@ pub fn lyrics_for(client: &Client, t: &Track, lyrics_id: Option<&str>) -> Option
         album: t.album.as_ref().map(|a| a.name.as_str()),
         duration_ms: t.duration_ms,
         lyrics_id,
-        third_party: true,
+        third_party: THIRD_PARTY_LYRICS.load(std::sync::atomic::Ordering::Relaxed),
     };
     let l = lyrics::find(client, &q);
     log::info!(

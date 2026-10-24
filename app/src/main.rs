@@ -220,6 +220,8 @@ struct App {
     minimized: bool,
     /// Another window is active: the clock moves once a second and the meter rests.
     unfocused: bool,
+    /// The signed-out toast was shown for the current expiry.
+    told_expired: bool,
     /// Runs while skips come quickly; when it ends, the song they stopped at plays.
     skip_timer: Timer,
     /// Skips moved past songs without playing them (see [`App::skip`]).
@@ -348,6 +350,7 @@ fn main() {
         resume_at: None,
         minimized: false,
         unfocused: false,
+        told_expired: false,
         skip_timer: Timer::default(),
         skip_pending: false,
         waiting_since: None,
@@ -377,6 +380,8 @@ fn main() {
     workers::spawn(images::prune_disk);
     update::clean_up();
     update::watch(update::show);
+    // A sign-in that crashed or was killed leaves a browser profile holding Google cookies.
+    workers::spawn(|| signin::clean_up(&webview_dir()));
 
     // Window handle work needs the native window, which exists once the event loop runs.
     let _ = slint::invoke_from_event_loop(|| {
@@ -513,6 +518,18 @@ fn wire(ui: &AppWindow) {
             a.settings.save();
             a.forget_pages(PageKind::AllPlaylists);
             a.load_playlists();
+        });
+    });
+    g.on_lyrics_third_party_changed(|on| {
+        pages::THIRD_PARTY_LYRICS.store(on, std::sync::atomic::Ordering::Relaxed);
+        with(|a| {
+            a.settings.lyrics_third_party = on;
+            a.save_later();
+        });
+    });
+    g.on_reset_lyrics_id(|| {
+        workers::run_ordered(music_core::lyrics::reset_key_id, |()| {
+            with(|a| a.notify("Unison has a new ID for this app"));
         });
     });
     g.on_open_data_folder(|| {
@@ -730,6 +747,11 @@ impl App {
         g.set_playlists(ModelRc::from(self.playlist_rows.clone()));
         g.set_volume(self.settings.volume);
         g.set_sidebar_collapsed(self.settings.sidebar_collapsed);
+        g.set_lyrics_third_party(self.settings.lyrics_third_party);
+        pages::THIRD_PARTY_LYRICS.store(
+            self.settings.lyrics_third_party,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         g.set_panel_open(self.settings.panel_open);
         g.set_panel_tab(self.settings.panel_tab);
         self.set_volume(self.settings.volume);
@@ -1221,6 +1243,9 @@ impl App {
                     music_core::Error::Net(_) => {
                         self.went_offline();
                         "Couldn't load this page. Check your connection."
+                    }
+                    _ if self.session_check() => {
+                        "YouTube signed you out. Sign in to see this page."
                     }
                     _ => "Couldn't load this page.",
                 }
@@ -3265,11 +3290,7 @@ impl App {
         let client = self.client.clone();
         // The sign-in window runs its own message loop on its own thread.
         std::thread::spawn(move || {
-            let dir = music_core::paths::cache_dir()
-                .parent()
-                .expect("cache dir")
-                .join("webview");
-            let r = signin::sign_in(&dir)
+            let r = signin::sign_in(&webview_dir())
                 .map_err(|e| e.to_string())
                 .and_then(|c| Session::new(c).map_err(|e| e.to_string()))
                 .and_then(|s| {
@@ -3727,27 +3748,9 @@ impl App {
                 else {
                     return;
                 };
-                let (client, playlist) = (self.client.clone(), p.id.clone());
-                let name = p.title.clone();
-                let generation = self.generation;
+                let (playlist, name) = (p.id.clone(), p.title.clone());
                 let showing = self.history[self.at].id == playlist;
-                self.page_cache
-                    .remove(&format!("{:?}|{}", PageKind::Playlist, playlist));
-                workers::run_ordered(
-                    move || client.add_to_playlist(&playlist, &ids),
-                    move |r| {
-                        with(|a| match r {
-                            // Showing that playlist: show it with the new songs.
-                            Ok(()) => {
-                                if showing && a.generation == generation {
-                                    a.reload();
-                                }
-                                a.notify(format!("Added to {name}"));
-                            }
-                            Err(e) => a.account_failed(&format!("add to {name}"), &e, None),
-                        });
-                    },
-                );
+                self.add_to(playlist, name, ids, showing, false);
             }
             MenuTarget::Queue(pos) => {
                 // The queue may have moved on since the menu opened (a song ended, the radio
@@ -3979,6 +3982,9 @@ impl App {
     /// `retry` can do it again.
     fn account_failed(&mut self, what: &str, e: &music_core::Error, retry: Option<toast::Then>) {
         log::warn!("{what}: {e}");
+        if self.session_check() {
+            return;
+        }
         let msg = match e {
             music_core::Error::Net(_) => {
                 self.went_offline();
@@ -3990,6 +3996,66 @@ impl App {
             Some(retry) => self.notify_with(msg, "Retry", retry),
             None => self.notify(msg),
         }
+    }
+
+    /// Adds songs to a playlist. Without `force`, ones it already has are left out and a toast
+    /// offers "Add anyway".
+    fn add_to(
+        &mut self,
+        playlist: String,
+        name: String,
+        ids: Vec<String>,
+        showing: bool,
+        force: bool,
+    ) {
+        self.page_cache
+            .remove(&format!("{:?}|{}", PageKind::Playlist, playlist));
+        let client = self.client.clone();
+        let generation = self.generation;
+        workers::run_ordered(
+            {
+                let (playlist, ids) = (playlist.clone(), ids.clone());
+                move || client.add_to_playlist_checked(&playlist, &ids, force)
+            },
+            move |r| {
+                with(|a| match r {
+                    Ok(added) => {
+                        // Showing that playlist: show it with the new songs.
+                        if showing && a.generation == generation {
+                            a.reload();
+                        }
+                        let skipped = added.skipped;
+                        if skipped.is_empty() {
+                            a.notify(format!("Added to {name}"));
+                            return;
+                        }
+                        let msg = match (ids.len(), skipped.len()) {
+                            (1, _) => format!("Already in {name}"),
+                            (n, k) if n == k => format!("All {n} are already in {name}"),
+                            (n, k) => format!("Added {} to {name}; {k} were already there", n - k),
+                        };
+                        a.notify_with(msg, "Add anyway", move |a| {
+                            a.add_to(playlist, name, skipped, showing, true)
+                        });
+                    }
+                    Err(e) => a.account_failed(&format!("add to {name}"), &e, None),
+                });
+            },
+        );
+    }
+
+    /// YouTube has signed this session out (cookies expired or revoked): say so once, with a
+    /// way to sign in again. True when it has.
+    fn session_check(&mut self) -> bool {
+        if !self.client.session_expired() {
+            self.told_expired = false;
+            return false;
+        }
+        if !self.told_expired {
+            self.told_expired = true;
+            self.notify_with("YouTube signed you out", "Sign in", |a| a.sign_in());
+        }
+        true
     }
 
     fn open_song(&mut self, t: &Track) {
@@ -4854,6 +4920,14 @@ fn lyrics_note(_: &lyrics::Lyrics) -> String {
 }
 
 /// A new page: the page view goes back to the top.
+/// Where sign-in's browser keeps its profile while it runs.
+fn webview_dir() -> std::path::PathBuf {
+    music_core::paths::cache_dir()
+        .parent()
+        .expect("cache dir")
+        .join("webview")
+}
+
 fn g_serial_bump(ui: &AppWindow) {
     let g = ui.global::<Ui>();
     g.set_page_serial(g.get_page_serial().wrapping_add(1));

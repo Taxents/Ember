@@ -247,6 +247,10 @@ export global Ui {
     in property <[SidebarPlaylist]> hidden-playlists;
     callback unhide-playlist(string);
     callback open-data-folder();
+    // Lyrics from Unison and LRCLIB too, and making a new anonymous id for Unison.
+    in-out property <bool> lyrics-third-party: true;
+    callback lyrics-third-party-changed(bool);
+    callback reset-lyrics-id();
     in property <image> account-photo;
     in property <[SidebarPlaylist]> playlists;
     callback sign-in();
@@ -2602,6 +2606,42 @@ component SettingsPage inherits Rectangle {
                     primary: false;
                     clicked => {
                         Ui.eq-open = true;
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 24px;
+            }
+
+            SettingsHeading {
+                text: "LYRICS";
+            }
+
+            SettingRow {
+                title: "Lyrics from other sources";
+                note: "Also look on Unison and LRCLIB, which are sent the song's title, artist, album and length. Off: only YouTube's lyrics.";
+                PillButton {
+                    text: Ui.lyrics-third-party ? "On" : "Off";
+                    primary: Ui.lyrics-third-party;
+                    accessible-role: switch;
+                    accessible-checkable: true;
+                    accessible-checked: Ui.lyrics-third-party;
+                    clicked => {
+                        Ui.lyrics-third-party = !Ui.lyrics-third-party;
+                        Ui.lyrics-third-party-changed(Ui.lyrics-third-party);
+                    }
+                }
+            }
+
+            if Ui.lyrics-third-party: SettingRow {
+                title: "Unison ID";
+                note: "Unison knows this app by a random ID. A new one isn't linked to the lookups made so far.";
+                PillButton {
+                    text: "Make a new one";
+                    primary: false;
+                    clicked => {
+                        Ui.reset-lyrics-id();
                     }
                 }
             }
