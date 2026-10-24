@@ -15,6 +15,10 @@ const OPUS_PREROLL: u64 = 3840;
 const OPUS_RATE: u64 = 48000;
 /// AAC seeks start two packets early: the first packet after a reset has no MDCT overlap.
 const AAC_PREROLL: i64 = 2048;
+/// Decode only when this much past the last read is downloaded. Opus reads give up rather
+/// than wait, so a block or two is enough; symphonia reads ahead and its reads wait.
+const OPUS_AHEAD: u64 = 16 * 1024;
+const AAC_AHEAD: u64 = 64 * 1024;
 
 pub trait Source: Send {
     /// Native sample rate.
@@ -77,7 +81,9 @@ pub struct OpusSource {
 
 impl OpusSource {
     pub fn new(stream: HttpStream) -> Result<Self> {
-        let demux = WebmDemuxer::open(stream)?;
+        let mut demux = WebmDemuxer::open(stream)?;
+        // From here on the decoder thread reads: never wait on the network there.
+        demux.get_mut().set_nonblocking(true);
         let ch = demux.track.channels;
         Ok(OpusSource {
             dec: new_opus(ch)?,
@@ -143,6 +149,10 @@ impl Source for OpusSource {
         Ok(true)
     }
 
+    fn stalled(&self) -> bool {
+        self.demux.get_ref().stalled(OPUS_AHEAD)
+    }
+
     fn seek(&mut self, frame: u64) -> Result<()> {
         let pre_skip = self.demux.track.pre_skip;
         let target = (frame + pre_skip).saturating_sub(OPUS_PREROLL);
@@ -163,6 +173,8 @@ use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 
 pub struct AacSource {
+    /// The download, to see whether reading on would wait.
+    probe: HttpStream,
     fmt: Box<dyn FormatReader>,
     dec: Box<dyn AudioDecoder>,
     track_id: u32,
@@ -178,6 +190,7 @@ pub struct AacSource {
 impl AacSource {
     pub fn new(stream: HttpStream) -> Result<Self> {
         let edit = read_edit_list(&mut stream.reader());
+        let probe = stream.reader();
         let mss = MediaSourceStream::new(Box::new(stream), MediaSourceStreamOptions::default());
         let fmt = symphonia::default::get_probe()
             .probe(
@@ -212,6 +225,7 @@ impl AacSource {
             None => (1600, None),
         };
         Ok(AacSource {
+            probe,
             fmt,
             dec,
             track_id,
@@ -232,6 +246,10 @@ impl Source for AacSource {
 
     fn total_frames(&self) -> Option<u64> {
         self.total
+    }
+
+    fn stalled(&self) -> bool {
+        self.probe.stalled(AAC_AHEAD)
     }
 
     fn read(&mut self, out: &mut Vec<f32>) -> Result<bool> {

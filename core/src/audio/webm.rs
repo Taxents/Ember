@@ -282,42 +282,65 @@ impl<R: Read + Seek> WebmDemuxer<R> {
             if at >= self.segment_end {
                 return Ok(None);
             }
-            let (eid, size) = match read_header(&mut self.r) {
-                Ok(h) => h,
-                // A clean end of file (or a truncated final element) ends the stream; the
-                // download giving up doesn't (that comes back as the stream's own error).
-                Err(Error::Media(_)) => return Ok(None),
+            match self.next_element() {
+                Ok(true) => {}
+                Ok(false) => return Ok(None),
+                // Not downloaded yet: back to the start of the element, to read it whole later.
+                Err(Error::WouldBlock) => {
+                    self.r.seek(SeekFrom::Start(at)).map_err(io)?;
+                    return Err(Error::WouldBlock);
+                }
                 Err(e) => return Err(e),
-            };
-            // Cluster children are read flat, so clusters of unknown size work too.
-            match eid {
-                id::CLUSTER => {}
-                id::TIMECODE => self.cluster_tc = uint(&read_body(&mut self.r, size)?),
-                id::SIMPLE_BLOCK => {
-                    let b = read_body(&mut self.r, size)?;
-                    self.parse_block(&b, 0)?;
-                }
-                id::BLOCK_GROUP => {
-                    let body = read_body(&mut self.r, size)?;
-                    let mut block = None;
-                    let mut padding = 0i64;
-                    for (k, v) in children(&body)? {
-                        match k {
-                            id::BLOCK => block = Some(v),
-                            id::DISCARD_PADDING => padding = sint(v),
-                            _ => {}
-                        }
-                    }
-                    if let Some(b) = block {
-                        self.parse_block(b, padding.max(0) as u64)?;
-                    }
-                }
-                _ if size == UNKNOWN_SIZE => {
-                    return Err(Error::Media(format!("unknown-size element {eid:#x}")));
-                }
-                _ => skip(&mut self.r, size)?,
             }
         }
+    }
+
+    /// Reads one element, queueing any packets in it; `false` at the end of the file.
+    fn next_element(&mut self) -> Result<bool> {
+        let (eid, size) = match read_header(&mut self.r) {
+            Ok(h) => h,
+            // A clean end of file (or a truncated final element) ends the stream; the
+            // download giving up doesn't (that comes back as the stream's own error).
+            Err(Error::Media(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        // Cluster children are read flat, so clusters of unknown size work too.
+        match eid {
+            id::CLUSTER => {}
+            id::TIMECODE => self.cluster_tc = uint(&read_body(&mut self.r, size)?),
+            id::SIMPLE_BLOCK => {
+                let b = read_body(&mut self.r, size)?;
+                self.parse_block(&b, 0)?;
+            }
+            id::BLOCK_GROUP => {
+                let body = read_body(&mut self.r, size)?;
+                let mut block = None;
+                let mut padding = 0i64;
+                for (k, v) in children(&body)? {
+                    match k {
+                        id::BLOCK => block = Some(v),
+                        id::DISCARD_PADDING => padding = sint(v),
+                        _ => {}
+                    }
+                }
+                if let Some(b) = block {
+                    self.parse_block(b, padding.max(0) as u64)?;
+                }
+            }
+            _ if size == UNKNOWN_SIZE => {
+                return Err(Error::Media(format!("unknown-size element {eid:#x}")));
+            }
+            _ => skip(&mut self.r, size)?,
+        }
+        Ok(true)
+    }
+
+    pub fn get_ref(&self) -> &R {
+        &self.r
+    }
+
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.r
     }
 
     fn parse_block(&mut self, b: &[u8], discard_padding_ns: u64) -> Result<()> {
@@ -572,5 +595,97 @@ mod tests {
         assert_eq!(read_vint(&mut c, false).unwrap(), (2, 2));
         let mut c = std::io::Cursor::new([0x1Au8, 0x45, 0xDF, 0xA3]);
         assert_eq!(read_vint(&mut c, true).unwrap(), (0x1A45DFA3, 4));
+    }
+
+    /// An element: its id, an 8-byte size (`None`: unknown) and the body.
+    fn el(eid: u32, size: Option<usize>, body: &[u8]) -> Vec<u8> {
+        let mut v: Vec<u8> = eid
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|b| *b == 0)
+            .collect();
+        let size = size.map_or(0x00FF_FFFF_FFFF_FFFF, |s| s as u64);
+        v.push(0x01);
+        v.extend(&size.to_be_bytes()[1..]);
+        v.extend(body);
+        v
+    }
+
+    fn known(eid: u32, body: &[u8]) -> Vec<u8> {
+        el(eid, Some(body.len()), body)
+    }
+
+    /// One Opus track and a cluster of two 100-byte blocks, 20 ms apart; and where the first
+    /// block starts.
+    fn webm() -> (Vec<u8>, usize) {
+        let mut head = b"OpusHead".to_vec();
+        head.extend([1, 2, 0x38, 0x01, 0x80, 0xBB, 0, 0, 0, 0, 0]);
+        let entry = [
+            known(id::TRACK_NUMBER, &[1]),
+            known(id::TRACK_TYPE, &[2]),
+            known(id::CODEC_ID, b"A_OPUS"),
+            known(id::CODEC_PRIVATE, &head),
+        ]
+        .concat();
+        let block = |rel: u8| {
+            known(
+                id::SIMPLE_BLOCK,
+                &[[0x81, 0, rel, 0x80].as_slice(), &[7; 100]].concat(),
+            )
+        };
+        let mut f = known(id::EBML, &[]);
+        f.extend(el(id::SEGMENT, None, &[]));
+        f.extend(known(id::TRACKS, &known(id::TRACK_ENTRY, &entry)));
+        f.extend(el(id::CLUSTER, None, &[]));
+        f.extend(known(id::TIMECODE, &[0]));
+        let first = f.len();
+        f.extend(block(0));
+        f.extend(block(20));
+        (f, first)
+    }
+
+    /// Bytes past `limit` aren't there yet: reads fail with `WouldBlock`, as the stream's do.
+    struct Partial {
+        data: std::io::Cursor<Vec<u8>>,
+        limit: u64,
+    }
+
+    impl Read for Partial {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let room = self.limit.saturating_sub(self.data.position()) as usize;
+            if room == 0 && (self.data.position() as usize) < self.data.get_ref().len() {
+                return Err(Error::WouldBlock.into());
+            }
+            let n = out.len().min(room);
+            self.data.read(&mut out[..n])
+        }
+    }
+
+    impl Seek for Partial {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.data.seek(to)
+        }
+    }
+
+    #[test]
+    fn a_block_not_downloaded_yet_is_read_whole_later() {
+        let (f, first) = webm();
+        let len = f.len() as u64;
+        let r = Partial {
+            data: std::io::Cursor::new(f),
+            limit: len,
+        };
+        let mut d = WebmDemuxer::open(r).unwrap();
+        assert_eq!(d.track.pre_skip, 312);
+        // Cut off in the middle of the first block.
+        d.get_mut().limit = first as u64 + 50;
+        assert!(matches!(d.next_packet(), Err(Error::WouldBlock)));
+        assert_eq!(d.get_mut().data.position(), first as u64);
+        d.get_mut().limit = len;
+        let p = d.next_packet().unwrap().unwrap();
+        assert_eq!((p.ts_ns, p.data.len()), (0, 100));
+        let p = d.next_packet().unwrap().unwrap();
+        assert_eq!(p.ts_ns, 20_000_000);
+        assert!(d.next_packet().unwrap().is_none());
     }
 }

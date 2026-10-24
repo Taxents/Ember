@@ -14,7 +14,7 @@ use super::clock;
 use super::output::{self, HOLD, Output, Shared, SharedConsumer};
 use super::resample::Resampler;
 use super::source::{self, Source};
-use super::stream::HttpStream;
+use super::stream::{Cancel, HttpStream};
 use crate::audio::eq::EqSettings;
 use crate::yt::Resolver;
 use crate::{Error, Result};
@@ -45,8 +45,11 @@ const REOPEN_RETRY_MAX: Duration = Duration::from_secs(5);
 /// The rate of an output without a device (tests).
 const NULL_RATE: u32 = 48000;
 
-/// Opens a track: resolve, connect, parse headers ([`load`]; a fake one in tests).
-type Loader = Arc<dyn Fn(&str, Sender<Event>) -> Result<Loaded> + Send + Sync>;
+/// Opens a track: resolve, connect, parse headers ([`load`]; a fake one in tests). The token
+/// stops its download.
+type Loader = Arc<dyn Fn(&str, &Cancel, Sender<Event>) -> Result<Loaded> + Send + Sync>;
+/// How long dropping the engine waits for the decoder thread.
+const QUIT_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -147,12 +150,16 @@ pub struct Engine {
     shared: Arc<Shared>,
     timeline: Arc<Mutex<Timeline>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Stops every download the engine started.
+    cancel: Cancel,
+    /// Disconnects when the decoder thread ends.
+    done: Receiver<()>,
 }
 
 impl Engine {
     pub fn new(resolver: Arc<Resolver>) -> Result<Self> {
         Self::with_loader(
-            Arc::new(move |id, events| load(&resolver, id, events)),
+            Arc::new(move |id, cancel, events| load(&resolver, id, cancel, events)),
             false,
         )
     }
@@ -163,6 +170,7 @@ impl Engine {
         let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
         let shared = Shared::new();
         let timeline = Arc::new(Mutex::new(Timeline::default()));
+        let cancel = Cancel::new();
         let mut w = Worker::new(
             loader,
             null_output,
@@ -171,9 +179,14 @@ impl Engine {
             cmd_tx.clone(),
             ev_tx,
         )?;
+        w.cancel = cancel.clone();
+        let (done_tx, done) = crossbeam_channel::bounded::<()>(0);
         let thread = std::thread::Builder::new()
             .name("decoder".into())
-            .spawn(move || w.run(cmd_rx))
+            .spawn(move || {
+                let _done = done_tx;
+                w.run(cmd_rx)
+            })
             .map_err(|e| Error::Device(e.to_string()))?;
         Ok(Engine {
             cmd: cmd_tx,
@@ -181,6 +194,8 @@ impl Engine {
             shared,
             timeline,
             thread: Some(thread),
+            cancel,
+            done,
         })
     }
 
@@ -315,9 +330,20 @@ fn position(shared: &Shared, timeline: &Mutex<Timeline>) -> Option<Position> {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        // Downloads first, so nothing the decoder could be waiting on keeps it.
+        self.cancel.cancel();
         let _ = self.cmd.send(Cmd::Quit);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        let ended = matches!(
+            self.done.recv_timeout(QUIT_WAIT),
+            Err(RecvTimeoutError::Disconnected)
+        );
+        match self.thread.take() {
+            Some(t) if ended => {
+                let _ = t.join();
+            }
+            // Still busy: leave it to end by itself rather than hang the caller.
+            Some(_) => log::warn!("decoder thread did not stop in time"),
+            None => {}
         }
     }
 }
@@ -416,6 +442,8 @@ impl Track {
 
 struct Worker {
     loader: Loader,
+    /// Parent of every load's token.
+    cancel: Cancel,
     /// No device: the ring is read by whoever drives the worker (tests).
     null_output: bool,
     shared: Arc<Shared>,
@@ -471,6 +499,7 @@ impl Worker {
         let (p, c) = RingBuffer::new(2);
         let mut w = Worker {
             loader,
+            cancel: Cancel::new(),
             null_output,
             shared,
             timeline,
@@ -812,10 +841,11 @@ impl Worker {
         let tx = self.cmd_tx.clone();
         let loader = self.loader.clone();
         let events = self.events.clone();
+        let cancel = self.cancel.child();
         std::thread::Builder::new()
             .name("track-load".into())
             .spawn(move || {
-                let result = loader(&id, events);
+                let result = loader(&id, &cancel, events);
                 let _ = tx.send(Cmd::Loaded {
                     generation,
                     next,
@@ -942,13 +972,14 @@ impl Worker {
                 self.maybe_preload();
                 return;
             }
-            // A live stream waiting for the network: come back on the next wake-up.
+            // Waiting for the network: back to the commands, decode on the next wake-up.
             if t.src.stalled() {
                 return;
             }
             self.pcm.clear();
             let more = match t.src.read(&mut self.pcm) {
                 Ok(m) => m,
+                Err(Error::WouldBlock) => return,
                 Err(e) => {
                     let id = t.id.clone();
                     t.eof = true;
@@ -1147,7 +1178,12 @@ impl Worker {
 }
 
 /// Resolve, open the stream and parse headers: everything up to the first decodable packet.
-fn load(resolver: &Arc<Resolver>, id: &str, events: Sender<Event>) -> Result<Loaded> {
+fn load(
+    resolver: &Arc<Resolver>,
+    id: &str,
+    cancel: &Cancel,
+    events: Sender<Event>,
+) -> Result<Loaded> {
     let t0 = Instant::now();
     if crate::radio::is_station(id) {
         // Listening along: the host's relayed bytes, not a connection of our own.
@@ -1174,7 +1210,12 @@ fn load(resolver: &Arc<Resolver>, id: &str, events: Sender<Event>) -> Result<Loa
         r.invalidate(&vid);
         r.refresh(&vid).map(|i| i.url)
     });
-    let stream = match HttpStream::open(info.url.clone(), info.content_length, refresh) {
+    let stream = match HttpStream::open_with(
+        info.url.clone(),
+        info.content_length,
+        refresh,
+        cancel.clone(),
+    ) {
         Ok(s) => s,
         Err(e) => {
             resolver.invalidate(id);
@@ -1267,7 +1308,7 @@ mod tests {
             let loads: Arc<Mutex<Vec<String>>> = Arc::default();
             let loader: Loader = {
                 let (specs, loads) = (specs.clone(), loads.clone());
-                Arc::new(move |id, _| {
+                Arc::new(move |id, _, _| {
                     loads.lock().unwrap().push(id.into());
                     let spec = specs.lock().unwrap().get(id).cloned().unwrap_or_default();
                     std::thread::sleep(spec.load_delay);
@@ -1429,7 +1470,7 @@ mod tests {
         assert_eq!(r.position().map(|p| p.ms), Some(300));
     }
 
-    /// Raw f32 stereo over an `HttpStream`: reads wait on the download as a decoder's do.
+    /// Raw f32 stereo over a non-blocking `HttpStream`, as the Opus decoder reads.
     struct Raw {
         s: HttpStream,
         buf: Vec<u8>,
@@ -1447,9 +1488,13 @@ mod tests {
             let pos = self.s.stream_position().unwrap();
             let n = (960 * 8).min(self.s.len() - pos) as usize;
             self.buf.resize(n, 0);
-            self.s
-                .read_exact(&mut self.buf)
-                .map_err(|e| Error::Net(e.to_string()))?;
+            if let Err(e) = self.s.read_exact(&mut self.buf) {
+                self.s.seek(std::io::SeekFrom::Start(pos)).unwrap();
+                return Err(match e.kind() {
+                    std::io::ErrorKind::WouldBlock => Error::WouldBlock,
+                    _ => Error::Net(e.to_string()),
+                });
+            }
             out.extend(
                 self.buf
                     .as_chunks::<4>()
@@ -1458,6 +1503,9 @@ mod tests {
                     .map(|b| b[0] as f32 / 1000.0),
             );
             Ok(pos + (n as u64) < self.s.len())
+        }
+        fn stalled(&self) -> bool {
+            self.s.stalled(960 * 8)
         }
         fn seek(&mut self, frame: u64) -> Result<()> {
             use std::io::Seek;
@@ -1468,8 +1516,10 @@ mod tests {
 
     /// An engine on its own thread, without a device, playing raw audio from `url`.
     fn raw_engine(url: String) -> Engine {
-        let loader: Loader = Arc::new(move |_, _| {
-            let s = HttpStream::open(url.clone(), None, Box::new(|| Err(Error::Cancelled)))?;
+        let loader: Loader = Arc::new(move |_, cancel, _| {
+            let refresh = Box::new(|| Err(Error::Cancelled));
+            let mut s = HttpStream::open_with(url.clone(), None, refresh, cancel.clone())?;
+            s.set_nonblocking(true);
             Ok(Loaded {
                 duration_ms: None,
                 src: Box::new(Raw { s, buf: Vec::new() }),
@@ -1491,7 +1541,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "H3"]
     fn a_stalled_download_never_holds_up_commands() {
         use crate::audio::testserver::{self, Behaviour};
         // The first unit comes, then nothing: the decoder runs into the stall at once.
