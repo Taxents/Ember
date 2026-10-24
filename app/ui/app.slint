@@ -211,6 +211,10 @@ export global Ui {
     callback toast-act();
     callback toast-dismiss();
     callback toast-hover(bool);
+    // A request failed on the network and the app is checking until it's back.
+    in property <bool> offline;
+    // The page failed to load: try again.
+    callback retry-page();
 
     // Account
     in property <bool> signed-in;
@@ -2528,6 +2532,18 @@ component StatusPage inherits Rectangle {
             font-size: 13px;
             wrap: word-wrap;
         }
+
+        if Ui.page.error != "" && !Ui.page.loading: HorizontalLayout {
+            alignment: start;
+            padding-top: 10px;
+            PillButton {
+                text: "Try again";
+                primary: false;
+                clicked => {
+                    Ui.retry-page();
+                }
+            }
+        }
     }
 }
 
@@ -2556,6 +2572,24 @@ component TopBar inherits Rectangle {
                 enabled: Ui.can-forward;
                 clicked => {
                     Ui.forward();
+                }
+            }
+        }
+
+        if Ui.offline: Rectangle {
+            Rectangle {
+                x: 12px;
+                y: (parent.height - self.height) / 2;
+                height: 26px;
+                width: offline-text.preferred-width + 24px;
+                border-radius: 13px;
+                background: #76291E80;
+                offline-text := Text {
+                    text: "You're offline · Retrying…";
+                    color: Theme.ivory;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
                 }
             }
         }

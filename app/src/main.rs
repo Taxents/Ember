@@ -232,6 +232,9 @@ struct App {
     together: Option<listen::Session>,
     together_timer: Timer,
     toast: toast::Toast,
+    /// A request failed on the network; `offline_timer` checks until one gets through.
+    offline: bool,
+    offline_timer: Timer,
 }
 
 thread_local! {
@@ -334,6 +337,8 @@ fn main() {
         metrics: None,
         metrics_timer: Timer::default(),
         toast: Default::default(),
+        offline: false,
+        offline_timer: Timer::default(),
     };
     APP.with(|a| *a.borrow_mut() = Some(app));
 
@@ -376,6 +381,9 @@ fn forward_engine_events() {
 fn wire(ui: &AppWindow) {
     let g = ui.global::<Ui>();
     toast::wire(&g);
+    g.on_retry_page(|| {
+        with(|a| a.reload());
+    });
     g.on_navigate(|kind, id, title| {
         with(|a| {
             a.navigate(Route {
@@ -1108,11 +1116,58 @@ impl App {
             }
             Err(e) => {
                 log::warn!("page: {e}");
-                page.error = format!("Couldn't load this page ({e}).").into();
+                page.error = match &e {
+                    music_core::Error::Net(_) => {
+                        self.went_offline();
+                        "Couldn't load this page. Check your connection."
+                    }
+                    _ => "Couldn't load this page.",
+                }
+                .into();
             }
         }
         g.set_page(page);
         self.video_sync();
+    }
+
+    /// A request failed on the network: says so, and checks every 10 s until it's back.
+    fn went_offline(&mut self) {
+        if self.offline {
+            return;
+        }
+        self.offline = true;
+        self.ui().global::<Ui>().set_offline(true);
+        self.offline_timer
+            .start(TimerMode::Repeated, Duration::from_secs(10), || {
+                workers::run(
+                    || {
+                        music_core::net::agent()
+                            .head("https://music.youtube.com/")
+                            .call()
+                            .is_ok()
+                    },
+                    |ok| {
+                        if ok {
+                            with(|a| a.back_online());
+                        }
+                    },
+                );
+            });
+    }
+
+    fn back_online(&mut self) {
+        if !self.offline {
+            return;
+        }
+        self.offline = false;
+        self.offline_timer.stop();
+        let ui = self.ui();
+        let g = ui.global::<Ui>();
+        g.set_offline(false);
+        // A page that failed loads now.
+        if !g.get_page().error.is_empty() {
+            self.reload();
+        }
     }
 
     fn push_row(&mut self, r: RowRef, kind: RowKind, row: TrackRow) {
@@ -2429,12 +2484,16 @@ impl App {
             Event::Failed { id, error, .. } => {
                 log::warn!("{id}: {error}");
                 if failed_now && !matches!(error, music_core::Error::Cancelled) {
-                    let title = self.known.get(id).map_or("this song", |t| t.title.as_str());
+                    let title = self
+                        .known
+                        .get(id)
+                        .map_or("this song".to_string(), |t| t.title.clone());
                     let msg = match error {
                         music_core::Error::Unavailable(_) => {
                             format!("'{title}' isn't available to play")
                         }
                         music_core::Error::Net(_) => {
+                            self.went_offline();
                             format!("Couldn't play '{title}': check your connection")
                         }
                         _ => format!("Couldn't play '{title}'"),
@@ -3634,7 +3693,10 @@ impl App {
     fn account_failed(&mut self, what: &str, e: &music_core::Error, retry: Option<toast::Then>) {
         log::warn!("{what}: {e}");
         let msg = match e {
-            music_core::Error::Net(_) => format!("Couldn't {what}: check your connection"),
+            music_core::Error::Net(_) => {
+                self.went_offline();
+                format!("Couldn't {what}: check your connection")
+            }
             _ => format!("Couldn't {what}"),
         };
         match retry {

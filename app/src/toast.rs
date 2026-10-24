@@ -110,7 +110,7 @@ impl App {
     pub fn toast_hover(&mut self, over: bool) {
         if over {
             self.toast.timer.stop();
-        } else if self.ui().global::<Ui>().get_toast_text() != "" {
+        } else if !self.ui().global::<Ui>().get_toast_text().is_empty() {
             self.toast_timer();
         }
     }
