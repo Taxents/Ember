@@ -833,6 +833,7 @@ impl Worker {
 
     /// Drops everything queued for output.
     fn flush(&mut self) {
+        self.shared.flushes.fetch_add(1, Ordering::Relaxed);
         {
             let mut c = self.consumer.lock().unwrap();
             let n = c.slots();
