@@ -59,6 +59,7 @@ impl HttpStream {
             url,
             refresh,
             len: len_hint,
+            published: 0,
         };
         // The first request runs here, so `open` returns with the length known and the first
         // unit available.
@@ -172,6 +173,8 @@ struct Fetcher {
     url: String,
     refresh: Refresh,
     len: Option<u64>,
+    /// Units published so far: a request that brought any is progress, whatever ended it.
+    published: u64,
 }
 
 enum Fetch {
@@ -207,7 +210,12 @@ impl Fetcher {
             let Some((start, n)) = self.next_range() else {
                 return;
             };
-            match self.request(start, n) {
+            let published = self.published;
+            let result = self.request(start, n);
+            if self.published > published {
+                failures = 0;
+            }
+            match result {
                 Fetch::Done | Fetch::Redirected => {
                     failures = 0;
                     refreshed = false;
@@ -322,6 +330,7 @@ impl Fetcher {
             if pos >= unit_end.min(len) {
                 let u = (unit_start / UNIT) as usize;
                 st.have[u] = true;
+                self.published += 1;
                 unit_start = unit_end;
                 self.shared.cv.notify_all();
                 // A reader is blocked somewhere this request won't reach soon: go there.
@@ -389,7 +398,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "M12"]
     fn connections_that_drop_but_make_progress_never_give_up() {
         // Every request after the first ends early, but each one brings two more units.
         let s = testserver::serve(
