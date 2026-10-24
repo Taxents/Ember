@@ -656,6 +656,7 @@ pub fn lyrics_for(client: &Client, t: &Track, lyrics_id: Option<&str>) -> Option
         album: t.album.as_ref().map(|a| a.name.as_str()),
         duration_ms: t.duration_ms,
         lyrics_id,
+        third_party: true,
     };
     let l = lyrics::find(client, &q);
     log::info!(

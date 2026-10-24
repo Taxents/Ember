@@ -70,6 +70,9 @@ pub struct Query<'a> {
     pub duration_ms: Option<u64>,
     /// The watch page's lyrics tab (`WatchNext::lyrics_id`), when the caller already has it.
     pub lyrics_id: Option<&'a str>,
+    /// Ask Unison and LRCLIB too (they're sent the title, artist, album and length). When
+    /// false only YouTube is asked.
+    pub third_party: bool,
 }
 
 /// Cache format; a change here invalidates old files.
@@ -94,8 +97,9 @@ pub fn find(client: &Client, q: &Query) -> Option<Lyrics> {
     }
     let (found, sure) = fetch(client, q);
     // An answer is only kept when every better source answered, so a network hiccup doesn't
-    // pin a worse result (or a miss) for a week.
-    if sure {
+    // pin a worse result (or a miss) for a week. YouTube's alone isn't kept either: it would
+    // stand in for the better ones once they're allowed again.
+    if sure && q.third_party {
         let c = Cached {
             v: CACHE_VERSION,
             at: paths::unix_now(),
@@ -128,10 +132,12 @@ fn fetch(client: &Client, q: &Query) -> (Option<Lyrics>, bool) {
         *sure = false;
     };
     let mut plain = None;
-    match unison(q) {
-        Ok(Some(l)) if l.synced() => return (Some(estimated(l)), sure),
-        Ok(l) => plain = plain.or(l),
-        Err(e) => failed(&mut sure, "unison", e),
+    if q.third_party {
+        match unison(q) {
+            Ok(Some(l)) if l.synced() => return (Some(estimated(l)), sure),
+            Ok(l) => plain = plain.or(l),
+            Err(e) => failed(&mut sure, "unison", e),
+        }
     }
     let lyrics_id = match q.lyrics_id {
         Some(id) => Some(id.to_string()),
@@ -150,10 +156,12 @@ fn fetch(client: &Client, q: &Query) -> (Option<Lyrics>, bool) {
             Err(e) => failed(&mut sure, "youtube timed", e),
         }
     }
-    match lrclib(q) {
-        Ok(Some(l)) if l.synced() => return (Some(estimated(l)), sure),
-        Ok(l) => plain = plain.or(l),
-        Err(e) => failed(&mut sure, "lrclib", e),
+    if q.third_party {
+        match lrclib(q) {
+            Ok(Some(l)) if l.synced() => return (Some(estimated(l)), sure),
+            Ok(l) => plain = plain.or(l),
+            Err(e) => failed(&mut sure, "lrclib", e),
+        }
     }
     if plain.is_none()
         && let Some(id) = &lyrics_id
@@ -208,47 +216,45 @@ pub fn unison(q: &Query) -> Result<Option<Lyrics>> {
     Ok(Some(l))
 }
 
-/// Our Unison key id: 64 hex digits, like Better Lyrics' SHA-256 of its public key.
+/// Our Unison key id: 64 hex digits, like Better Lyrics' SHA-256 of its public key. Random,
+/// made once and kept, so Unison can tell requests apart without knowing who sends them.
 fn key_id() -> String {
-    use std::sync::OnceLock;
-    static KEY: OnceLock<String> = OnceLock::new();
-    KEY.get_or_init(|| {
-        let path = paths::config_dir().join("unison-key-id.txt");
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            let s = s.trim();
-            if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return s.to_string();
-            }
-        }
-        let k = random_hex(64);
-        let _ = paths::write_atomic(&path, k.as_bytes());
-        k
-    })
-    .clone()
+    let mut key = KEY.lock().unwrap();
+    if let Some(k) = &*key {
+        return k.clone();
+    }
+    let path = key_path();
+    let k = std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| {
+            let k = random_hex();
+            let _ = paths::write_atomic(&path, k.as_bytes());
+            k
+        });
+    *key = Some(k.clone());
+    k
 }
 
-fn random_hex(n: usize) -> String {
-    use sha1::{Digest, Sha1};
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let local = 0u8;
-    let mut out = String::new();
-    let mut round = 0u32;
-    while out.len() < n {
-        let mut h = Sha1::new();
-        h.update(seed.to_le_bytes());
-        h.update(std::process::id().to_le_bytes());
-        h.update((&local as *const u8 as usize).to_le_bytes());
-        h.update(round.to_le_bytes());
-        for b in h.finalize() {
-            out += &format!("{b:02x}");
-        }
-        round += 1;
-    }
-    out.truncate(n);
-    out
+static KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn key_path() -> std::path::PathBuf {
+    paths::config_dir().join("unison-key-id.txt")
+}
+
+/// Forgets the Unison key id; the next request makes a new one, unlinked from the old.
+pub fn reset_key_id() {
+    let mut key = KEY.lock().unwrap();
+    *key = None;
+    let _ = std::fs::remove_file(key_path());
+}
+
+/// 32 random bytes from the system, in hex.
+fn random_hex() -> String {
+    let mut b = [0u8; 32];
+    getrandom::fill(&mut b).expect("system random numbers");
+    b.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ---- LRCLIB --------------------------------------------------------------------------------
