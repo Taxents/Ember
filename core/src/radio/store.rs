@@ -2,7 +2,8 @@
 //! recently played ones, recent searches and places visited. Kept locally, never on YouTube.
 //!
 //! A file that can't be read is set aside as `radio.json.bad-<unix time>` rather than written
-//! over, and [`Store::damaged`] says so, for the app to tell the user.
+//! over, and [`Store::damaged`] says so, for the app to tell the user. If it can't even be
+//! moved, it is left as it is and nothing is saved over it this run.
 
 use super::{PlaceRef, Station};
 use crate::paths::{config_dir, write_atomic};
@@ -30,8 +31,17 @@ pub struct RadioData {
 pub struct Store {
     path: PathBuf,
     pub data: RadioData,
-    /// The file couldn't be read when loading (it was set aside).
-    pub damaged: bool,
+    /// The file couldn't be read when loading.
+    pub damaged: Option<Damaged>,
+}
+
+/// What became of a file that couldn't be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Damaged {
+    /// Moved out of the way; a fresh one is saved in its place.
+    SetAside,
+    /// Couldn't be moved, so it is left as it is and changes aren't saved.
+    Kept,
 }
 
 /// Moves an unreadable file out of the way, to `<name>.bad-<unix time>` next to it.
@@ -54,12 +64,14 @@ impl Store {
     }
 
     pub fn load_at(path: PathBuf) -> Self {
-        let mut damaged = false;
+        let mut damaged = None;
         let mut data: RadioData = match std::fs::read(&path) {
             Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
                 log::warn!("{FILE} can't be read ({e}); setting it aside");
-                set_aside(&path);
-                damaged = true;
+                damaged = Some(match set_aside(&path) {
+                    Some(_) => Damaged::SetAside,
+                    None => Damaged::Kept,
+                });
                 RadioData::default()
             }),
             Err(_) => RadioData::default(),
@@ -76,6 +88,9 @@ impl Store {
     }
 
     fn save(&self) {
+        if self.damaged == Some(Damaged::Kept) {
+            return; // not over the only copy of what couldn't be read
+        }
         let json = serde_json::to_vec_pretty(&self.data).expect("json");
         if let Err(e) = write_atomic(&self.path, &json) {
             log::warn!("saving {}: {e}", FILE);
@@ -233,7 +248,7 @@ mod tests {
         let junk = b"{\"favourites\": [ oops";
         std::fs::write(&path, junk).unwrap();
         let mut s = Store::load_at(path.clone());
-        assert!(s.damaged);
+        assert_eq!(s.damaged, Some(Damaged::SetAside));
         assert!(s.data.favourites.is_empty());
         assert!(!path.exists());
         let aside: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -247,7 +262,27 @@ mod tests {
         // Saving afterwards leaves it alone, and the new file reads fine.
         s.searched("jazz");
         assert_eq!(std::fs::read(&aside[0]).unwrap(), junk);
-        assert!(!Store::load_at(path).damaged);
+        assert_eq!(Store::load_at(path).damaged, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_file_that_stays_put_is_not_saved_over() {
+        let dir = std::env::temp_dir().join(format!("ember-radio-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        let junk = b"{\"favourites\": [ oops";
+        std::fs::write(&path, junk).unwrap();
+        // As loading leaves it when the file couldn't be moved.
+        let mut s = Store {
+            path: path.clone(),
+            data: RadioData::default(),
+            damaged: Some(Damaged::Kept),
+        };
+        s.set_favourite(&st("hcx4T119", "Kiss FM"), true);
+        s.searched("jazz");
+        assert_eq!(std::fs::read(&path).unwrap(), junk);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

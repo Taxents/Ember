@@ -12,7 +12,8 @@
 
 use crate::pages::{Block, Loaded};
 use crate::{App, Card, MenuEntry, MenuTarget, PageKind, Route, RowRef, Ui};
-use music_core::radio::{self, PlaceRef, Section, Station, store::Store};
+use music_core::radio::store::{Damaged, Store};
+use music_core::radio::{self, PlaceRef, Section, Station};
 use music_core::yt::model::{BrowseRef, Item, Link, Named, Shelf, Track};
 use music_core::{Error, Result};
 use slint::{ComponentHandle, Image, Model, Rgba8Pixel, SharedPixelBuffer, VecModel};
@@ -37,10 +38,14 @@ fn store() -> MutexGuard<'static, Store> {
     static S: OnceLock<Mutex<Store>> = OnceLock::new();
     S.get_or_init(|| {
         let s = Store::load();
-        if s.damaged {
+        let said = s.damaged.map(|d| match d {
+            Damaged::SetAside => "Your radio favourites couldn't be read",
+            Damaged::Kept => "Your radio favourites couldn't be read, so changes won't be saved",
+        });
+        if let Some(said) = said {
             // Said once the UI gets to it (this may run on any thread, inside anything).
-            let _ = slint::invoke_from_event_loop(|| {
-                crate::with(|a| a.notify("Your radio favourites couldn't be read"));
+            let _ = slint::invoke_from_event_loop(move || {
+                crate::with(|a| a.notify(said));
             });
         }
         Mutex::new(s)
