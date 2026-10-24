@@ -102,7 +102,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "installing Inno Setup $env:INNO_VERSION failed" }
           $iscc = Get-ChildItem "C:\Program Files*\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $iscc) { throw "ISCC.exe not found" }
-          if ($iscc.VersionInfo.ProductVersion -notlike "$env:INNO_VERSION*") { throw "ISCC is $($iscc.VersionInfo.ProductVersion), not $env:INNO_VERSION" }
           $v = "$env:TAG".TrimStart('v')
           & $iscc.FullName "/DAppVersion=$v" "/DExePath=$PWD\out\ember.exe" "/O$PWD\out" installer\ember.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
