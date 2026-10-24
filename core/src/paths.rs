@@ -23,15 +23,27 @@ pub fn cache_dir() -> PathBuf {
 
 /// The app's folder under `base`. A `MusicApp` folder from before the rename becomes `Ember`;
 /// if it can't be moved (an older copy of the app still has files open), it stays in use, so
-/// nothing seems lost.
+/// nothing seems lost. An `Ember` folder that was already there (from some other build) is
+/// renamed aside first, never deleted. A marker in the moved folder keeps this to once, so a
+/// `MusicApp` an old copy makes later is left alone.
 fn home(base: PathBuf) -> PathBuf {
+    const MOVED: &str = "moved-from-MusicApp";
     let new = base.join(APP_DIR);
     let old = base.join(OLD_DIR);
-    if new.exists() || !old.exists() {
+    if !old.exists() || new.join(MOVED).exists() {
         return new;
     }
+    if new.exists() {
+        let aside = base.join(format!("{APP_DIR} (before {OLD_DIR} moved in)"));
+        if aside.exists() || std::fs::rename(&new, &aside).is_err() {
+            return old;
+        }
+    }
     match std::fs::rename(&old, &new) {
-        Ok(()) => new,
+        Ok(()) => {
+            let _ = std::fs::write(new.join(MOVED), b"");
+            new
+        }
         Err(_) => old,
     }
 }
@@ -85,6 +97,23 @@ mod tests {
         // Already moved: stays put, even if an old copy made a new MusicApp since.
         std::fs::create_dir_all(base.join(OLD_DIR)).unwrap();
         assert_eq!(home(base.clone()), base.join(APP_DIR));
+        assert!(base.join(OLD_DIR).exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_stray_ember_folder_is_set_aside() {
+        let base = std::env::temp_dir().join(format!("ember-paths-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(OLD_DIR)).unwrap();
+        std::fs::create_dir_all(base.join(APP_DIR)).unwrap();
+        std::fs::write(base.join(OLD_DIR).join("settings.json"), b"current").unwrap();
+        std::fs::write(base.join(APP_DIR).join("settings.json"), b"stray").unwrap();
+        let dir = home(base.clone());
+        assert_eq!(dir, base.join(APP_DIR));
+        assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), b"current");
+        let aside = base.join(format!("{APP_DIR} (before {OLD_DIR} moved in)"));
+        assert_eq!(std::fs::read(aside.join("settings.json")).unwrap(), b"stray");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
