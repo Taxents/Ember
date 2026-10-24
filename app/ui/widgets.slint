@@ -493,3 +493,45 @@ export component ScrollBar inherits Rectangle {
         }
     }
 }
+
+// Nothing to show (an empty queue, no lyrics, a page that failed): an icon, a line and maybe a
+// button, centred in the space it's given.
+export component EmptyState inherits Rectangle {
+    in property <string> icon;
+    in property <string> text;
+    in property <color> text-color: Theme.beige;
+    // The button's label; none when empty.
+    in property <string> action;
+    callback act();
+    VerticalLayout {
+        alignment: center;
+        spacing: 12px;
+        padding: 20px;
+        if root.icon != "": HorizontalLayout {
+            alignment: center;
+            Icon {
+                name: root.icon;
+                width: 28px;
+                height: 28px;
+                color: Theme.dim;
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.text-color;
+            font-size: 13px;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+        if root.action != "": HorizontalLayout {
+            alignment: center;
+            PillButton {
+                text: root.action;
+                primary: false;
+                clicked => {
+                    root.act();
+                }
+            }
+        }
+    }
+}

@@ -7,7 +7,7 @@ import "fonts/Inter-Bold.ttf";
 import "fonts/Inter-ExtraBold.ttf";
 import { ListView, Palette } from "std-widgets.slint";
 import { RadioSearch } from "radio.slint";
-import { Theme, Icon, IconButton, ValueBar, PillButton, Art, ScrollBar, ExplicitBadge, MiniVisualizer } from "widgets.slint";
+import { Theme, Icon, IconButton, ValueBar, PillButton, Art, ScrollBar, ExplicitBadge, MiniVisualizer, EmptyState } from "widgets.slint";
 
 export { Theme }
 
@@ -1426,13 +1426,9 @@ component LyricsPanel inherits Rectangle {
             root.scroll-to(row-y);
         }
     }
-    if Ui.lyrics.length == 0: Text {
+    if Ui.lyrics.length == 0: EmptyState {
+        icon: "lyrics";
         text: Ui.np.active ? Ui.lyrics-note : "Play something to see its lyrics.";
-        color: Theme.beige;
-        font-size: 13px;
-        wrap: word-wrap;
-        horizontal-alignment: center;
-        width: parent.width - 32px;
     }
     flick := Flickable {
         visible: Ui.lyrics.length > 0;
@@ -2134,7 +2130,8 @@ component SkeletonRow inherits Rectangle {
 // Every page: one list of rows (a banner or title, headings, tracks, card shelves and grids)
 // that scrolls as one, the banner with it.
 component PageView inherits Rectangle {
-    property <length> banner-h: clamp(root.height * 0.46, 300px, 500px);
+    // Home's hero is a title and two buttons, so it stays shorter than an album's banner.
+    property <length> banner-h: Ui.page.kind == PageKind.home ? clamp(root.height * 0.36, 260px, 360px) : clamp(root.height * 0.46, 300px, 500px);
     property <int> drop-target: -1;
     property <length> shelf-card: 176px;
     // Grid lines hold as many cards of at least 170px as fit.
@@ -2639,22 +2636,21 @@ component StatusPage inherits Rectangle {
             overflow: elide;
         }
 
-        Text {
-            text: Ui.page.loading ? "Loading…" : Ui.page.error != "" ? Ui.page.error : Ui.page.subtitle;
-            color: Ui.page.error != "" ? Theme.amber : Theme.beige;
+        if Ui.page.error == "" || Ui.page.loading: Text {
+            text: Ui.page.loading ? "Loading…" : Ui.page.subtitle;
+            color: Theme.beige;
             font-size: 13px;
             wrap: word-wrap;
         }
 
-        if Ui.page.error != "" && !Ui.page.loading: HorizontalLayout {
-            alignment: start;
-            padding-top: 10px;
-            PillButton {
-                text: "Try again";
-                primary: false;
-                clicked => {
-                    Ui.retry-page();
-                }
+        if Ui.page.error != "" && !Ui.page.loading: EmptyState {
+            height: 240px;
+            icon: Ui.offline ? "link" : "close";
+            text: Ui.page.error;
+            text-color: Theme.amber;
+            action: "Try again";
+            act => {
+                Ui.retry-page();
             }
         }
     }
@@ -2959,16 +2955,10 @@ component RightPanel inherits Rectangle {
                 }
             }
         }
-        if Ui.panel-tab == 1 && Ui.queue.length == 0: Rectangle {
+        if Ui.panel-tab == 1 && Ui.queue.length == 0: EmptyState {
             vertical-stretch: 1;
-            Text {
-                width: parent.width - 40px;
-                text: "Nothing queued. Play an album or playlist, or use Add to queue on a song.";
-                color: Theme.beige;
-                font-size: 13px;
-                wrap: word-wrap;
-                horizontal-alignment: center;
-            }
+            icon: "queue";
+            text: "Nothing queued. Play an album or playlist, or use Add to queue on a song.";
         }
         if Ui.panel-tab == 1 && Ui.queue.length > 0: Rectangle {
             vertical-stretch: 1;
@@ -3911,6 +3901,11 @@ component NowPlayingBar inherits Rectangle {
             }
         }
 
+        // A gap between groups: like · panels · sound and sharing · volume.
+        Rectangle {
+            width: 12px;
+        }
+
         Rectangle {
             width: 32px;
             IconButton {
@@ -3949,6 +3944,10 @@ component NowPlayingBar inherits Rectangle {
                     Ui.panel-changed();
                 }
             }
+        }
+
+        Rectangle {
+            width: 12px;
         }
 
         Rectangle {
@@ -4006,11 +4005,11 @@ component NowPlayingBar inherits Rectangle {
         }
 
         Rectangle {
-            width: 14px;
+            width: 2px;
         }
 
         Rectangle {
-            width: 20px;
+            width: 28px;
             IconButton {
                 icon: Ui.volume <= 0.001 ? "mute" : "volume";
                 tooltip: Ui.volume <= 0.001 ? "Unmute (Ctrl+M)" : "Mute (Ctrl+M)";
@@ -4028,7 +4027,7 @@ component NowPlayingBar inherits Rectangle {
             ValueBar {
                 x: 8px;
                 width: 96px;
-                thickness: 3px;
+                thickness: 4px;
                 label: "Volume";
                 value: Ui.volume;
                 fill: Theme.ivory;
