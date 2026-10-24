@@ -130,11 +130,6 @@ pub fn finish_ordered(limit: std::time::Duration) {
     }
 }
 
-/// [`spawn`], in order with [`run_ordered`].
-pub fn spawn_ordered(job: impl FnOnce() + Send + 'static) {
-    ordered().push(Box::new(job), false);
-}
-
 /// [`run`], on threads of their own, for the many small look-ups a page asks for.
 pub fn run_background<T: Send + 'static>(
     job: impl FnOnce() -> T + Send + 'static,

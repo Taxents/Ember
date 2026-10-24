@@ -11,7 +11,8 @@ use std::time::Duration;
 const PLAIN: Duration = Duration::from_secs(5);
 const WITH_ACTION: Duration = Duration::from_secs(8);
 
-type Then = Box<dyn FnOnce(&mut App)>;
+/// What runs on the UI thread when a toast's action is chosen or it goes.
+pub type Then = Box<dyn FnOnce(&mut App)>;
 
 #[derive(Default)]
 pub struct Toast {
@@ -31,7 +32,6 @@ impl App {
     }
 
     /// A message with an action button ("Retry", "Sign in", "Add anyway").
-    #[allow(dead_code)] // until the account actions use it
     pub fn notify_with(
         &mut self,
         msg: impl Into<String>,
@@ -42,7 +42,6 @@ impl App {
     }
 
     /// A change already shown, sent by `commit` when the toast goes; Undo runs `undo` instead.
-    #[allow(dead_code)] // until the account actions use it
     pub fn notify_undoable(
         &mut self,
         msg: impl Into<String>,

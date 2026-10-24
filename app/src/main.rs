@@ -2755,7 +2755,6 @@ impl App {
     }
 
     fn toggle_like(&mut self) {
-        self.forget_pages(PageKind::Liked);
         // On a station the heart is "favourite station".
         if self.station_like() {
             return;
@@ -2763,7 +2762,7 @@ impl App {
         let Some(id) = self.player.current().map(str::to_string) else {
             return;
         };
-        let Some(t) = self.known.get_mut(&id) else {
+        let Some(t) = self.known.get(&id) else {
             return;
         };
         let like = if t.like == Some(Like::Like) {
@@ -2771,18 +2770,8 @@ impl App {
         } else {
             Like::Like
         };
-        t.like = Some(like);
-        let ui = self.ui();
-        let g = ui.global::<Ui>();
-        let mut np = g.get_np();
-        np.liked = like == Like::Like;
-        g.set_np(np);
-        let client = self.client.clone();
-        workers::spawn_ordered(move || {
-            if let Err(e) = client.rate(&id, like) {
-                log::warn!("like: {e}");
-            }
-        });
+        // The same way as a row's heart, so the rows showing this song follow too.
+        self.set_like(&id, like);
     }
 
     fn panel_changed(&mut self) {
@@ -2926,6 +2915,7 @@ impl App {
                     a.ui().global::<Ui>().set_signing_in(false);
                     if let Err(e) = r {
                         log::warn!("sign-in: {e}");
+                        a.notify_with("Sign-in didn't finish", "Try again", |a| a.sign_in());
                     }
                     a.account_changed();
                     a.reload();
@@ -3103,7 +3093,7 @@ impl App {
                 items.extend(song_entries(t));
                 items.push(divider());
                 items.push(like_entry(self.liked(t)));
-                items.push(entry("dislike", "Dislike", "dislike", false));
+                items.push(entry("dislike", "Don't recommend this song", "hide", false));
                 items.push(divider());
                 items.push(entry("song", "Go to song", "song", false));
                 let on_album = self.header.as_ref().is_some_and(|h| h.album);
@@ -3160,10 +3150,10 @@ impl App {
                 }
                 if let Item::Track(t) = item {
                     items.push(like_entry(self.liked(t)));
-                    items.push(entry("dislike", "Dislike", "dislike", false));
+                    items.push(entry("dislike", "Don't recommend this song", "hide", false));
                 }
                 if pages::not_interested(item).is_some() {
-                    items.push(entry("hide", "Not interested", "close", false));
+                    items.push(entry("hide", "Hide this suggestion", "hide", false));
                 }
                 items.push(divider());
                 let artists = pages::artists_of(item);
@@ -3204,7 +3194,7 @@ impl App {
                 }
                 items.push(divider());
                 items.push(like_entry(liked));
-                items.push(entry("dislike", "Dislike", "dislike", false));
+                items.push(entry("dislike", "Don't recommend this song", "hide", false));
                 items.push(divider());
                 if let Some(t) = song {
                     items.push(entry("song", "Go to song", "song", false));
@@ -3367,6 +3357,7 @@ impl App {
                     return;
                 };
                 let (client, playlist) = (self.client.clone(), p.id.clone());
+                let name = p.title.clone();
                 let generation = self.generation;
                 let showing = self.history[self.at].id == playlist;
                 self.page_cache
@@ -3376,9 +3367,13 @@ impl App {
                     move |r| {
                         with(|a| match r {
                             // Showing that playlist: show it with the new songs.
-                            Ok(()) if showing && a.generation == generation => a.reload(),
-                            Ok(()) => {}
-                            Err(e) => log::warn!("add to playlist: {e}"),
+                            Ok(()) => {
+                                if showing && a.generation == generation {
+                                    a.reload();
+                                }
+                                a.notify(format!("Added to {name}"));
+                            }
+                            Err(e) => a.account_failed(&format!("add to {name}"), &e, None),
                         });
                     },
                 );
@@ -3505,8 +3500,48 @@ impl App {
         self.known.get(&t.video_id).and_then(|k| k.like).or(t.like) == Some(Like::Like)
     }
 
-    /// Likes a song or takes the like away: here everywhere it shows, then on YouTube.
+    /// Likes a song or takes the like away: here everywhere it shows, then on YouTube (and back
+    /// here if YouTube refuses).
     fn set_like(&mut self, id: &str, like: Like) {
+        if self.needs_account("like songs") {
+            return;
+        }
+        let before = self
+            .known
+            .get(id)
+            .and_then(|k| k.like)
+            .or_else(|| {
+                self.page_tracks
+                    .iter()
+                    .find(|t| t.video_id == id)
+                    .and_then(|t| t.like)
+            })
+            .unwrap_or(Like::Indifferent);
+        self.mark_like(id, like);
+        let (client, id) = (self.client.clone(), id.to_string());
+        workers::run_ordered(
+            {
+                let id = id.clone();
+                move || client.rate(&id, like)
+            },
+            move |r| {
+                with(|a| {
+                    if let Err(e) = r {
+                        a.mark_like(&id, before);
+                        let what = if like == Like::Like {
+                            "like this song"
+                        } else {
+                            "remove the like"
+                        };
+                        a.account_failed(what, &e, Some(Box::new(move |a| a.set_like(&id, like))));
+                    }
+                });
+            },
+        );
+    }
+
+    /// Shows a song liked (or not) everywhere it is here.
+    fn mark_like(&mut self, id: &str, like: Like) {
         self.forget_pages(PageKind::Liked);
         for t in self.page_tracks.iter_mut().filter(|t| t.video_id == id) {
             t.like = Some(like);
@@ -3532,12 +3567,29 @@ impl App {
             np.liked = like == Like::Like;
             g.set_np(np);
         }
-        let (client, id) = (self.client.clone(), id.to_string());
-        workers::spawn_ordered(move || {
-            if let Err(e) = client.rate(&id, like) {
-                log::warn!("like: {e}");
-            }
-        });
+    }
+
+    /// Account actions need an account: without one, a toast offers to sign in.
+    fn needs_account(&mut self, to: &str) -> bool {
+        if self.client.signed_in() {
+            return false;
+        }
+        self.notify_with(format!("Sign in to {to}"), "Sign in", |a| a.sign_in());
+        true
+    }
+
+    /// An account change YouTube refused (already undone here): says so, with Retry when
+    /// `retry` can do it again.
+    fn account_failed(&mut self, what: &str, e: &music_core::Error, retry: Option<toast::Then>) {
+        log::warn!("{what}: {e}");
+        let msg = match e {
+            music_core::Error::Net(_) => format!("Couldn't {what}: check your connection"),
+            _ => format!("Couldn't {what}"),
+        };
+        match retry {
+            Some(retry) => self.notify_with(msg, "Retry", retry),
+            None => self.notify(msg),
+        }
     }
 
     fn open_song(&mut self, t: &Track) {
@@ -3612,12 +3664,19 @@ impl App {
         c.title = name.clone().into();
         g.set_collection(c);
         let client = self.client.clone();
+        let generation = self.generation;
         workers::run_ordered(
             move || client.rename_playlist(&id, &name),
-            |r| {
-                with(|a| match r {
-                    Ok(()) => a.load_playlists(),
-                    Err(e) => log::warn!("rename: {e}"),
+            move |r| {
+                with(|a| {
+                    a.load_playlists();
+                    if let Err(e) = r {
+                        // The old name back, from YouTube.
+                        if a.generation == generation {
+                            a.reload();
+                        }
+                        a.account_failed("rename the playlist", &e, None);
+                    }
                 });
             },
         );
@@ -3625,14 +3684,38 @@ impl App {
 
     /// Saves a song to the library or takes it out: everywhere it shows, then on YouTube.
     fn save_song(&mut self, t: &Track, save: bool) {
-        self.forget_pages(PageKind::Songs);
+        if self.needs_account("save songs") {
+            return;
+        }
         let Some(lib) = &t.library else { return };
         let token = if save {
             lib.add.clone()
         } else {
             lib.remove.clone()
         };
-        let id = t.video_id.clone();
+        self.mark_saved(&t.video_id, save);
+        let (client, id, t) = (self.client.clone(), t.video_id.clone(), t.clone());
+        workers::run_ordered(
+            move || client.feedback(&token),
+            move |r| {
+                with(|a| {
+                    if let Err(e) = r {
+                        a.mark_saved(&id, !save);
+                        let what = if save {
+                            "add the song to your library"
+                        } else {
+                            "remove the song from your library"
+                        };
+                        a.account_failed(what, &e, Some(Box::new(move |a| a.save_song(&t, save))));
+                    }
+                });
+            },
+        );
+    }
+
+    /// Shows a song saved to the library (or not) everywhere it is here.
+    fn mark_saved(&mut self, id: &str, save: bool) {
+        self.forget_pages(PageKind::Songs);
         let mark = |x: &mut Track| {
             if x.video_id == id
                 && let Some(l) = &mut x.library
@@ -3651,16 +3734,13 @@ impl App {
                 }
             }
         }
-        let client = self.client.clone();
-        workers::spawn_ordered(move || {
-            if let Err(e) = client.feedback(&token) {
-                log::warn!("library: {e}");
-            }
-        });
     }
 
     /// Adds an album or playlist to the library, or takes it out (off the Albums wall too).
     fn save_item(&mut self, item: Item, save: bool) {
+        if self.needs_account("save to your library") {
+            return;
+        }
         self.forget_pages(PageKind::Albums);
         self.forget_pages(PageKind::AllPlaylists);
         if !save {
@@ -3668,6 +3748,7 @@ impl App {
             self.drop_from_page(&|i| pages::item_id(i) == id);
         }
         let client = self.client.clone();
+        let (again, generation) = (item.clone(), self.generation);
         workers::run_ordered(
             move || -> music_core::Result<()> {
                 let id = match &item {
@@ -3677,10 +3758,25 @@ impl App {
                 };
                 client.save_playlist(&id, save)
             },
-            |r| {
-                with(|a| match r {
-                    Ok(()) => a.load_playlists(),
-                    Err(e) => log::warn!("library: {e}"),
+            move |r| {
+                with(|a| {
+                    a.load_playlists();
+                    if let Err(e) = r {
+                        // A card taken off the page comes back.
+                        if !save && a.generation == generation {
+                            a.reload();
+                        }
+                        let what = if save {
+                            "add it to your library"
+                        } else {
+                            "remove it from your library"
+                        };
+                        a.account_failed(
+                            what,
+                            &e,
+                            Some(Box::new(move |a| a.save_item(again, save))),
+                        );
+                    }
                 });
             },
         );
@@ -3688,6 +3784,9 @@ impl App {
 
     /// The banner's Add to library.
     fn toggle_saved(&mut self) {
+        if self.needs_account("save to your library") {
+            return;
+        }
         self.forget_page();
         self.forget_pages(PageKind::Albums);
         self.forget_pages(PageKind::AllPlaylists);
@@ -3724,12 +3823,34 @@ impl App {
         c.saved = save;
         g.set_collection(c);
         let client = self.client.clone();
+        let (page_id, generation) = (self.history[self.at].id.clone(), self.generation);
         workers::run_ordered(
             move || client.save_playlist(&id, save),
-            |r| {
-                with(|a| match r {
-                    Ok(()) => a.load_playlists(),
-                    Err(e) => log::warn!("library: {e}"),
+            move |r| {
+                with(|a| {
+                    if let Err(e) = &r {
+                        // Back as it was: the sidebar, and the banner if it's still showing.
+                        a.library_wish.retain(|(w, _)| *w != page_id);
+                        if a.generation == generation {
+                            if let Some((_, saved)) =
+                                a.header.as_mut().and_then(|h| h.save.as_mut())
+                            {
+                                *saved = !save;
+                            }
+                            let ui = a.ui();
+                            let g = ui.global::<Ui>();
+                            let mut c = g.get_collection();
+                            c.saved = !save;
+                            g.set_collection(c);
+                        }
+                        let what = if save {
+                            "add it to your library"
+                        } else {
+                            "remove it from your library"
+                        };
+                        a.account_failed(what, e, None);
+                    }
+                    a.load_playlists();
                 });
             },
         );
@@ -3737,6 +3858,9 @@ impl App {
 
     /// The banner's Follow.
     fn toggle_follow(&mut self) {
+        if self.needs_account("follow artists") {
+            return;
+        }
         self.forget_page();
         self.forget_pages(PageKind::Artists);
         let Some((channel, on)) = self.header.as_mut().and_then(|h| h.follow.as_mut()) else {
@@ -3750,11 +3874,29 @@ impl App {
         c.following = follow;
         g.set_collection(c);
         let client = self.client.clone();
-        workers::spawn_ordered(move || {
-            if let Err(e) = client.subscribe(&channel, follow) {
-                log::warn!("follow: {e}");
-            }
-        });
+        let generation = self.generation;
+        workers::run_ordered(
+            move || client.subscribe(&channel, follow),
+            move |r| {
+                with(|a| {
+                    if let Err(e) = r {
+                        if a.generation == generation {
+                            if let Some((_, on)) = a.header.as_mut().and_then(|h| h.follow.as_mut())
+                            {
+                                *on = !follow;
+                            }
+                            let ui = a.ui();
+                            let g = ui.global::<Ui>();
+                            let mut c = g.get_collection();
+                            c.following = !follow;
+                            g.set_collection(c);
+                        }
+                        let what = if follow { "follow" } else { "unfollow" };
+                        a.account_failed(what, &e, None);
+                    }
+                });
+            },
+        );
     }
 
     fn copy_link(&self, item: &Item) {
@@ -3763,11 +3905,15 @@ impl App {
         }
     }
 
-    /// Dislikes a song: on YouTube (so it stops being recommended), then off this page's
-    /// recommendations and the queue, skipping it if it's playing. The page's own list (a
-    /// playlist, an album) keeps it.
+    /// "Don't recommend this song": off this page's recommendations and the queue at once,
+    /// skipping it if it's playing (the page's own list, a playlist or an album, keeps it); told
+    /// to YouTube when its toast goes, so Undo can still take it back.
     fn dislike(&mut self, t: Track) {
+        if self.needs_account("tune your recommendations") {
+            return;
+        }
         let id = t.video_id.clone();
+        let before = self.known.get(&id).and_then(|k| k.like);
         if let Some(k) = self.known.get_mut(&id) {
             k.like = Some(Like::Dislike);
         }
@@ -3798,27 +3944,70 @@ impl App {
             }
         }
         self.queue_changed();
-        let client = self.client.clone();
-        workers::spawn_ordered(move || {
-            if let Err(e) = client.rate(&t.video_id, Like::Dislike) {
-                log::warn!("dislike: {e}");
-            }
-        });
+        let generation = self.generation;
+        let title = t.title.clone();
+        self.notify_undoable(
+            format!("Won't recommend '{title}'"),
+            move |a| {
+                if let Some(k) = a.known.get_mut(&t.video_id) {
+                    k.like = before;
+                }
+                for p in a
+                    .page_tracks
+                    .iter_mut()
+                    .filter(|p| p.video_id == t.video_id)
+                {
+                    p.like = before;
+                }
+                // YouTube wasn't told, so the page fetched again has it back.
+                if a.generation == generation {
+                    a.reload();
+                }
+            },
+            move |a| {
+                let client = a.client.clone();
+                workers::run_ordered(
+                    move || client.rate(&id, Like::Dislike),
+                    |r| {
+                        if let Err(e) = r {
+                            with(|a| {
+                                a.account_failed("tell YouTube not to recommend it", &e, None)
+                            });
+                        }
+                    },
+                );
+            },
+        );
     }
 
-    /// "Not interested" in a recommendation: told to YouTube, and off the page.
+    /// "Hide this suggestion" (YouTube's "Not interested"): off the page at once, told to
+    /// YouTube when its toast goes (YouTube has no undo for it), so Undo can still take it back.
     fn not_interested(&mut self, item: Item) {
         let Some(token) = pages::not_interested(&item).map(str::to_string) else {
             return;
         };
         let id = pages::item_id(&item).to_string();
         self.drop_from_page(&|i| pages::item_id(i) == id);
-        let client = self.client.clone();
-        workers::spawn_ordered(move || {
-            if let Err(e) = client.feedback(&token) {
-                log::warn!("not interested: {e}");
-            }
-        });
+        let generation = self.generation;
+        self.notify_undoable(
+            "Suggestion hidden",
+            move |a| {
+                if a.generation == generation {
+                    a.reload();
+                }
+            },
+            move |a| {
+                let client = a.client.clone();
+                workers::run_ordered(
+                    move || client.feedback(&token),
+                    |r| {
+                        if let Err(e) = r {
+                            with(|a| a.account_failed("hide the suggestion", &e, None));
+                        }
+                    },
+                );
+            },
+        );
     }
 
     /// Takes matching cards, and songs in headed lists (search results, top songs), off the
@@ -3973,11 +4162,11 @@ impl App {
             move || client.remove_from_playlist(&playlist, &[t]),
             move |r| {
                 if let Err(e) = r {
-                    log::warn!("remove: {e}");
                     with(|a| {
                         if a.generation == generation {
                             a.reload();
                         }
+                        a.account_failed("remove the song from the playlist", &e, None);
                     });
                 }
             },
@@ -4038,14 +4227,16 @@ impl App {
             return;
         }
         let client = self.client.clone();
+        let made = name.clone();
         workers::run_ordered(
             move || client.create_playlist(&name, "", &ids),
-            |r| {
+            move |r| {
                 with(|a| match r {
-                    Ok(_) => a.load_playlists(),
-                    Err(e) => {
-                        log::warn!("new playlist: {e}");
+                    Ok(_) => {
+                        a.load_playlists();
+                        a.notify(format!("Created '{made}'"));
                     }
+                    Err(e) => a.account_failed("create the playlist", &e, None),
                 });
             },
         );
@@ -4073,9 +4264,7 @@ impl App {
                             });
                         }
                     }
-                    Err(e) => {
-                        log::warn!("delete playlist: {e}");
-                    }
+                    Err(e) => a.account_failed("delete the playlist", &e, None),
                 });
             },
         );
