@@ -62,7 +62,7 @@ impl<E: Playback> Player<E> {
             at: 0,
             repeat: Repeat::Off,
             shuffle: false,
-            seed: 0x9E3779B97F4A7C15,
+            seed: random_seed(),
             skip: HashSet::new(),
             failures: 0,
             follower: false,
@@ -360,6 +360,17 @@ impl<E: Playback> Player<E> {
     }
 }
 
+/// A different shuffle every launch (and per player): the std hasher's random keys, the time
+/// and the process id. Never 0, which xorshift can't leave.
+fn random_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    h.write_u128(now.unwrap_or_default().as_nanos());
+    h.write_u32(std::process::id());
+    h.finish() | 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,7 +649,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "L1"]
     fn each_player_shuffles_differently() {
         let list = "a b c d e f g h i j k l m n o p q r s t";
         let order = || {
