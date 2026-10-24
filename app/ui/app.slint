@@ -316,6 +316,8 @@ export global Ui {
     // Right panel
     in-out property <bool> panel-open;
     in-out property <int> panel-tab; // 0 lyrics, 1 queue
+    // The playing song has no lyrics: the Lyrics tab and the bar's lyrics button are dimmed.
+    in property <bool> lyrics-missing;
     callback panel-changed();
     // The playing song's lyrics, the main line being sung (-1 before the first; its background
     // lines share it as their `group`), and what to say when there are none ("Looking for
@@ -2728,7 +2730,8 @@ component RightPanel inherits Rectangle {
 
                     Text {
                         text: label;
-                        color: Ui.panel-tab == i ? Theme.ivory : Theme.beige;
+                        color: i == 0 && Ui.lyrics-missing ? Theme.dim
+                            : Ui.panel-tab == i ? Theme.ivory : Theme.beige;
                         font-size: 12px;
                         font-weight: 600;
                     }
@@ -2816,9 +2819,12 @@ component RightPanel inherits Rectangle {
         if Ui.panel-tab == 1 && Ui.queue.length == 0: Rectangle {
             vertical-stretch: 1;
             Text {
-                text: "Nothing queued.";
+                width: parent.width - 40px;
+                text: "Nothing queued. Play an album or playlist, or use Add to queue on a song.";
                 color: Theme.beige;
                 font-size: 13px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
             }
         }
         if Ui.panel-tab == 1 && Ui.queue.length > 0: Rectangle {
@@ -3719,6 +3725,8 @@ component NowPlayingBar inherits Rectangle {
             IconButton {
                 icon: "lyrics";
                 active: Ui.panel-open && Ui.panel-tab == 0;
+                enabled: !Ui.lyrics-missing;
+                tooltip: Ui.lyrics-missing ? "No lyrics for this song" : "Lyrics";
                 icon-size: 17px;
                 clicked => {
                     if (Ui.panel-open && Ui.panel-tab == 0) {

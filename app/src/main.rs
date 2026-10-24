@@ -232,6 +232,8 @@ struct App {
     together: Option<listen::Session>,
     together_timer: Timer,
     toast: toast::Toast,
+    /// Lyrics were shown this session (see [`App::lyrics_wanted`]).
+    lyrics_opened: bool,
     /// A request failed on the network; `offline_timer` checks until one gets through.
     offline: bool,
     offline_timer: Timer,
@@ -337,6 +339,7 @@ fn main() {
         metrics: None,
         metrics_timer: Timer::default(),
         toast: Default::default(),
+        lyrics_opened: false,
         offline: false,
         offline_timer: Timer::default(),
     };
@@ -727,6 +730,12 @@ impl App {
             self.show_autoplay();
             self.queue_changed();
             self.show_now_playing(false);
+            // The panel showing lyrics shows the restored song's, not an empty page.
+            if self.lyrics_wanted() {
+                self.lyrics_for_current();
+            }
+        } else {
+            g.set_lyrics_note("Play something to see its lyrics here.".into());
         }
 
         self.account_changed();
@@ -2453,7 +2462,11 @@ impl App {
                     self.player.engine.seek(ms);
                 }
                 self.queue_changed();
-                self.lyrics_for_current();
+                if self.lyrics_wanted() {
+                    self.lyrics_for_current();
+                } else {
+                    self.forget_lyrics();
+                }
                 // Nothing after this song (a single, a search result, a list's last song): let
                 // its radio follow, once per song.
                 let station = radio::is_station(id);
@@ -2607,9 +2620,10 @@ impl App {
         g.set_lyrics(ModelRc::default());
         g.set_lyric_line(-1);
         g.set_lyric_pause_row(-1);
-        g.set_lyrics_note("Looking for lyrics…".into());
+        g.set_lyrics_missing(false);
+        g.set_lyrics_note("Finding lyrics…".into());
         let Some(t) = self.known.get(&id).cloned() else {
-            g.set_lyrics_note("No lyrics for this song.".into());
+            self.no_lyrics();
             return;
         };
         let client = self.client.clone();
@@ -2630,11 +2644,43 @@ impl App {
                             a.lyrics = Some(f);
                             a.lyrics_tick();
                         }
-                        None => g.set_lyrics_note("No lyrics for this song.".into()),
+                        None => a.no_lyrics(),
                     }
                 });
             },
         );
+    }
+
+    /// The playing song has no lyrics: the lyrics controls dim, and a panel showing lyrics shows
+    /// the queue instead (it stays there until Lyrics is chosen again).
+    fn no_lyrics(&mut self) {
+        let ui = self.ui();
+        let g = ui.global::<Ui>();
+        g.set_lyrics_note("No lyrics for this song.".into());
+        g.set_lyrics_missing(true);
+        if g.get_panel_open() && g.get_panel_tab() == 0 {
+            g.set_panel_tab(1);
+        }
+    }
+
+    /// Lyrics are fetched (from YouTube and, if allowed, the lyrics services) only once they've
+    /// been shown this session, or while they're on screen.
+    fn lyrics_wanted(&self) -> bool {
+        let ui = self.ui();
+        let g = ui.global::<Ui>();
+        self.lyrics_opened || (g.get_panel_open() && g.get_panel_tab() == 0)
+    }
+
+    /// Nothing known about the playing song's lyrics (they weren't asked for).
+    fn forget_lyrics(&mut self) {
+        self.lyrics = None;
+        let ui = self.ui();
+        let g = ui.global::<Ui>();
+        g.set_lyrics(ModelRc::default());
+        g.set_lyric_line(-1);
+        g.set_lyric_pause_row(-1);
+        g.set_lyrics_missing(false);
+        g.set_lyrics_note(SharedString::default());
     }
 
     /// Moves the lyrics to the playback position: the sung line at 4 Hz from `tick`, and its
@@ -2860,6 +2906,11 @@ impl App {
         self.settings.panel_open = g.get_panel_open();
         self.settings.panel_tab = g.get_panel_tab();
         self.save_later();
+        if g.get_panel_open() && g.get_panel_tab() == 0 {
+            // Lyrics asked for: from now on they're fetched for every song.
+            self.lyrics_opened = true;
+            self.lyrics_for_current();
+        }
         // Lyrics shown now: fill the sung line at once, even while paused.
         self.lyrics_tick();
     }
