@@ -1,0 +1,402 @@
+// The types and globals the window shares with Rust: page kinds, rows, cards, and the `Ui` global.
+
+export enum PageKind {
+    search,
+    home,
+    explore,
+    radio,
+    history,
+    artists,
+    albums,
+    songs,
+    all-playlists,
+    liked,
+    playlist,
+    album,
+    artist,
+    // A browse page reached from a tile or "See all"; the id is "browse id|params".
+    feed,
+    // One song: its versions and what's related; the id is its video id.
+    song,
+    // The app's settings (drawn by SettingsPage, nothing to fetch).
+    settings,
+}
+
+// What a row of the page list is.
+export enum RowKind {
+    track,
+    // The banner and title block (albums, playlists, artists, Home's hero).
+    header,
+    // The page's name, for pages without a banner.
+    title,
+    // A heading over the tracks that follow it.
+    heading,
+    // A titled row of cards that scrolls sideways.
+    shelf,
+    // One line of a card grid.
+    grid,
+    // The line after the last track ("237 tracks, 14 hours 3 minutes").
+    footer,
+    // Column titles over a track list (#, Title, Album, Plays, length).
+    columns,
+    // A song's lyrics beside its release date, credits and the artist's bio.
+    details,
+    // A placeholder while the page loads, shaped like what's coming: `number` 0 is a track,
+    // 1 a shelf, 2 a grid line.
+    skeleton,
+}
+
+// A line of lyrics; `ms` is when it starts, -1 when they aren't synced. `fill` is the line as
+// drawn: bold text, which Rust recolours word by word while it's sung. `group` is the main line
+// a background line belongs to (a main line's own index); `agent` 1 is a duet's second voice.
+export struct LyricLine {
+    text: string,
+    ms: int,
+    fill: styled-text,
+    // Only what's sung, drawn blurred-ish behind the line as its glow.
+    glow: styled-text,
+    // The line all lit, which fades away over the plain line once it's been sung.
+    done: styled-text,
+    group: int,
+    agent: int,
+    background: bool,
+    // How long (ms) the instrumental break before it lasts: the waiting dots breathe by it.
+    gap: int,
+}
+
+// "Written by" and who.
+export struct InfoLine {
+    label: string,
+    text: string,
+}
+
+// An album, playlist, artist or song in a shelf or grid, or a coloured tile (moods, genres).
+export struct Card {
+    title: string,
+    subtitle: string,
+    art: image,
+    // Artists: a round picture, the text centred.
+    round: bool,
+    // A coloured tile with its title on it, and no picture.
+    tile: bool,
+    color: color,
+    // Shows a play button on hover.
+    playable: bool,
+    // A music video: its YouTube thumbnail, 16:9, as tall as the others and wider.
+    video: bool,
+    // Where it starts along its row, in card widths (gaps not counted).
+    at: float,
+}
+
+export struct SidebarPlaylist {
+    id: string,
+    title: string,
+    cover: image,
+}
+
+export struct TrackRow {
+    title: string,
+    artist: string,
+    album: string,
+    duration: string,
+    plays: string,
+    art: image,
+    explicit: bool,
+    current: bool,
+    unavailable: bool,
+    // Its place in the list, from 1.
+    number: int,
+    kind: RowKind,
+    // Shelf and grid rows.
+    cards: [Card],
+    // Headings and shelves with "See all".
+    link: bool,
+    // Page rows: the row's index on the page, and its place (set by Rust, which lays them out).
+    index: int,
+    y: length,
+    h: length,
+    // Song details: lyrics, where they're from, credits and the artist's bio. `live` while the
+    // song plays, so its lyrics follow along.
+    lines: [LyricLine],
+    note: string,
+    info: [InfoLine],
+    about: string,
+    live: bool,
+}
+
+// One line of the right-click menu; `id` "-" draws a divider.
+export struct MenuEntry {
+    id: string,
+    label: string,
+    icon: string,
+    danger: bool,
+}
+
+// What an album or playlist page shows above its tracks.
+export struct Collection {
+    label: string, // "Album · 1973", "Playlist"
+    title: string,
+    artist: string,
+    cover: image,
+    banner: image,
+    // Album pages: rows have no artwork or album column.
+    album: bool,
+    // Your own playlist: rows can be dragged to reorder it.
+    editable: bool,
+    // Artists: a wide picture across the banner, and no cover.
+    wide: bool,
+    // Artists: their logo, shown in place of the name when there is one.
+    logo: image,
+    // A logo is known and on its way: its space is kept, and the name waits.
+    logo-pending: bool,
+    // The artist line links to artist pages.
+    linked: bool,
+    // Albums and others' playlists: Add to library, and whether it's in.
+    can-save: bool,
+    saved: bool,
+    // Artists: Follow, and whether you do.
+    can-follow: bool,
+    following: bool,
+}
+
+export struct NowPlaying {
+    active: bool,
+    title: string,
+    artist: string,
+    art: image,
+    duration-ms: int,
+    position-ms: int,
+    playing: bool,
+    loading: bool,
+    liked: bool,
+}
+
+export struct PageState {
+    kind: PageKind,
+    id: string,
+    title: string,
+    subtitle: string,
+    loading: bool,
+    error: string,
+    playable: bool,
+}
+
+// Everything the Rust side reads and drives.
+export global Ui {
+    // Navigation
+    in property <PageState> page;
+    in property <bool> can-back;
+    in property <bool> can-forward;
+    callback navigate(PageKind, string, string);
+    callback back();
+    callback forward();
+    callback search(string);
+
+    // The toast above the player bar: its message ("" when none), its action's label ("" for
+    // none), and a count that changes with each new one.
+    in property <string> toast-text;
+    in property <string> toast-action;
+    in property <int> toast-serial;
+    callback toast-act();
+    callback toast-dismiss();
+    callback toast-hover(bool);
+    // A request failed on the network and the app is checking until it's back.
+    in property <bool> offline;
+    // The page failed to load: try again.
+    callback retry-page();
+
+    // Account
+    in property <bool> signed-in;
+    in property <bool> signing-in;
+    in property <string> account-name;
+    // A newer version is installed and runs from the next start; this restarts into it.
+    in property <string> update-ready;
+    callback restart-to-update();
+    // A newer version found (nothing downloaded yet), and whether its banner was put away.
+    in property <string> update-available;
+    in property <bool> update-dismissed;
+    // While it downloads: "Downloading Ember 1.2.3… 42%". After a failure: what went wrong.
+    in property <string> update-progress;
+    in property <string> update-error;
+    // The download didn't match its signature (or none can be checked): no retry is offered.
+    in property <bool> update-unverified;
+    // Download, verify and install update-available; only ever on this click.
+    callback update-install();
+    // Hide the banner until a newer version than update-available is out.
+    callback update-dismiss();
+    // What the last check said, for Settings.
+    in property <string> update-status;
+    in property <string> app-version;
+    callback check-updates();
+    // Settings: the cache's size and emptying it, hidden playlists, the app's folder.
+    in property <string> cache-size;
+    in property <int> hidden-count;
+    callback clear-cache();
+    // Playlists hidden from the sidebar, for Settings to bring back one at a time.
+    in property <[SidebarPlaylist]> hidden-playlists;
+    callback unhide-playlist(string);
+    callback open-data-folder();
+    // Lyrics from Unison and LRCLIB too, and making a new anonymous id for Unison.
+    in-out property <bool> lyrics-third-party: true;
+    callback lyrics-third-party-changed(bool);
+    callback reset-lyrics-id();
+    in property <image> account-photo;
+    in property <[SidebarPlaylist]> playlists;
+    callback sign-in();
+    callback sign-out();
+
+    // The right-click menu: Rust fills it for what was clicked, the window draws it.
+    in-out property <bool> menu-open;
+    in property <[MenuEntry]> menu-items;
+    in property <Point> menu-at;
+    // What was right-clicked ("playlist", "track", "queue"), its row, its id, and where (window
+    // coordinates).
+    callback context(string, int, string, Point);
+    callback menu-chosen(string);
+    // An artist name was clicked: a page row, -1 the banner, -2 the now-playing bar; and where.
+    callback open-artist(int, Point);
+    callback toggle-saved(); // the banner's album or playlist
+    // Your playlist's name is being edited on its banner; `rename` saves the new one.
+    in-out property <bool> renaming;
+    callback rename(string);
+    callback new-playlist(); // asks for its name in the sidebar
+    in-out property <bool> naming-playlist;
+    // Where the name field sits in the window, so a press outside it can put it away.
+    in-out property <{x: length, y: length, width: length, height: length}> naming-field;
+    callback create-playlist(string); // the name typed ("" when cancelled)
+    // A sidebar playlist dragged from one place to before another.
+    callback move-playlist(int, int);
+    callback np-open(string); // the playing song's "song" or "album" page
+    callback toggle-follow(); // the banner's artist
+
+    // The current page's rows: banner or title, headings, tracks, shelves and grids.
+    // The page's rows near the view (each knows its place), how tall the whole page is and how
+    // many rows it has. A new page bumps the serial, which scrolls back to the top.
+    in property <[TrackRow]> tracks;
+    in property <length> page-height;
+    in property <int> page-count;
+    in property <int> page-serial;
+    // Where a page opened by Back/Forward was left: read when the page is new, and again
+    // when `scroll-serial` moves (its rows came after it opened).
+    in property <float> page-scroll;
+    in property <int> scroll-serial;
+    callback page-metrics(length, length, length, length); // banner height, grid card width, view height, view width
+    callback page-scrolled(length); // how far down the view starts
+    callback row-measured(int, length); // a row sized by its content (a song's details)
+    callback columns-changed(int); // how many cards fit across a grid line
+    callback card-clicked(int, int); // row, card
+    callback card-play(int, int);
+    callback card-shown(int, int); // load its artwork
+    callback see-all(int); // a heading or shelf row
+    callback play-tracks(int); // a row, -1 to shuffle all, -2 to play all from the top
+    callback open-album(int); // a row: open its track's album
+    callback track-move(int, int); // row, and the row it goes before (your own playlists)
+    in property <Collection> collection;
+    // A song page of the playing music video: a 16:9 panel under its banner shows the picture
+    // (`video-on`), with the newest frame once one is decoded. Rust makes the header row taller
+    // to hold it (rows.rs), so the two sizes must match.
+    in property <bool> video-on;
+    in property <image> video-frame;
+    // Bumped when a music video is opened: its song page glides down to centre the panel once
+    // it shows (and until you scroll it yourself, or leave the page).
+    in property <int> centre-video-serial;
+    callback near-end();
+    callback row-shown(int, int); // list (0 page, 1 queue), index: load its artwork
+
+    // Now playing
+    in property <NowPlaying> np;
+    // A live radio station plays: no length to seek in, "LIVE" in its place.
+    in property <bool> np-live;
+    in property <bool> shuffle;
+    in property <int> repeat; // 0 off, 1 all, 2 one
+    in-out property <float> volume: 1.0;
+    callback play-pause();
+    // The music's loudness in four bands, bass first (0..1), for the visualizer.
+    in property <[float]> levels: [0, 0, 0, 0];
+    callback next();
+    callback previous();
+    callback seek(int);
+    callback set-volume(float);
+    // The level before muting, for Ctrl+M or the speaker icon to bring back.
+    in-out property <float> volume-before-mute: 1.0;
+    public function toggle-mute() {
+        if (self.volume <= 0.001) {
+            self.volume = max(self.volume-before-mute, 0.05);
+        } else {
+            self.volume-before-mute = self.volume;
+            self.volume = 0;
+        }
+        self.set-volume(self.volume);
+    }
+    callback toggle-shuffle();
+    callback cycle-repeat();
+    callback toggle-like();
+
+    // Right panel
+    in-out property <bool> panel-open;
+    in-out property <int> panel-tab; // 0 lyrics, 1 queue
+    // The playing song has no lyrics: the Lyrics tab and the bar's lyrics button are dimmed.
+    in property <bool> lyrics-missing;
+    callback panel-changed();
+    // The playing song's lyrics, the main line being sung (-1 before the first; its background
+    // lines share it as their `group`), and what to say when there are none ("Looking for
+    // lyrics…", "No lyrics for this song.").
+    in property <[LyricLine]> lyrics;
+    in property <int> lyric-line: -1;
+    // A long instrumental gap: the row of the line after it, and how far through (0..1); -1
+    // when there's none.
+    in property <int> lyric-pause-row: -1;
+    in property <float> lyric-pause;
+    in property <string> lyrics-note;
+    in property <[TrackRow]> queue;
+    in property <int> queue-current;
+    callback queue-jump(int);
+    callback queue-remove(int);
+    // Autoplay: the queue grows from one song by YouTube's radio, drawn from the picked choice.
+    in property <[string]> autoplay-chips;
+    in property <int> autoplay-picked: -1;
+    callback autoplay-chip(int);
+    callback radio-from-current(); // drop the playlist or album, keep the song, radio after it
+    callback queue-move(int, int);
+
+    // Equalizer
+    in-out property <bool> eq-open;
+    in property <bool> eq-enabled;
+    in property <[float]> eq-gains: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    in property <string> eq-preset;
+    callback eq-toggle();
+    callback eq-set(int, float);
+    callback eq-choose(string);
+
+    in-out property <bool> sidebar-collapsed;
+    callback sidebar-changed();
+
+    // Listen Along: friends join a host's session and hear the same music in sync.
+    in-out property <bool> together-open; // the popover
+    // 0 off, 1 connecting/starting, 2 hosting, 3 listening, 4 listening but the link dropped
+    // (rejoining by itself; still playing)
+    in property <int> together-state;
+    in property <string> together-code; // hosting: the invite code
+    in property <string> together-host; // listening: the host's name
+    // Everyone in the session, host first, already worded by Rust ("Sam (host)").
+    in property <[string]> together-members;
+    // A status or error line ("Connecting…", "Invite code copied"), "" for none.
+    in property <string> together-status;
+    // An invite code found on the clipboard when the popover opened, "" for none.
+    in property <string> together-found;
+    in-out property <string> together-name; // your display name (editable)
+    callback together-opened(); // the popover opened: Rust checks the clipboard
+    // Start a session (not `together-host`: that name is the host's name above).
+    callback together-start();
+    callback together-join(string); // join with this code
+    callback together-copy(); // copy the invite code again
+    callback together-leave(); // stop hosting, or leave
+    callback together-resync(); // listener: start again in sync (rarely needed)
+    callback together-name-changed(string);
+}
+
+export global Fmt {
+    public pure function time(ms: int) -> string {
+        return floor(ms / 60000) + ":" + (mod(floor(ms / 1000), 60) < 10 ? "0" : "") + mod(floor(ms / 1000), 60);
+    }
+}

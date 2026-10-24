@@ -1,0 +1,40 @@
+// A page with nothing to list yet.
+
+import { Theme, EmptyState } from "../widgets.slint";
+import { Ui } from "../types.slint";
+
+// A page with nothing to list yet: its name and why (loading, an error, a note).
+export component StatusPage inherits Rectangle {
+    VerticalLayout {
+        padding-left: 34px;
+        padding-right: 24px;
+        padding-top: 4px;
+        spacing: 6px;
+        alignment: start;
+        Text {
+            text: Ui.page.title;
+            color: Theme.ivory;
+            font-size: 34px;
+            font-weight: 800;
+            overflow: elide;
+        }
+
+        if Ui.page.error == "" || Ui.page.loading: Text {
+            text: Ui.page.loading ? "Loading…" : Ui.page.subtitle;
+            color: Theme.beige;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+
+        if Ui.page.error != "" && !Ui.page.loading: EmptyState {
+            height: 240px;
+            icon: Ui.offline ? "link" : "close";
+            text: Ui.page.error;
+            text-color: Theme.amber;
+            action: "Try again";
+            act => {
+                Ui.retry-page();
+            }
+        }
+    }
+}
