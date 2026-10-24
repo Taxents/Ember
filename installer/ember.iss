@@ -89,9 +89,9 @@ Type: files; Name: "{app}\ember.exe.new"
 Type: dirifempty; Name: "{app}"
 
 [Code]
-// Settings, sign-in and cache live outside the install folder (%LOCALAPPDATA%\MusicApp and
-// %APPDATA%\MusicApp). They are kept unless the user says otherwise; a silent uninstall
-// always keeps them.
+// Settings, sign-in and cache live outside the install folder (%LOCALAPPDATA%\Ember and
+// %APPDATA%\Ember; MusicApp before the rename, if an old copy couldn't move them). They are
+// kept unless the user says otherwise; a silent uninstall always keeps them.
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if (CurUninstallStep = usPostUninstall) and not UninstallSilent then
@@ -100,6 +100,8 @@ begin
               'Choose No to keep them for a later reinstall.',
               mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
     begin
+      DelTree(ExpandConstant('{localappdata}\Ember'), True, True, True);
+      DelTree(ExpandConstant('{userappdata}\Ember'), True, True, True);
       DelTree(ExpandConstant('{localappdata}\MusicApp'), True, True, True);
       DelTree(ExpandConstant('{userappdata}\MusicApp'), True, True, True);
     end;
