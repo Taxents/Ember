@@ -383,6 +383,14 @@ fn home(f: Feed) -> Loaded {
                 .iter()
                 .find_map(|s| s.items.first().map(|i| (s.title.clone(), i.clone())))
         });
+    // The shelf the hero comes from doesn't show it again.
+    let mut shelves = f.shelves;
+    if let Some((title, item)) = &hero {
+        let id = item_id(item);
+        if let Some(s) = shelves.iter_mut().find(|s| s.title == *title) {
+            s.items.retain(|i| item_id(i) != id);
+        }
+    }
     match hero {
         Some((shelf, item)) => {
             let (title, artist, thumbs) = match &item {
@@ -414,7 +422,7 @@ fn home(f: Feed) -> Loaded {
         }
         None => l.title = Some("Home".into()),
     }
-    l.blocks = blocks(f.shelves, false);
+    l.blocks = blocks(shelves, false);
     l
 }
 
