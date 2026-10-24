@@ -50,13 +50,14 @@ pub fn find(name: &str, channel: Option<&str>) -> Option<String> {
     let key = channel.unwrap_or(name).to_string();
     let now = unix_now();
     let mut failed = false;
-    let mut get = |url: &str, query: &[(&str, &str)]| match fetch(url, query) {
-        Ok(v) => v,
-        Err(()) => {
-            failed = true;
-            None
-        }
-    };
+    let mut get =
+        |url: &str, query: &[(&str, &str)], key: Option<&str>| match fetch(url, query, key) {
+            Ok(v) => v,
+            Err(()) => {
+                failed = true;
+                None
+            }
+        };
     let by_channel = channel.and_then(|c| {
         let resource = format!("https://www.youtube.com/channel/{c}");
         get(
@@ -66,6 +67,7 @@ pub fn find(name: &str, channel: Option<&str>) -> Option<String> {
                 ("inc", "artist-rels"),
                 ("fmt", "json"),
             ],
+            None,
         )
         .and_then(|v| {
             v["relations"]
@@ -79,13 +81,15 @@ pub fn find(name: &str, channel: Option<&str>) -> Option<String> {
         get(
             "https://musicbrainz.org/ws/2/artist",
             &[("query", &q), ("fmt", "json"), ("limit", "5")],
+            None,
         )
         .and_then(|v| by_name(&v, name))
     });
     let url = mbid.and_then(|m| {
         get(
             &format!("https://webservice.fanart.tv/v3/music/{m}"),
-            &[("api_key", FANART_KEY)],
+            &[],
+            Some(FANART_KEY),
         )
         .and_then(|v| best_logo(&v))
     });
@@ -121,7 +125,11 @@ fn best_logo(v: &Value) -> Option<String> {
                     .unwrap_or(0)
             })
             .and_then(|l| l["url"].as_str())
-            .map(str::to_string)
+            // Listed as http://; the same file is served over https, the only scheme shown.
+            .map(|u| match u.strip_prefix("http://") {
+                Some(rest) => format!("https://{rest}"),
+                None => u.to_string(),
+            })
     };
     pick("hdmusiclogo").or_else(|| pick("musiclogo"))
 }
@@ -134,8 +142,9 @@ fn loose(s: &str) -> String {
 }
 
 /// GET JSON, at most one request a second to each host (MusicBrainz's rule). `Ok(None)` is a
-/// plain "not found". URLs aren't logged: fanart.tv's carries the key.
-fn fetch(url: &str, query: &[(&str, &str)]) -> Result<Option<Value>, ()> {
+/// plain "not found". `key` goes in fanart.tv's `api-key` header, not the URL, so it stays out
+/// of logs and proxies.
+fn fetch(url: &str, query: &[(&str, &str)], key: Option<&str>) -> Result<Option<Value>, ()> {
     static LAST: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
     let host = url.split('/').nth(2).unwrap_or_default().to_string();
     // One request a second per host: this one's turn is booked, then waited for unlocked, so
@@ -158,6 +167,9 @@ fn fetch(url: &str, query: &[(&str, &str)]) -> Result<Option<Value>, ()> {
         .header("Accept", "application/json");
     for (k, v) in query {
         req = req.query(*k, *v);
+    }
+    if let Some(key) = key {
+        req = req.header("api-key", key);
     }
     let mut r = req.call().map_err(|_| ())?;
     match r.status().as_u16() {
