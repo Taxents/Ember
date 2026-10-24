@@ -207,6 +207,11 @@ struct App {
     skip_timer: Timer,
     /// Skips moved past songs without playing them (see [`App::skip`]).
     skip_pending: bool,
+    /// What the media flyout and taskbar were last told (playing or not); `None` after a new
+    /// song, so the next tick tells them again.
+    reported_playing: Option<bool>,
+    /// The flyout's timeline was last set at this second of the song (and for this length).
+    reported_timeline: (u64, u64),
     /// Since when the current song has had no audible position (see [`App::tick`]).
     waiting_since: Option<std::time::Instant>,
     /// Reads the band levels for the visualizer while playing (about 30 times a second).
@@ -313,6 +318,8 @@ fn main() {
         skip_timer: Timer::default(),
         skip_pending: false,
         waiting_since: None,
+        reported_playing: None,
+        reported_timeline: (u64::MAX, 0),
         together: None,
         together_timer: Timer::default(),
         meter_timer: Timer::default(),
@@ -553,13 +560,7 @@ fn wire(ui: &AppWindow) {
         with(|a| a.skip(-1));
     });
     g.on_seek(|ms| {
-        with(|a| {
-            let ms = ms.max(0) as u64;
-            if !a.ask_host(listen::Req::Seek(ms)) {
-                a.player.engine.seek(ms);
-            }
-            a.tick();
-        });
+        with(|a| a.seek(ms.max(0) as u64));
     });
     g.on_set_volume(|v| {
         with(|a| a.set_volume(v));
@@ -601,6 +602,7 @@ fn wire(ui: &AppWindow) {
         with(|a| {
             let pos = a.queue_from + i as usize;
             if !a.ask_host(listen::Req::Jump(pos)) {
+                a.cancel_skip();
                 a.player.jump(pos);
             }
         });
@@ -2024,6 +2026,7 @@ impl App {
             });
             return;
         }
+        self.cancel_skip();
         self.autoplay = None;
         if let Some(on) = shuffle {
             self.player.set_shuffle(on);
@@ -2306,10 +2309,17 @@ impl App {
             });
     }
 
+    /// Quick skips are over: what's played now was chosen some other way.
+    fn cancel_skip(&mut self) {
+        self.skip_timer.stop();
+        self.skip_pending = false;
+    }
+
     fn play_pause(&mut self) {
         if self.ask_host(listen::Req::Toggle) {
             return;
         }
+        self.cancel_skip();
         match self.player.engine.position() {
             // Hosting Listen Along: everyone starts again together.
             Some(p) if p.paused => {
@@ -2322,6 +2332,13 @@ impl App {
                 self.together_paused();
             }
             None => self.player.play_current(),
+        }
+        self.tick();
+    }
+
+    fn seek(&mut self, ms: u64) {
+        if !self.ask_host(listen::Req::Seek(ms)) {
+            self.player.engine.seek(ms);
         }
         self.tick();
     }
@@ -2349,6 +2366,12 @@ impl App {
         // A failure is shown only for the song meant to be heard, not a preload.
         let failed_now =
             matches!(&e, Event::Failed { id, .. } if self.player.current() == Some(id.as_str()));
+        // Skipping quickly: a song passed over that starts after all mustn't take the queue back.
+        if self.skip_pending
+            && matches!(&e, Event::Started { id, .. } if self.player.current() != Some(id.as_str()))
+        {
+            return;
+        }
         self.player.on_event(&e);
         self.together_engine(&e);
         match &e {
@@ -2444,6 +2467,7 @@ impl App {
             liked: t.like == Some(Like::Like),
         };
         g.set_np(np);
+        self.reported_playing = None;
         if let Some(m) = &self.media {
             let art_url = images::url_for(&t.thumbs, 300);
             let album = t.album.as_ref().map(|a| a.name.as_str()).unwrap_or("");
@@ -2588,8 +2612,10 @@ impl App {
                 np.duration_ms = d as i32;
             }
         }
-        if np.playing != playing {
-            np.playing = playing;
+        np.playing = playing;
+        // Compared with what Windows was told, not with `np`: a new song sets `np` first.
+        if self.reported_playing != Some(playing) {
+            self.reported_playing = Some(playing);
             if let Some(m) = &self.media {
                 m.status(if np.active { Some(playing) } else { None });
             }
@@ -2600,17 +2626,30 @@ impl App {
                 self.save_queue();
             }
         }
+        // The flyout's seek bar: once a second, and at once after a jump (a seek, a new song).
+        if let Some(m) = &self.media {
+            let (sec, dur) = (
+                np.position_ms.max(0) as u64 / 1000,
+                np.duration_ms.max(0) as u64,
+            );
+            let (was_sec, was_dur) = self.reported_timeline;
+            if dur != was_dur || sec != was_sec {
+                self.reported_timeline = (sec, dur);
+                m.timeline(np.position_ms.max(0) as u64, dur);
+            }
+        }
         g.set_np(np);
         // A song that's current but not audible yet (loading, seeking, a skip) keeps the clock
         // asking for a while: its start can come without an event that would wake it again.
         let waiting = pos.is_none() && self.player.current().is_some();
-        if !waiting {
+        let waited = if waiting {
+            self.waiting_since
+                .get_or_insert_with(std::time::Instant::now)
+                .elapsed()
+        } else {
             self.waiting_since = None;
-        }
-        let waited = self
-            .waiting_since
-            .get_or_insert_with(std::time::Instant::now)
-            .elapsed();
+            Duration::ZERO
+        };
         if waiting && (3000..3250).contains(&waited.as_millis()) {
             log::warn!(
                 "{}: no audible position after 3 s",
@@ -2776,6 +2815,7 @@ impl App {
             Remote::Forward => self.go(1),
             Remote::Minimized => self.minimize(),
             Remote::Restored => self.restore(),
+            Remote::Seek(ms) => self.seek(ms),
         }
     }
 
@@ -3346,6 +3386,7 @@ impl App {
             MenuTarget::Queue(pos) => match choice {
                 "play" => {
                     if !self.ask_host(listen::Req::Jump(pos)) {
+                        self.cancel_skip();
                         self.player.jump(pos);
                     }
                 }

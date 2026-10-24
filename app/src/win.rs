@@ -3,8 +3,9 @@
 
 use std::cell::RefCell;
 use windows::Media::{
-    MediaPlaybackStatus, MediaPlaybackType, SystemMediaTransportControls,
-    SystemMediaTransportControlsButton,
+    MediaPlaybackStatus, MediaPlaybackType, PlaybackPositionChangeRequestedEventArgs,
+    SystemMediaTransportControls, SystemMediaTransportControlsButton,
+    SystemMediaTransportControlsTimelineProperties,
 };
 use windows::Storage::Streams::RandomAccessStreamReference;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
@@ -41,6 +42,8 @@ pub enum Remote {
     /// The mouse's back and forward side buttons.
     Back,
     Forward,
+    /// The media flyout's seek bar was moved, to this many ms.
+    Seek(u64),
 }
 
 /// Draw at the display's real resolution instead of letting Windows stretch a 96-DPI bitmap.
@@ -289,7 +292,36 @@ impl Media {
                 Ok(())
             },
         ))?;
+        smtc.PlaybackPositionChangeRequested(&windows::Foundation::TypedEventHandler::new(
+            move |_, args: windows::core::Ref<PlaybackPositionChangeRequestedEventArgs>| {
+                if let Some(a) = args.as_ref() {
+                    // 100 ns units.
+                    let ms = a.RequestedPlaybackPosition()?.Duration.max(0) / 10_000;
+                    emit(Remote::Seek(ms as u64));
+                }
+                Ok(())
+            },
+        ))?;
         Ok(Media { smtc })
+    }
+
+    /// Where the song is, for the flyout's seek bar (both 0: none).
+    pub fn timeline(&self, position_ms: u64, duration_ms: u64) {
+        let span = |ms: u64| windows::Foundation::TimeSpan {
+            Duration: ms as i64 * 10_000,
+        };
+        let r = (|| -> windows::core::Result<()> {
+            let t = SystemMediaTransportControlsTimelineProperties::new()?;
+            t.SetStartTime(span(0))?;
+            t.SetMinSeekTime(span(0))?;
+            t.SetEndTime(span(duration_ms))?;
+            t.SetMaxSeekTime(span(duration_ms))?;
+            t.SetPosition(span(position_ms.min(duration_ms)))?;
+            self.smtc.UpdateTimelineProperties(&t)
+        })();
+        if let Err(e) = r {
+            log::debug!("media timeline: {e}");
+        }
     }
 
     pub fn track(&self, title: &str, artist: &str, album: &str, art_url: Option<&str>) {
