@@ -147,8 +147,7 @@ enum Cmd {
     /// A track became audible before the decoder noticed: say so now.
     Announce,
     Loaded {
-        generation: u64,
-        next: bool,
+        serial: u64,
         id: String,
         result: Result<Loaded>,
     },
@@ -517,10 +516,12 @@ struct Worker {
     prev: Option<Track>,
     next: Option<Track>,
     next_id: Option<String>,
-    loading_next: bool,
+    /// `next_id` is being opened: that load's serial and the token that stops it.
+    next_load: Option<(u64, Cancel)>,
     /// A track asked for with `Play` is being opened.
-    loading_play: bool,
-    generation: u64,
+    play_load: Option<(u64, Cancel)>,
+    /// Numbers loads: a result that is no longer wanted matches neither of the above.
+    load_serial: u64,
     finished_sent: bool,
     idle_since: Option<Instant>,
     /// The output must be (re)opened at this time (device changed or lost, or none yet).
@@ -568,9 +569,9 @@ impl Worker {
             prev: None,
             next: None,
             next_id: None,
-            loading_next: false,
-            loading_play: false,
-            generation: 0,
+            next_load: None,
+            play_load: None,
+            load_serial: 0,
             finished_sent: true,
             idle_since: Some(Instant::now()),
             reopen_at: None,
@@ -720,26 +721,20 @@ impl Worker {
             // The loop announces after every command.
             Cmd::Announce => {}
             Cmd::Stop => self.stop(),
-            Cmd::Loaded {
-                generation,
-                next,
-                id,
-                result,
-            } => self.loaded(generation, next, id, result),
+            Cmd::Loaded { serial, id, result } => self.loaded(serial, id, result),
             Cmd::DeviceError(e) => self.device_error(e),
         }
         true
     }
 
     fn stop(&mut self) {
-        self.generation += 1;
         self.flush();
         self.cur = None;
         self.prev = None;
         self.next = None;
         self.next_id = None;
-        self.loading_next = false;
-        self.loading_play = false;
+        drop_load(&mut self.next_load);
+        drop_load(&mut self.play_load);
         self.pending = None;
         self.finished_sent = true;
     }
@@ -753,22 +748,28 @@ impl Worker {
     }
 
     fn play(&mut self, id: String) {
-        self.generation += 1;
         self.flush();
         self.prev = None;
-        self.next_id = None;
-        self.loading_next = false;
         self.finished_sent = false;
+        // A track still opening for an earlier play isn't wanted any more: stop its download.
+        drop_load(&mut self.play_load);
+        let opening_next = self.next_id.take().filter(|n| *n == id).is_some();
         // Skipping to the preloaded track starts instantly.
         if let Some(t) = self.next.take().filter(|t| t.id == id) {
+            drop_load(&mut self.next_load);
             self.cur = None;
             self.begin(t);
             return;
         }
         self.cur = None;
         self.next = None;
-        self.loading_play = true;
-        self.spawn_load(id, false);
+        if opening_next && self.next_load.is_some() {
+            // Already being opened ahead: that load becomes this one.
+            self.play_load = self.next_load.take();
+        } else {
+            drop_load(&mut self.next_load);
+            self.spawn_load(id, false);
+        }
     }
 
     fn set_next(&mut self, id: Option<String>) {
@@ -776,7 +777,7 @@ impl Worker {
             // Nothing follows: whatever was opened or being opened ahead goes.
             self.next = None;
             self.next_id = None;
-            self.loading_next = false;
+            drop_load(&mut self.next_load);
             self.next_when = None;
             return;
         };
@@ -784,7 +785,7 @@ impl Worker {
             return;
         }
         self.next = None;
-        self.loading_next = false;
+        drop_load(&mut self.next_load);
         if self.next_when.as_ref().is_some_and(|(i, _)| *i != id) {
             self.next_when = None;
         }
@@ -792,7 +793,7 @@ impl Worker {
     }
 
     fn seek(&mut self, ms: u64) {
-        if self.loading_play {
+        if self.play_load.is_some() {
             // Still opening: it starts there instead.
             let when = self.pending.and_then(|(_, w)| w);
             self.pending = Some((ms, when));
@@ -911,12 +912,20 @@ impl Worker {
         self.shared.expecting.store(false, Ordering::Relaxed);
     }
 
+    /// Starts opening `id`, as the next track or as the one to play now.
     fn spawn_load(&mut self, id: String, next: bool) {
-        let generation = self.generation;
+        self.load_serial += 1;
+        let serial = self.load_serial;
         let tx = self.cmd_tx.clone();
         let loader = self.loader.clone();
         let events = self.events.clone();
         let cancel = self.cancel.child();
+        let slot = Some((serial, cancel.clone()));
+        if next {
+            self.next_load = slot;
+        } else {
+            self.play_load = slot;
+        }
         let load_id = id.clone();
         let spawned = std::thread::Builder::new()
             .name("track-load".into())
@@ -928,35 +937,25 @@ impl Worker {
                             panic_message(&*p)
                         )))
                     });
-                let _ = tx.send(Cmd::Loaded {
-                    generation,
-                    next,
-                    id,
-                    result,
-                });
+                let _ = tx.send(Cmd::Loaded { serial, id, result });
             });
         if let Err(e) = spawned {
             let e = Error::Device(format!("can't start loading: {e}"));
-            self.loaded(generation, next, load_id, Err(e));
+            self.loaded(serial, load_id, Err(e));
         }
     }
 
-    fn loaded(&mut self, generation: u64, next: bool, id: String, result: Result<Loaded>) {
-        if generation != self.generation {
-            return;
-        }
-        if next {
-            if self.next_id.as_deref() != Some(&id) {
-                return;
-            }
-            self.loading_next = false;
+    fn loaded(&mut self, serial: u64, id: String, result: Result<Loaded>) {
+        let is = |l: &Option<(u64, Cancel)>| l.as_ref().is_some_and(|(s, _)| *s == serial);
+        if is(&self.next_load) {
+            self.next_load = None;
             self.next_id = None;
             match result.and_then(|l| Track::new(id.clone(), l, self.dev_rate)) {
                 Ok(t) => self.next = Some(t),
                 Err(e) => self.fail(id, e),
             }
-        } else {
-            self.loading_play = false;
+        } else if is(&self.play_load) {
+            self.play_load = None;
             match result.and_then(|l| Track::new(id.clone(), l, self.dev_rate)) {
                 Ok(t) => self.begin(t),
                 Err(e) => {
@@ -1075,7 +1074,7 @@ impl Worker {
                     let id = t.id.clone();
                     t.eof = true;
                     let handed_over =
-                        self.next.is_some() || self.loading_next || self.next_id.is_some();
+                        self.next.is_some() || self.next_load.is_some() || self.next_id.is_some();
                     self.report(id, e, handed_over);
                     continue;
                 }
@@ -1098,7 +1097,7 @@ impl Worker {
                 let id = t.id.clone();
                 t.eof = true;
                 let handed_over =
-                    self.next.is_some() || self.loading_next || self.next_id.is_some();
+                    self.next.is_some() || self.next_load.is_some() || self.next_id.is_some();
                 self.report(id, e, handed_over);
                 continue;
             }
@@ -1110,7 +1109,7 @@ impl Worker {
     }
 
     fn maybe_preload(&mut self) {
-        if self.next.is_some() || self.loading_next {
+        if self.next.is_some() || self.next_load.is_some() {
             return;
         }
         let Some(id) = self.next_id.clone() else {
@@ -1123,7 +1122,6 @@ impl Worker {
             None => false,
         };
         if due {
-            self.loading_next = true;
             self.spawn_load(id, true);
         }
     }
@@ -1182,7 +1180,8 @@ impl Worker {
         }
         let drained = self.carry.is_empty() && played >= self.written;
         let ended = self.cur.as_ref().is_none_or(|t| t.eof) && self.next.is_none();
-        let waiting = self.loading_next || self.loading_play || self.next_id.is_some();
+        let waiting =
+            self.next_load.is_some() || self.play_load.is_some() || self.next_id.is_some();
         if drained && ended && !waiting && !self.finished_sent {
             self.finished_sent = true;
             self.cur = None;
@@ -1287,6 +1286,13 @@ impl Worker {
                 o.stop();
             }
         }
+    }
+}
+
+/// Stops a load that is no longer wanted (its result is then ignored).
+fn drop_load(load: &mut Option<(u64, Cancel)>) {
+    if let Some((_, cancel)) = load.take() {
+        cancel.cancel();
     }
 }
 
@@ -1444,11 +1450,16 @@ mod tests {
     fn tone_loader(
         specs: Arc<Mutex<HashMap<String, Spec>>>,
         loads: Arc<Mutex<Vec<String>>>,
+        cancelled: Arc<Mutex<Vec<String>>>,
     ) -> Loader {
-        Arc::new(move |id, _, _| {
+        Arc::new(move |id, cancel, _| {
             loads.lock().unwrap().push(id.into());
             let spec = specs.lock().unwrap().get(id).cloned().unwrap_or_default();
             std::thread::sleep(spec.load_delay);
+            if cancel.is_cancelled() {
+                cancelled.lock().unwrap().push(id.into());
+                return Err(Error::Cancelled);
+            }
             if spec.load_panic {
                 panic!("test panic");
             }
@@ -1469,6 +1480,8 @@ mod tests {
         events: Receiver<Event>,
         specs: Arc<Mutex<HashMap<String, Spec>>>,
         loads: Arc<Mutex<Vec<String>>>,
+        /// Loads that found themselves cancelled.
+        cancelled: Arc<Mutex<Vec<String>>>,
     }
 
     impl Rig {
@@ -1477,7 +1490,8 @@ mod tests {
             let (etx, events) = crossbeam_channel::unbounded();
             let specs: Arc<Mutex<HashMap<String, Spec>>> = Arc::default();
             let loads: Arc<Mutex<Vec<String>>> = Arc::default();
-            let loader = tone_loader(specs.clone(), loads.clone());
+            let cancelled: Arc<Mutex<Vec<String>>> = Arc::default();
+            let loader = tone_loader(specs.clone(), loads.clone(), cancelled.clone());
             let timeline = Arc::new(Mutex::new(Timeline::default()));
             let w = Worker::new(loader, true, Shared::new(), timeline, tx, etx).unwrap();
             Rig {
@@ -1486,6 +1500,7 @@ mod tests {
                 events,
                 specs,
                 loads,
+                cancelled,
             }
         }
 
@@ -1499,7 +1514,7 @@ mod tests {
         }
 
         fn loading(&self) -> bool {
-            self.w.loading_play || self.w.loading_next
+            self.w.play_load.is_some() || self.w.next_load.is_some()
         }
 
         /// Lets the worker catch up: loads in, decoded as far as the ring allows.
@@ -1644,7 +1659,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let e = Engine::with_loader(tone_loader(specs, Arc::default()), true).unwrap();
+        let e =
+            Engine::with_loader(tone_loader(specs, Arc::default(), Arc::default()), true).unwrap();
         let until = |want: &dyn Fn(&Event) -> bool| loop {
             match e.events().recv_timeout(Duration::from_secs(5)) {
                 Ok(ev) if want(&ev) => return ev,
@@ -1679,6 +1695,48 @@ mod tests {
         r.play_out(100);
         assert_eq!(r.events(), ["started b"]);
         assert_eq!(r.position().unwrap().id, "b");
+    }
+
+    #[test]
+    fn fast_skips_stop_the_downloads_they_leave_behind() {
+        let mut r = Rig::new();
+        for id in ["a", "b"] {
+            r.track(id, |s| s.load_delay = Duration::from_millis(100));
+        }
+        // Each skip comes before the last track has opened.
+        for id in ["a", "b", "c"] {
+            assert!(r.w.handle(Cmd::Play(id.into())));
+        }
+        r.play_out(300);
+        assert_eq!(r.events(), ["started c"]);
+        // The skipped loads wake up to find themselves stopped.
+        assert!(within(Duration::from_secs(2), || r
+            .cancelled
+            .lock()
+            .unwrap()
+            .len()
+            == 2));
+        let mut cancelled = r.cancelled.lock().unwrap().clone();
+        cancelled.sort();
+        assert_eq!(cancelled, ["a", "b"]);
+    }
+
+    #[test]
+    fn playing_the_track_being_opened_ahead_uses_that_load() {
+        let mut r = Rig::new();
+        r.track("a", |s| s.frames = RATE / 2);
+        r.track("b", |s| s.load_delay = Duration::from_millis(100));
+        r.cmd(Cmd::Play("a".into()));
+        assert!(r.w.handle(Cmd::SetNext(Some("b".into()))));
+        r.consume(100);
+        r.w.pump();
+        assert!(r.w.next_load.is_some());
+        // Skipped to before it finished opening.
+        r.cmd(Cmd::Play("b".into()));
+        r.play_out(100);
+        assert_eq!(r.events(), ["started a", "started b"]);
+        assert_eq!(r.loads(), ["a", "b"]);
+        assert!(r.cancelled.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1940,7 +1998,7 @@ mod tests {
         assert!(r.w.handle(Cmd::SetNext(Some("b".into()))));
         r.consume(200);
         r.w.pump();
-        assert!(r.w.loading_next);
+        assert!(r.w.next_load.is_some());
         r.cmd(Cmd::SetNext(None));
         r.play_out(2500);
         assert_eq!(r.events(), ["started a", "finished"]);
