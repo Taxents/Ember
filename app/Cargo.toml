@@ -12,7 +12,7 @@ path = "src/main.rs"
 music-core = { path = "../core" }
 signin = { path = "../signin" }
 together = { path = "../together" }
-slint = { version = "=1.18.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg", "raw-window-handle-06"] }
+slint = { version = "=1.18.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg", "raw-window-handle-06", "accessibility"] }
 raw-window-handle = "0.6"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 crossbeam-channel = "0.5"

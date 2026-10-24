@@ -532,11 +532,6 @@ fn wire(ui: &AppWindow) {
             a.save_later();
         });
     });
-    g.on_reset_lyrics_id(|| {
-        workers::run_ordered(music_core::lyrics::reset_key_id, |()| {
-            with(|a| a.notify("Unison has a new ID for this app"));
-        });
-    });
     g.on_open_data_folder(|| {
         let _ = std::process::Command::new("explorer.exe")
             .arg(music_core::paths::config_dir())

@@ -1,6 +1,6 @@
 // The Settings page.
 
-import { Theme, IconButton, PillButton, Art } from "../widgets.slint";
+import { Theme, IconButton, PillButton, Art, ScrollBar } from "../widgets.slint";
 import { Ui } from "../types.slint";
 
 // One setting: what it is and a word on it, with its control on the right.
@@ -63,10 +63,10 @@ export component SettingsHeading inherits Text {
     letter-spacing: 0.6px;
 }
 
-// Settings: account, updates, playback, sidebar, storage.
+// Settings: account, updates, playback, lyrics, sidebar, storage.
 export component SettingsPage inherits Rectangle {
     property <bool> hidden-open;
-    Flickable {
+    flick := Flickable {
         content-height: col.preferred-height;
         col := VerticalLayout {
             padding-left: 34px;
@@ -166,8 +166,7 @@ export component SettingsPage inherits Rectangle {
             }
 
             SettingRow {
-                title: "Lyrics from other sources";
-                note: "Also look on Unison and LRCLIB, which are sent the song's title, artist, album and length. Off: only YouTube's lyrics.";
+                title: "Improved lyrics";
                 PillButton {
                     text: Ui.lyrics-third-party ? "On" : "Off";
                     primary: Ui.lyrics-third-party;
@@ -177,18 +176,6 @@ export component SettingsPage inherits Rectangle {
                     clicked => {
                         Ui.lyrics-third-party = !Ui.lyrics-third-party;
                         Ui.lyrics-third-party-changed(Ui.lyrics-third-party);
-                    }
-                }
-            }
-
-            if Ui.lyrics-third-party: SettingRow {
-                title: "Unison ID";
-                note: "Unison knows this app by a random ID. A new one isn't linked to the lookups made so far.";
-                PillButton {
-                    text: "Make a new one";
-                    primary: false;
-                    clicked => {
-                        Ui.reset-lyrics-id();
                     }
                 }
             }
@@ -284,5 +271,14 @@ export component SettingsPage inherits Rectangle {
                 }
             }
         }
+    }
+
+    ScrollBar {
+        x: flick.x + flick.width - self.width;
+        y: flick.y;
+        height: flick.height;
+        content-y <=> flick.content-y;
+        content-height: flick.content-height;
+        visible-height: flick.height;
     }
 }
