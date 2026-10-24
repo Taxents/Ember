@@ -150,6 +150,10 @@ struct App {
     main_len: usize,
     /// The card grid, which is always last, from row `grid_at`; laid out for (columns, cards).
     grid: Vec<Item>,
+    /// Which page rows (and cards in them) show each artwork URL, so an arriving picture
+    /// doesn't walk the whole page; rebuilt when its key (what it was built from) goes stale.
+    art_index: HashMap<String, Vec<(usize, Option<usize>)>>,
+    art_index_key: (u64, usize, usize, usize, Option<u32>, u32),
     grid_at: usize,
     grid_laid: (usize, usize),
     columns: usize,
@@ -171,6 +175,11 @@ struct App {
     /// Play counts looked up for rows that don't carry one: video id → (count, unix time).
     plays: HashMap<String, (u64, u64)>,
     plays_asked: std::collections::HashSet<String>,
+    /// Songs whose stats are wanted once scrolling settles (newest last), how many requests are
+    /// out, and the settle timer: a fast scroll past hundreds of rows asks for none of them.
+    stats_queue: std::collections::VecDeque<String>,
+    stats_in_flight: usize,
+    stats_timer: Timer,
     /// Bumped by every "play this": an older click's tracks arriving late don't replace it.
     play_seq: u64,
     /// Pages seen lately (by [`page_key`]), shown at once when opened again, then fetched again
@@ -205,6 +214,8 @@ struct App {
     /// Seek to this once the restored track starts.
     resume_at: Option<u64>,
     minimized: bool,
+    /// Another window is active: the clock moves once a second and the meter rests.
+    unfocused: bool,
     /// Runs while skips come quickly; when it ends, the song they stopped at plays.
     skip_timer: Timer,
     /// Skips moved past songs without playing them (see [`App::skip`]).
@@ -285,6 +296,8 @@ fn main() {
         history: Vec::new(),
         at: 0,
         generation: 0,
+        art_index: HashMap::new(),
+        art_index_key: Default::default(),
         page_tracks: Vec::new(),
         page_groups: Vec::new(),
         page_rows: rows::PageRows::new(),
@@ -307,6 +320,9 @@ fn main() {
         autoplay: None,
         plays: settings::load_plays(),
         plays_asked: Default::default(),
+        stats_queue: Default::default(),
+        stats_in_flight: 0,
+        stats_timer: Timer::default(),
         play_seq: 0,
         playlists_seq: 0,
         library_wish: Vec::new(),
@@ -325,6 +341,7 @@ fn main() {
         account: None,
         resume_at: None,
         minimized: false,
+        unfocused: false,
         skip_timer: Timer::default(),
         skip_pending: false,
         waiting_since: None,
@@ -838,6 +855,7 @@ impl App {
     }
 
     fn load_page(&mut self) {
+        self.trim_caches();
         let r = self.history[self.at].clone();
         self.generation += 1;
         let generation = self.generation;
@@ -922,6 +940,7 @@ impl App {
         self.page_tracks.clear();
         self.page_groups.clear();
         self.rows.clear();
+        self.art_index.clear();
         self.page_rows.set_vec(Vec::new());
         self.page_rows.set_playable(false);
         self.tracks_at = 0;
@@ -938,6 +957,22 @@ impl App {
 
     /// A page was fetched: kept for next time, and shown, unless what's shown is it already
     /// (`again`: it was shown from what was kept).
+    /// Song details pile up over a long session: past 5,000, keep only what the queue needs.
+    fn trim_caches(&mut self) {
+        const MOST: usize = 5000;
+        if self.known.len() > MOST {
+            let keep: std::collections::HashSet<&str> =
+                self.player.queue().iter().map(String::as_str).collect();
+            self.known.retain(|id, _| keep.contains(id.as_str()));
+        }
+        if self.lengths.len() > MOST {
+            self.lengths.clear();
+        }
+        if self.plays_asked.len() > MOST {
+            self.plays_asked.clear();
+        }
+    }
+
     fn page_arrived(
         &mut self,
         generation: u64,
@@ -1195,6 +1230,7 @@ impl App {
 
     fn push_row(&mut self, r: RowRef, kind: RowKind, row: TrackRow) {
         self.rows.push(r);
+        self.art_index.clear();
         self.page_rows.push(TrackRow { kind, ..row });
     }
 
@@ -1203,6 +1239,7 @@ impl App {
         let mut at = self.tracks_at + self.main_len;
         if matches!(self.rows.get(at), Some(RowRef::Footer)) {
             self.rows.remove(at);
+            self.art_index.clear();
             self.page_rows.remove(at);
         }
         let current = self.player.current().map(str::to_string);
@@ -1220,6 +1257,7 @@ impl App {
                 row.artist = SharedString::new();
             }
             self.rows.insert(at, RowRef::Track(self.page_tracks.len()));
+            self.art_index.clear();
             self.page_rows.insert(at, row);
             self.page_tracks.push(t);
             self.page_groups.push(0);
@@ -1228,6 +1266,7 @@ impl App {
         // Only once the whole list is here, so the totals are right.
         if self.summary && self.more.is_none() && self.main_len > 0 {
             self.rows.insert(at, RowRef::Footer);
+            self.art_index.clear();
             self.page_rows.insert(
                 at,
                 TrackRow {
@@ -1348,6 +1387,7 @@ impl App {
         };
         while self.rows.len() > self.grid_at + keep {
             self.rows.pop();
+            self.art_index.clear();
             self.page_rows.remove(self.page_rows.row_count() - 1);
         }
         for &(start, end) in &lines[keep..] {
@@ -1610,6 +1650,7 @@ impl App {
         let at = if to > from { to - 1 } else { to };
         let t = self.page_tracks.remove(from);
         self.page_tracks.insert(at, t);
+        self.art_index.clear();
         let row = self.page_rows.remove(from + off);
         self.page_rows.insert(at + off, row);
         for i in from.min(at)..=from.max(at) {
@@ -1715,7 +1756,7 @@ impl App {
                 .get(&t.video_id)
                 .is_some_and(|p| music_core::paths::unix_now().saturating_sub(p.1) < 7 * 24 * 3600);
             if !fresh || (t.duration_ms.is_none() && !self.lengths.contains_key(&t.video_id)) {
-                self.ask_stats(t.video_id.clone());
+                self.want_stats(t.video_id.clone());
             }
             let Some(size) = self.page_art() else {
                 return;
@@ -1783,12 +1824,43 @@ impl App {
         }
     }
 
-    /// Looks up a track's play count (once per run), then fills it into the page.
-    /// Asks for a song's play count and length, then fills them in wherever it's listed.
+    /// A row showing `id` came into view: its stats are asked for once the list has been still
+    /// for 300 ms, the rows seen last first.
+    fn want_stats(&mut self, id: String) {
+        if self.plays_asked.contains(&id) {
+            return;
+        }
+        self.stats_queue.retain(|q| *q != id);
+        self.stats_queue.push_back(id);
+        // Rows scrolled past long ago aren't on screen any more.
+        while self.stats_queue.len() > 40 {
+            self.stats_queue.pop_front();
+        }
+        self.stats_timer
+            .start(TimerMode::SingleShot, Duration::from_millis(300), || {
+                with(|a| a.send_stats());
+            });
+    }
+
+    /// Sends what's waiting in `stats_queue`, at most 4 at a time.
+    fn send_stats(&mut self) {
+        if self.stats_timer.running() {
+            return;
+        }
+        while self.stats_in_flight < 4
+            && let Some(id) = self.stats_queue.pop_back()
+        {
+            self.ask_stats(id);
+        }
+    }
+
+    /// Asks for a song's play count and length (once per run), then fills them in wherever it's
+    /// listed.
     fn ask_stats(&mut self, id: String) {
         if !self.plays_asked.insert(id.clone()) {
             return;
         }
+        self.stats_in_flight += 1;
         let client = self.client.clone();
         let page = PAGE.load(Ordering::Relaxed);
         workers::run_background(
@@ -1798,49 +1870,58 @@ impl App {
                 (r, id)
             },
             |(r, id)| {
-                with(|a| match r {
-                    None => {
-                        a.plays_asked.remove(&id);
-                    }
-                    Some(r) => match r {
-                        Ok(VideoStats {
-                            plays,
-                            duration_ms: ms,
-                            ..
-                        }) => {
-                            if let Some(n) = plays {
-                                a.plays
-                                    .insert(id.clone(), (n, music_core::paths::unix_now()));
-                                a.save_plays_later();
-                            }
-                            if let Some(ms) = ms {
-                                a.lengths.insert(id.clone(), ms);
-                            }
-                            for (ri, r) in a.rows.iter().enumerate() {
-                                let RowRef::Track(ti) = r else { continue };
-                                let t = &mut a.page_tracks[*ti];
-                                if t.video_id != id {
-                                    continue;
-                                }
-                                let Some(mut row) = a.page_rows.row_data(ri) else {
-                                    continue;
-                                };
-                                if let Some(n) = plays {
-                                    t.plays = Some(n);
-                                    row.plays = fmt_count(n).into();
-                                }
-                                if let Some(ms) = ms.filter(|_| t.duration_ms.is_none()) {
-                                    t.duration_ms = Some(ms);
-                                    row.duration = fmt_ms(ms).into();
-                                }
-                                a.page_rows.set_row_data(ri, row);
-                            }
-                        }
-                        Err(e) => log::warn!("stats {id}: {e}"),
-                    },
+                with(|a| {
+                    a.stats_in_flight -= 1;
+                    a.got_stats(r, id);
+                    a.send_stats();
                 });
             },
         );
+    }
+
+    fn got_stats(&mut self, r: Option<music_core::Result<VideoStats>>, id: String) {
+        let a = self;
+        match r {
+            None => {
+                a.plays_asked.remove(&id);
+            }
+            Some(r) => match r {
+                Ok(VideoStats {
+                    plays,
+                    duration_ms: ms,
+                    ..
+                }) => {
+                    if let Some(n) = plays {
+                        a.plays
+                            .insert(id.clone(), (n, music_core::paths::unix_now()));
+                        a.save_plays_later();
+                    }
+                    if let Some(ms) = ms {
+                        a.lengths.insert(id.clone(), ms);
+                    }
+                    for (ri, r) in a.rows.iter().enumerate() {
+                        let RowRef::Track(ti) = r else { continue };
+                        let t = &mut a.page_tracks[*ti];
+                        if t.video_id != id {
+                            continue;
+                        }
+                        let Some(mut row) = a.page_rows.row_data(ri) else {
+                            continue;
+                        };
+                        if let Some(n) = plays {
+                            t.plays = Some(n);
+                            row.plays = fmt_count(n).into();
+                        }
+                        if let Some(ms) = ms.filter(|_| t.duration_ms.is_none()) {
+                            t.duration_ms = Some(ms);
+                            row.duration = fmt_ms(ms).into();
+                        }
+                        a.page_rows.set_row_data(ri, row);
+                    }
+                }
+                Err(e) => log::warn!("stats {id}: {e}"),
+            },
+        }
     }
 
     /// The page's sizes changed. While the sidebar or panel slides they change every frame and
@@ -1876,23 +1957,34 @@ impl App {
     }
 
     /// An image arrived: put it everywhere it's wanted.
-    fn image_arrived(&mut self, url: String, img: Image) {
-        self.images.insert(&url, img.clone());
-        if self.minimized || img.size().width == 0 {
-            return;
-        }
+    /// Brings `art_index` up to date with the page's rows and artwork sizes.
+    fn index_art(&mut self) {
         let row_px = self.page_art().map(|s| self.px(s));
         let card_px = self.px(CARD_ART);
+        let cards: usize = (0..self.page_rows.row_count())
+            .filter_map(|ri| self.page_rows.row_data(ri))
+            .map(|r| r.cards.row_count())
+            .sum();
+        let key = (
+            self.generation,
+            self.rows.len(),
+            self.grid.len(),
+            cards,
+            row_px,
+            card_px,
+        );
+        if key == self.art_index_key && !self.art_index.is_empty() {
+            return;
+        }
+        self.art_index_key = key;
+        self.art_index.clear();
         for (ri, r) in self.rows.iter().enumerate() {
             let items: &[Item] = match r {
                 RowRef::Track(ti) => {
                     if let Some(px) = row_px
-                        && images::url_for(&self.page_tracks[*ti].thumbs, px).as_deref()
-                            == Some(url.as_str())
-                        && let Some(mut row) = self.page_rows.row_data(ri)
+                        && let Some(url) = images::url_for(&self.page_tracks[*ti].thumbs, px)
                     {
-                        row.art = img.clone();
-                        self.page_rows.set_row_data(ri, row);
+                        self.art_index.entry(url).or_default().push((ri, None));
                     }
                     continue;
                 }
@@ -1908,12 +2000,33 @@ impl App {
                 _ => continue,
             };
             for (j, item) in items.iter().enumerate() {
-                if pages::card_url(item, card_px).as_deref() == Some(url.as_str())
-                    && let Some(row) = self.page_rows.row_data(ri)
-                    && let Some(mut c) = row.cards.row_data(j)
-                {
-                    c.art = img.clone();
-                    row.cards.set_row_data(j, c);
+                if let Some(url) = pages::card_url(item, card_px) {
+                    self.art_index.entry(url).or_default().push((ri, Some(j)));
+                }
+            }
+        }
+    }
+
+    fn image_arrived(&mut self, url: String, img: Image) {
+        self.images.insert(&url, img.clone());
+        if self.minimized || img.size().width == 0 {
+            return;
+        }
+        self.index_art();
+        for &(ri, card) in self.art_index.get(&url).into_iter().flatten() {
+            let Some(mut row) = self.page_rows.row_data(ri) else {
+                continue;
+            };
+            match card {
+                None => {
+                    row.art = img.clone();
+                    self.page_rows.set_row_data(ri, row);
+                }
+                Some(j) => {
+                    if let Some(mut c) = row.cards.row_data(j) {
+                        c.art = img.clone();
+                        row.cards.set_row_data(j, c);
+                    }
                 }
             }
         }
@@ -2815,13 +2928,24 @@ impl App {
             );
         }
         let want = (playing || waiting && waited < Duration::from_secs(20)) && !self.minimized;
-        // The meter's timer moves the clock too (see `meter_tick`).
+        // The meter's timer moves the clock too (see `meter_tick`); with another window active
+        // it's only the clock, once a second.
         if want && !self.meter_timer.running() {
             g.set_levels(ModelRc::from(self.levels.clone()));
-            self.meter_timer
-                .start(TimerMode::Repeated, Duration::from_millis(33), || {
-                    with(|a| a.meter_tick());
-                });
+            if self.unfocused {
+                self.meter_timer
+                    .start(TimerMode::Repeated, Duration::from_secs(1), || {
+                        with(|a| {
+                            a.tick();
+                            a.lyrics_tick();
+                        });
+                    });
+            } else {
+                self.meter_timer
+                    .start(TimerMode::Repeated, Duration::from_millis(33), || {
+                        with(|a| a.meter_tick());
+                    });
+            }
         } else if !want && self.meter_timer.running() {
             self.meter_timer.stop();
         }
@@ -2830,6 +2954,15 @@ impl App {
     /// Rebuilds the queue panel (the songs after the playing one) and marks the playing row on
     /// the page.
     fn queue_changed(&mut self) {
+        // Songs still in the queue keep the artwork they have rather than blinking and loading it
+        // again.
+        let from = self.queue_from.min(self.queue_ids.len());
+        let mut had: HashMap<String, Image> = self.queue_ids[from..]
+            .iter()
+            .zip(self.queue_rows.iter())
+            .filter(|(_, r)| r.art.size().width > 0)
+            .map(|(id, r)| (id.clone(), r.art))
+            .collect();
         let (order, at) = self.player.up_next();
         self.queue_ids = order.iter().map(|s| s.to_string()).collect();
         self.queue_from = (at + 1).min(self.queue_ids.len());
@@ -2847,6 +2980,9 @@ impl App {
                 // Listen Along: who added it.
                 if let Some(by) = self.added_by(id, self.queue_from + i) {
                     row.artist = format!("{} \u{b7} added by {by}", row.artist).into();
+                }
+                if let Some(art) = had.remove(id) {
+                    row.art = art;
                 }
                 row
             })
@@ -2952,6 +3088,9 @@ impl App {
     }
 
     fn remote(&mut self, r: Remote) {
+        if let Remote::Focused(on) = r {
+            return self.focus_changed(on);
+        }
         log::info!("remote: {r:?}");
         match r {
             Remote::PlayPause => self.play_pause(),
@@ -2972,7 +3111,25 @@ impl App {
             Remote::Minimized => self.minimize(),
             Remote::Restored => self.restore(),
             Remote::Seek(ms) => self.seek(ms),
+            Remote::Focused(_) => {}
         }
+    }
+
+    /// The meter's timer runs at its other pace from the next tick.
+    fn focus_changed(&mut self, focused: bool) {
+        if self.unfocused == !focused {
+            return;
+        }
+        self.unfocused = !focused;
+        if self.unfocused {
+            // The visualizer rests rather than freezing mid-beat.
+            for (i, m) in self.meter.iter_mut().enumerate() {
+                m.1 = 0.0;
+                self.levels.set_row_data(i, 0.0);
+            }
+        }
+        self.meter_timer.stop();
+        self.tick();
     }
 
     // ---- minimize ---------------------------------------------------------------------------
@@ -4251,6 +4408,7 @@ impl App {
             };
             if remove {
                 self.rows.remove(ri);
+                self.art_index.clear();
                 self.page_rows.remove(ri);
                 if self.tracks_at > ri {
                     self.tracks_at -= 1;
@@ -4266,6 +4424,7 @@ impl App {
             // The grid ends the page: its last card gone, so are its rows.
             while self.rows.len() > self.grid_at {
                 self.rows.pop();
+                self.art_index.clear();
                 self.page_rows.remove(self.page_rows.row_count() - 1);
             }
         } else if self.grid.len() != before {
@@ -4332,6 +4491,7 @@ impl App {
         let t = self.page_tracks.remove(i);
         self.page_groups.remove(i);
         self.rows.remove(at);
+        self.art_index.clear();
         self.page_rows.remove(at);
         self.main_len -= 1;
         for r in self.rows.iter_mut() {
