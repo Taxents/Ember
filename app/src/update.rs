@@ -103,6 +103,8 @@ pub fn check(report: &dyn Fn(Status)) -> Status {
     let Some(version) = release["tag_name"]
         .as_str()
         .map(|t| t.trim_start_matches('v').to_string())
+        // It names files: digits and dots only.
+        .filter(|v| plain_version(v))
     else {
         // No release yet.
         return done(Status::UpToDate);
@@ -144,7 +146,7 @@ pub fn download_and_install(version: &str, report: &dyn Fn(Status)) -> Status {
         s
     };
     let release = FOUND.lock().unwrap().clone();
-    let Some(release) = release.filter(|r| r.version == version) else {
+    let Some(release) = release.filter(|r| r.version == version && plain_version(version)) else {
         return done(Status::DownloadFailed(version.to_string()));
     };
     let unverified = |why: &str| {
@@ -206,34 +208,91 @@ pub fn download_and_install(version: &str, report: &dyn Fn(Status)) -> Status {
 /// Set when the user asked to restart into the update; read once the window has closed.
 pub static RESTART: AtomicBool = AtomicBool::new(false);
 
-/// One check or download at a time; none once an update is installed.
-static BUSY: AtomicBool = AtomicBool::new(false);
-static INSTALLED: AtomicBool = AtomicBool::new(false);
+type Job = Box<dyn FnOnce() -> Status + Send>;
 
-/// Runs `job` on its own thread, unless one is running or an update is already in.
-fn run(job: impl FnOnce() -> Status + Send + 'static) {
-    if INSTALLED.load(Ordering::Relaxed) || BUSY.swap(true, Ordering::AcqRel) {
-        return;
+/// One check or download at a time. Set and cleared under `QUEUED`'s lock.
+static BUSY: AtomicBool = AtomicBool::new(false);
+/// A download asked for while something else ran; it runs next.
+static QUEUED: Mutex<Option<Job>> = Mutex::new(None);
+/// The version installed this session; nothing more is checked or downloaded after it.
+static INSTALLED: Mutex<Option<String>> = Mutex::new(None);
+
+/// Runs `job` on the update thread. While another job runs it's dropped, or with `queue` kept
+/// to run after it. False: it will never run.
+fn run(job: Job, queue: bool) -> bool {
+    let mut queued = QUEUED.lock().unwrap();
+    if BUSY.load(Ordering::Acquire) {
+        if queue {
+            *queued = Some(job);
+        }
+        return queue;
     }
-    let _ = std::thread::Builder::new()
+    BUSY.store(true, Ordering::Release);
+    let spawned = std::thread::Builder::new()
         .name("update".into())
         .spawn(move || {
-            if matches!(job(), Status::Ready(_)) {
-                INSTALLED.store(true, Ordering::Relaxed);
+            let mut job = job;
+            loop {
+                if let Status::Ready(v) = job() {
+                    *INSTALLED.lock().unwrap() = Some(v);
+                }
+                let mut queued = QUEUED.lock().unwrap();
+                match queued.take() {
+                    Some(next) => job = next,
+                    None => {
+                        BUSY.store(false, Ordering::Release);
+                        return;
+                    }
+                }
             }
-            BUSY.store(false, Ordering::Release);
         });
+    if let Err(e) = spawned {
+        log::warn!("update: no thread: {e}");
+        BUSY.store(false, Ordering::Release);
+        return false;
+    }
+    true
 }
 
-/// Checks once on its own thread. `report` hears each step (on that thread: hand it to the UI
-/// thread yourself).
+fn installed() -> Option<String> {
+    INSTALLED.lock().unwrap().clone()
+}
+
+/// Checks once on its own thread, unless a check or download is running. `report` hears each
+/// step (on that thread: hand it to the UI thread yourself). Once an update is installed it
+/// just says so.
 pub fn check_now(report: impl Fn(Status) + Send + 'static) {
-    run(move || check(&report));
+    if let Some(v) = installed() {
+        return report(Status::Ready(v));
+    }
+    run(Box::new(move || check(&report)), false);
 }
 
-/// Downloads and installs `version` on its own thread; only ever on the user's say-so.
-pub fn install_now(version: String, report: impl Fn(Status) + Send + 'static) {
-    run(move || download_and_install(&version, &report));
+/// Downloads and installs `version` on its own thread; only ever on the user's say-so. Asked
+/// while a check runs, it starts as soon as that's done.
+pub fn install_now(version: String, report: impl Fn(Status) + Send + Clone + 'static) {
+    if let Some(v) = installed() {
+        return report(Status::Ready(v));
+    }
+    // Shown at once, even when it has to wait for a check to finish.
+    report(Status::Downloading(version.clone(), 0));
+    let r = report.clone();
+    let v = version.clone();
+    if !run(
+        Box::new(move || {
+            // Installed by an earlier queued click meanwhile.
+            match installed() {
+                Some(v) => {
+                    r(Status::Ready(v.clone()));
+                    Status::Ready(v)
+                }
+                None => download_and_install(&v, &r),
+            }
+        }),
+        true,
+    ) {
+        report(Status::DownloadFailed(version));
+    }
 }
 
 /// Checks right away at start, then every six hours while the app runs. Only checks.
@@ -346,9 +405,14 @@ fn dismissed_path() -> PathBuf {
 
 /// Fetches the release exe into `part`, carrying on from what's already there.
 fn download(release: &Release, part: &Path, report: &dyn Fn(Status)) -> Result<(), String> {
-    let have = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+    let mut have = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
     if release.exe_size > 0 && have == release.exe_size {
         return Ok(());
+    }
+    if release.exe_size > 0 && have > release.exe_size {
+        // Not a part of this file.
+        let _ = std::fs::remove_file(part);
+        have = 0;
     }
     // Large and possibly slow: no limit on the whole body, only on each read going quiet.
     let mut rb = music_core::net::agent()
@@ -377,6 +441,12 @@ fn download(release: &Release, part: &Path, report: &dyn Fn(Status)) -> Result<(
         ),
         // The server ignored the range (or there was nothing yet): start over.
         200 => (std::fs::File::create(part).map_err(|e| e.to_string())?, 0),
+        // The part doesn't fit the file (it changed, or the part is bad): once more from zero.
+        416 if have > 0 => {
+            drop(r);
+            std::fs::remove_file(part).map_err(|e| e.to_string())?;
+            return download(release, part, report);
+        }
         s => return Err(format!("HTTP {s}")),
     };
     let total = release.exe_size;
@@ -467,6 +537,15 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// `v` is `1.2.3`: three dot-separated runs of digits, nothing else.
+fn plain_version(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| (1..=9).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// `a` is a later version than `b` (dotted numbers; anything else counts as 0).
 fn newer(a: &str, b: &str) -> bool {
     let parts = |v: &str| -> Vec<u64> {
@@ -518,6 +597,18 @@ sMIVovIC6uCpVtbX+JtFy05OQWaoX2TCKIylUTu65dz1kYWDLHdtISlTq3rkJfee1yV/k5SCFDz0s5Vd
         assert!(newer("1.0.0", "0.99.99"));
         assert!(!newer("0.1.0", "0.1.0"));
         assert!(!newer("0.1.0", "0.2.0"));
+    }
+
+    #[test]
+    fn plain_versions() {
+        assert!(plain_version("1.2.3"));
+        assert!(plain_version("0.10.0"));
+        assert!(!plain_version("1.2"));
+        assert!(!plain_version("1.2.3-beta"));
+        assert!(!plain_version("1.2.3/../x"));
+        assert!(!plain_version("1..3"));
+        assert!(!plain_version("1.2.3.4"));
+        assert!(!plain_version("1.2.99999999999"));
     }
 
     #[test]
