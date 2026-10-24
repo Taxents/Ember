@@ -12,12 +12,13 @@ use crate::{Error, Result, net};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 const VISITOR_URL: &str = "https://music.youtube.com/youtubei/v1/visitor_id?prettyPrint=false";
 const CLIENT_NAME_ID: &str = "101";
-const CLIENT_VERSION: &str = "1.02";
+const VISION_VERSION: &str = "1.02";
 const CLIENT_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 \
      (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
 /// visitorData is refreshed daily, or immediately when YouTube rejects a request.
@@ -75,10 +76,22 @@ struct Disk {
     video_formats: HashMap<String, Vec<VideoInfo>>,
 }
 
+/// The last answer for one video (a failure too), shared by everyone who asked while it was
+/// being fetched.
+type Slot = Arc<Mutex<Option<(Instant, Result<(StreamInfo, Vec<VideoInfo>)>)>>>;
+
 pub struct Resolver {
     state: Mutex<Disk>,
     path: std::path::PathBuf,
     itags: Vec<u32>,
+    /// Videos being fetched: a second ask for the same one waits for the first's answer.
+    inflight: Mutex<HashMap<String, Slot>>,
+}
+
+/// Why a `/player` request failed, and whether a fresh visitorData might fix it.
+struct Refused {
+    err: Error,
+    retry: bool,
 }
 
 impl Resolver {
@@ -102,6 +115,7 @@ impl Resolver {
             state: Mutex::new(disk),
             path,
             itags: ITAGS.to_vec(),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -154,17 +168,74 @@ impl Resolver {
         }
     }
 
-    /// Asks YouTube for the streams and caches them.
+    /// Asks YouTube for the streams and caches them. Asks made while the same video is being
+    /// fetched wait and share that answer rather than sending their own.
     fn fetch(&self, video_id: &str) -> Result<(StreamInfo, Vec<VideoInfo>)> {
+        /// Takes the video out of `inflight` when the last one holding its slot is done, however
+        /// that ends (a panic included).
+        struct Leave<'a> {
+            inflight: &'a Mutex<HashMap<String, Slot>>,
+            id: &'a str,
+            slot: Option<Slot>,
+        }
+        impl Drop for Leave<'_> {
+            fn drop(&mut self) {
+                // Let go of the slot under the map's lock, so every count is seen in order.
+                let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+                drop(self.slot.take());
+                // Only the map's left: nobody else is waiting on it.
+                if inflight
+                    .get(self.id)
+                    .is_some_and(|s| Arc::strong_count(s) == 1)
+                {
+                    inflight.remove(self.id);
+                }
+            }
+        }
+
+        let asked = Instant::now();
+        let slot = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(video_id.to_string())
+            .or_default()
+            .clone();
+        let leave = Leave {
+            inflight: &self.inflight,
+            id: video_id,
+            slot: Some(slot),
+        };
+        // A panic in an earlier fetch only means it left no answer.
+        let mut last = leave
+            .slot
+            .as_ref()
+            .expect("slot")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match &*last {
+            // Answered while this one waited, success or not: that's the answer.
+            Some((at, got)) if *at >= asked => got.clone(),
+            _ => {
+                let r = self.fetch_now(video_id);
+                *last = Some((Instant::now(), r.clone()));
+                r
+            }
+        }
+    }
+
+    fn fetch_now(&self, video_id: &str) -> Result<(StreamInfo, Vec<VideoInfo>)> {
         let visitor = self.visitor(false)?;
         let (info, video) = match self.player(video_id, &visitor) {
             Ok(i) => i,
             // A stale visitorData is the usual reason for a refusal: retry once with a fresh one.
-            Err(Error::Net(_)) | Err(Error::Unavailable(_)) => {
-                let visitor = self.visitor(true)?;
-                self.player(video_id, &visitor)?
+            // When that fails too, the first answer is the one that says what happened.
+            Err(Refused { err, retry: true }) => {
+                log::debug!("resolve {video_id}: {err}; retrying with a fresh visitorData");
+                let visitor = self.visitor(true).map_err(|_| err.clone())?;
+                self.player(video_id, &visitor).map_err(|_| err)?
             }
-            Err(e) => return Err(e),
+            Err(Refused { err, .. }) => return Err(err),
         };
         // A resolver restricted to other formats (testing) doesn't touch the shared cache.
         if self.itags == ITAGS {
@@ -203,7 +274,8 @@ impl Resolver {
             }
         }
         let body = json!({"context": {"client": {
-            "clientName": "WEB_REMIX", "clientVersion": "1.20260707.12.00", "hl": "en", "gl": "US"
+            "clientName": "WEB_REMIX", "clientVersion": super::client::CLIENT_VERSION,
+            "hl": "en", "gl": "US"
         }}});
         let v = net::post_json(
             VISITOR_URL,
@@ -224,10 +296,14 @@ impl Resolver {
         Ok(data)
     }
 
-    fn player(&self, video_id: &str, visitor: &str) -> Result<(StreamInfo, Vec<VideoInfo>)> {
+    fn player(
+        &self,
+        video_id: &str,
+        visitor: &str,
+    ) -> std::result::Result<(StreamInfo, Vec<VideoInfo>), Refused> {
         let body = json!({
             "context": {"client": {
-                "clientName": "VISIONOS", "clientVersion": CLIENT_VERSION,
+                "clientName": "VISIONOS", "clientVersion": VISION_VERSION,
                 "deviceMake": "Apple", "deviceModel": "RealityDevice17,1",
                 "userAgent": CLIENT_UA, "osName": "visionOS", "osVersion": "26.5.23O471",
                 "hl": "en", "gl": "US", "visitorData": visitor,
@@ -242,13 +318,20 @@ impl Resolver {
             &[
                 ("User-Agent", CLIENT_UA),
                 ("X-YouTube-Client-Name", CLIENT_NAME_ID),
-                ("X-YouTube-Client-Version", CLIENT_VERSION),
+                ("X-YouTube-Client-Version", VISION_VERSION),
                 ("Origin", "https://www.youtube.com"),
                 ("X-Goog-Visitor-Id", visitor),
             ],
             &body,
-        )?;
-        let audio = parse_player(video_id, &v, &self.itags)?;
+        )
+        .map_err(|err| Refused {
+            retry: http_refused(&err),
+            err,
+        })?;
+        let audio = parse_player(video_id, &v, &self.itags).map_err(|err| Refused {
+            err,
+            retry: rejected(&v),
+        })?;
         Ok((audio, parse_video(video_id, &v)))
     }
 
@@ -270,6 +353,24 @@ impl Resolver {
 impl Default for Resolver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// An HTTP refusal a fresh visitorData can cure (400, 403); not timeouts, 404s or 5xx.
+fn http_refused(e: &Error) -> bool {
+    matches!(e, Error::Net(m) if m.starts_with("HTTP 400 ") || m.starts_with("HTTP 403 "))
+}
+
+/// A `/player` answer that turned the client away rather than said the video can't play: the
+/// "confirm you're not a bot" sign-in demand, or OK with no plain URLs. Private, age-restricted,
+/// removed or region-locked videos stay that way with any visitorData.
+fn rejected(v: &Value) -> bool {
+    let ps = &v["playabilityStatus"];
+    let reason = ps["reason"].as_str().unwrap_or("").to_lowercase();
+    match ps["status"].as_str().unwrap_or("") {
+        "LOGIN_REQUIRED" => !reason.contains("private") && !reason.contains("age"),
+        "OK" => true,
+        _ => false,
     }
 }
 
@@ -390,5 +491,70 @@ mod tests {
         assert_eq!(pick_video(&f, 600).unwrap().itag, 136);
         assert_eq!(pick_video(&f, 2000).unwrap().itag, 136);
         assert!(pick_video(&[], 300).is_none());
+    }
+
+    #[test]
+    fn shared_answers_survive_a_panic() {
+        let r = Resolver {
+            state: Mutex::new(Disk::default()),
+            path: std::env::temp_dir().join("ember-resolver-test.json"),
+            itags: vec![],
+            inflight: Mutex::new(HashMap::new()),
+        };
+        // A fetch that panicked holding the slot, and an answer arriving after this ask.
+        let slot: Slot = Default::default();
+        let s2 = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = s2.lock().unwrap();
+            panic!("fetch panicked");
+        })
+        .join();
+        assert!(slot.is_poisoned());
+        let later = Instant::now() + std::time::Duration::from_secs(60);
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((later, Err(Error::Unavailable("first".into()))));
+        r.inflight.lock().unwrap().insert("x".into(), slot);
+        let got = r.fetch("x");
+        assert!(matches!(got, Err(Error::Unavailable(m)) if m == "first"));
+        assert!(r.inflight.lock().unwrap().is_empty(), "the entry is gone");
+    }
+
+    #[test]
+    fn retries_only_refusals() {
+        let net = |m: &str| Error::Net(m.to_string());
+        assert!(http_refused(&net(
+            "HTTP 403 from https://www.youtube.com/x"
+        )));
+        assert!(http_refused(&net(
+            "HTTP 400 from https://www.youtube.com/x"
+        )));
+        assert!(!http_refused(&net(
+            "HTTP 404 from https://www.youtube.com/x"
+        )));
+        assert!(!http_refused(&net(
+            "HTTP 500 from https://www.youtube.com/x"
+        )));
+        assert!(!http_refused(&net("timeout")));
+        assert!(!http_refused(&Error::Unavailable("x".into())));
+
+        let status = |s: &str, r: &str| json!({"playabilityStatus": {"status": s, "reason": r}});
+        assert!(rejected(&status(
+            "LOGIN_REQUIRED",
+            "Sign in to confirm you’re not a bot"
+        )));
+        assert!(rejected(&status("OK", "")));
+        assert!(!rejected(&status(
+            "LOGIN_REQUIRED",
+            "This video is private"
+        )));
+        assert!(!rejected(&status(
+            "LOGIN_REQUIRED",
+            "Sign in to confirm your age"
+        )));
+        assert!(!rejected(&status(
+            "UNPLAYABLE",
+            "Not available in your country"
+        )));
+        assert!(!rejected(&status("ERROR", "Video unavailable")));
     }
 }

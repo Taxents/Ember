@@ -275,6 +275,54 @@ fn not_interested(menu: &Value) -> Option<String> {
     })
 }
 
+/// Every "Not interested" token in a response, paired with the token its "Undo" sends (the
+/// toast the website shows after it: `openPopupAction` → `notificationActionRenderer`).
+pub fn feedback_undo(v: &Value) -> Vec<(String, String)> {
+    fn walk(v: &Value, out: &mut Vec<(String, String)>) {
+        match v {
+            Value::Object(m) => {
+                let s = &v["menuServiceItemRenderer"];
+                if s["icon"]["iconType"].as_str() == Some("NOT_INTERESTED") {
+                    let f = &s["serviceEndpoint"]["feedbackEndpoint"];
+                    let undo = arr(&f["actions"]).iter().find_map(|a| {
+                        let button = &a["openPopupAction"]["popup"]["notificationActionRenderer"]
+                            ["actionButton"]["buttonRenderer"];
+                        str_of(&button["command"]["feedbackEndpoint"]["feedbackToken"])
+                    });
+                    if let (Some(t), Some(u)) = (str_of(&f["feedbackToken"]), undo) {
+                        out.push((t, u));
+                    }
+                    return;
+                }
+                m.values().for_each(|c| walk(c, out));
+            }
+            Value::Array(a) => a.iter().for_each(|c| walk(c, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(v, &mut out);
+    out
+}
+
+/// Which of `asked` an `edit_playlist` reply with `DEDUPE_OPTION_SKIP` left out as duplicates.
+/// The reply lists what it added (`playlistEditResults`); without that list nothing is known,
+/// so nothing counts as skipped.
+pub fn skipped_adds(v: &Value, asked: &[String]) -> Vec<String> {
+    let Some(results) = v["playlistEditResults"].as_array() else {
+        return Vec::new();
+    };
+    let added: Vec<&str> = results
+        .iter()
+        .filter_map(|r| r["playlistEditVideoAddedResultData"]["videoId"].as_str())
+        .collect();
+    asked
+        .iter()
+        .filter(|id| !added.contains(&id.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn browse_ref(endpoint: &Value) -> Option<BrowseRef> {
     let b = &endpoint["browseEndpoint"];
     Some(BrowseRef {
@@ -1175,5 +1223,18 @@ mod tests {
         );
         assert_eq!(album_kind("Single • 2024"), AlbumKind::Single);
         assert_eq!(year_in("Album • 1973"), Some(1973));
+    }
+
+    #[test]
+    fn skipped_duplicates() {
+        let asked = ["a".to_string(), "b".to_string()];
+        let v = serde_json::json!({"status": "STATUS_SUCCEEDED", "playlistEditResults": [
+            {"playlistEditVideoAddedResultData": {"videoId": "a", "setVideoId": "x"}}
+        ]});
+        assert_eq!(skipped_adds(&v, &asked), ["b"]);
+        let none = serde_json::json!({"status": "STATUS_SUCCEEDED", "playlistEditResults": []});
+        assert_eq!(skipped_adds(&none, &asked), asked);
+        let unknown = serde_json::json!({"status": "STATUS_SUCCEEDED"});
+        assert!(skipped_adds(&unknown, &asked).is_empty());
     }
 }

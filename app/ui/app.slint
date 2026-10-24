@@ -223,8 +223,19 @@ export global Ui {
     // A newer version is installed and runs from the next start; this restarts into it.
     in property <string> update-ready;
     callback restart-to-update();
-    // A newer version found and downloading; what the last check said, for Settings.
+    // A newer version found (nothing downloaded yet), and whether its banner was put away.
     in property <string> update-available;
+    in property <bool> update-dismissed;
+    // While it downloads: "Downloading Ember 1.2.3… 42%". After a failure: what went wrong.
+    in property <string> update-progress;
+    in property <string> update-error;
+    // The download didn't match its signature (or none can be checked): no retry is offered.
+    in property <bool> update-unverified;
+    // Download, verify and install update-available; only ever on this click.
+    callback update-install();
+    // Hide the banner until a newer version than update-available is out.
+    callback update-dismiss();
+    // What the last check said, for Settings.
     in property <string> update-status;
     in property <string> app-version;
     callback check-updates();
@@ -878,29 +889,46 @@ component Sidebar inherits Rectangle {
             }
         }
 
-        // A newer version: downloading, then ready to restart into.
-        if Ui.update-ready != "" || Ui.update-available != "": Rectangle {
-            height: 40px;
+        // A newer version: found (download on request), downloading, then ready to restart into.
+        if Ui.update-ready != "" || (Ui.update-available != "" && !Ui.update-dismissed): banner := Rectangle {
+            property <bool> ready: Ui.update-ready != "";
+            property <bool> busy: Ui.update-progress != "";
+            property <bool> failed: Ui.update-error != "";
             border-radius: 8px;
-            background: upd.has-hover ? Theme.amber.with-alpha(0.22) : Theme.amber.with-alpha(0.14);
-            upd := TouchArea {
-                mouse-cursor: pointer;
-                clicked => {
-                    if (Ui.update-ready != "") {
-                        Ui.restart-to-update();
-                    } else {
-                        Ui.navigate(PageKind.settings, "", "Settings");
+            background: Theme.amber.with-alpha(0.14);
+            // Collapsed, it's just the icon: restart when ready, else Settings says the rest.
+            if root.collapsed: Rectangle {
+                height: 40px;
+                background: upd.has-hover ? Theme.amber.with-alpha(0.08) : transparent;
+                border-radius: 8px;
+                upd := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        if (banner.ready) {
+                            Ui.restart-to-update();
+                        } else {
+                            Ui.navigate(PageKind.settings, "", "Settings");
+                        }
                     }
                 }
-            }
 
-            HorizontalLayout {
-                padding-left: root.collapsed ? 0 : 12px;
+                Icon {
+                    name: "check";
+                    width: 16px;
+                    height: 16px;
+                    color: Theme.amber;
+                }
+            }
+            if !root.collapsed: HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 4px;
+                padding-top: 8px;
+                padding-bottom: 8px;
                 spacing: 10px;
-                alignment: root.collapsed ? center : start;
                 Rectangle {
                     width: 16px;
                     Icon {
+                        y: 1px;
                         name: "check";
                         width: 16px;
                         height: 16px;
@@ -908,14 +936,49 @@ component Sidebar inherits Rectangle {
                     }
                 }
 
-                if !root.collapsed: Text {
-                    text: Ui.update-ready != "" ? "Restart to update (" + Ui.update-ready + ")"
-                        : "Downloading update " + Ui.update-available + "…";
-                    color: Theme.ivory;
-                    font-size: 12px;
-                    font-weight: 600;
-                    vertical-alignment: center;
-                    overflow: elide;
+                VerticalLayout {
+                    spacing: 4px;
+                    alignment: center;
+                    Text {
+                        text: banner.ready ? "Ember " + Ui.update-ready + " is ready"
+                            : banner.failed ? Ui.update-error
+                            : banner.busy ? Ui.update-progress
+                            : "Ember " + Ui.update-available + " is available";
+                        color: Theme.ivory;
+                        font-size: 12px;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+
+                    // The action, when there is one: install, try again, or restart.
+                    if !banner.busy && !Ui.update-unverified: Text {
+                        text: banner.ready ? "Restart to update" : banner.failed ? "Try again" : "Download and install";
+                        color: act.has-hover ? Theme.ivory : Theme.amber;
+                        font-size: 12px;
+                        font-weight: 600;
+                        overflow: elide;
+                        act := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                if (banner.ready) {
+                                    Ui.restart-to-update();
+                                } else {
+                                    Ui.update-install();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !banner.ready && !banner.busy: IconButton {
+                    y: 4px;
+                    icon: "close";
+                    size: 24px;
+                    icon-size: 12px;
+                    tooltip: "Not now";
+                    clicked => {
+                        Ui.update-dismiss();
+                    }
                 }
             }
         }
@@ -2508,7 +2571,13 @@ component SettingsPage inherits Rectangle {
                         Ui.restart-to-update();
                     }
                 }
-                if Ui.update-ready == "": PillButton {
+                if Ui.update-ready == "" && Ui.update-available != "" && Ui.update-progress == "" && !Ui.update-unverified: PillButton {
+                    text: "Download and install";
+                    clicked => {
+                        Ui.update-install();
+                    }
+                }
+                if Ui.update-ready == "" && (Ui.update-available == "" || Ui.update-unverified): PillButton {
                     text: "Check for updates";
                     primary: false;
                     clicked => {

@@ -49,11 +49,23 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Write a file atomically (temp file + rename), so a crash never leaves half a file.
+/// Write a file atomically (temp file + rename), so a crash never leaves half a file. The temp
+/// name is unique to the call, so two threads writing the same file don't share one temp.
 pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = path.with_file_name(name);
+    if let Err(e) = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

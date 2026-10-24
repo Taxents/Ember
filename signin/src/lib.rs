@@ -68,12 +68,7 @@ thread_local! {
 /// no other windows, e.g. a dedicated one.
 pub fn sign_in(profile_root: &std::path::Path) -> Result<Cookies, Error> {
     // A fresh profile per attempt: one left locked by a crashed attempt can't block this one.
-    // Leftovers are removed here once their browser processes have gone.
-    if let Ok(old) = std::fs::read_dir(profile_root) {
-        for e in old.flatten() {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
-    }
+    clean_up(profile_root);
     let profile_dir = profile_root.join(format!("{}", std::process::id()));
     let result = run(&profile_dir);
     // The browser processes release the profile shortly after the window is gone.
@@ -84,6 +79,17 @@ pub fn sign_in(profile_root: &std::path::Path) -> Result<Cookies, Error> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     result
+}
+
+/// Deletes the WebView profiles earlier sign-ins left in `profile_root` (one that crashed, or
+/// whose browser held on to its folder too long). They hold that browser session's Google
+/// cookies, so call this at start too. One still in use by a running sign-in stays.
+pub fn clean_up(profile_root: &std::path::Path) {
+    if let Ok(old) = std::fs::read_dir(profile_root) {
+        for e in old.flatten() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 fn run(profile_dir: &std::path::Path) -> Result<Cookies, Error> {

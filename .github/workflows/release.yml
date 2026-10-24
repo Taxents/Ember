@@ -1,6 +1,16 @@
-# Builds a release when a version tag (v1.2.3) is pushed: ember.exe and its SHA-256, which the
-# app's updater downloads and checks, plus EmberSetup.exe, the installer for new users. The tag
-# must match the app's Cargo.toml version.
+# Builds a release when a version tag (v1.2.3) is pushed: ember.exe, its minisign signature and its
+# SHA-256, which the app's updater downloads and checks, plus EmberSetup.exe, the installer for new
+# users. The tag must match the app's Cargo.toml version.
+#
+# Two jobs: `build` reads the repository only and hands the files on as an artifact; `publish`
+# can write (to create the release) but runs no project code. Actions are pinned to commits; the
+# comment beside each is the tag it was taken from.
+#
+# Secrets:
+#   MINISIGN_SECRET_KEY  the whole of the minisign secret key file (made with `minisign -G -W`, see
+#                        tools/release.ps1). Without it the build fails: unsigned releases would
+#                        never be installed by the app anyway.
+#   FANART_KEY           the fanart.tv key; without it the build has no artist logos but works.
 name: Release
 
 on:
@@ -8,26 +18,37 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  # Pinned tools. minisign's zip hash was checked against its author's signature
+  # (key RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3).
+  MINISIGN_URL: https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip
+  MINISIGN_SHA256: 37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479
+  INNO_VERSION: 6.7.1
 
 jobs:
-  release:
+  build:
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Check the tag matches the app version
         shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           $v = (Select-String -Path app/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          if ("v$v" -ne "${{ github.ref_name }}") { throw "tag ${{ github.ref_name }} but app/Cargo.toml says $v" }
+          if ("v$v" -ne "$env:TAG") { throw "tag $env:TAG but app/Cargo.toml says $v" }
 
-      # The fanart.tv key comes from the repository secret FANART_KEY; without it the build has no
-      # artist logos but works.
       - name: Write secrets.toml
         shell: pwsh
         env:
@@ -40,28 +61,72 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          Copy-Item target/release/ember.exe ember.exe
-          (Get-FileHash ember.exe -Algorithm SHA256).Hash.ToLower() | Set-Content ember.exe.sha256 -NoNewline -Encoding ascii
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item target/release/ember.exe out/ember.exe
+          (Get-FileHash out/ember.exe -Algorithm SHA256).Hash.ToLower() | Set-Content out/ember.exe.sha256 -NoNewline -Encoding ascii
+
+      # ember.exe.minisig: the app installs an update only if this verifies against the public key
+      # built into it (app/src/update.rs), and only if the trusted comment names its version.
+      - name: Sign
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if (-not $env:MINISIGN_SECRET_KEY) { throw "the MINISIGN_SECRET_KEY secret is not set" }
+          Invoke-WebRequest $env:MINISIGN_URL -OutFile "$env:RUNNER_TEMP\minisign.zip"
+          $got = (Get-FileHash "$env:RUNNER_TEMP\minisign.zip" -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $env:MINISIGN_SHA256) { throw "minisign download hash $got doesn't match" }
+          Expand-Archive "$env:RUNNER_TEMP\minisign.zip" "$env:RUNNER_TEMP\minisign" -Force
+          $minisign = "$env:RUNNER_TEMP\minisign\minisign-win64\x86_64\minisign.exe"
+          $key = "$env:RUNNER_TEMP\ember.key"
+          Set-Content -Path $key -Value $env:MINISIGN_SECRET_KEY -Encoding ascii
+          try {
+            $v = "$env:TAG".TrimStart('v')
+            & $minisign -S -s $key -m out/ember.exe -x out/ember.exe.minisig -t "version:$v file:ember.exe"
+            if ($LASTEXITCODE -ne 0) { throw "minisign failed ($LASTEXITCODE)" }
+          } finally {
+            Remove-Item $key -Force
+          }
 
       # EmberSetup.exe: the installer people download the first time (installer/ember.iss).
-      # The updater keeps using ember.exe and ember.exe.sha256 above.
+      # The updater keeps using ember.exe and its signature above.
       - name: Build the installer
         shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          $find = { Get-ChildItem "C:\Program Files*\Inno Setup *\ISCC.exe", "$env:LOCALAPPDATA\Programs\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 }
-          $iscc = & $find
-          if (-not $iscc) {
-            choco install innosetup -y --no-progress
-            if ($LASTEXITCODE -ne 0) { throw "installing Inno Setup failed" }
-            $iscc = & $find
-          }
+          choco install innosetup --version=$env:INNO_VERSION --allow-downgrade -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "installing Inno Setup $env:INNO_VERSION failed" }
+          $iscc = Get-ChildItem "C:\Program Files*\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $iscc) { throw "ISCC.exe not found" }
-          $v = "${{ github.ref_name }}".TrimStart('v')
-          & $iscc.FullName "/DAppVersion=$v" "/DExePath=$PWD\ember.exe" "/O$PWD" installer\ember.iss
+          if ($iscc.VersionInfo.ProductVersion -notlike "$env:INNO_VERSION*") { throw "ISCC is $($iscc.VersionInfo.ProductVersion), not $env:INNO_VERSION" }
+          $v = "$env:TAG".TrimStart('v')
+          & $iscc.FullName "/DAppVersion=$v" "/DExePath=$PWD\out\ember.exe" "/O$PWD\out" installer\ember.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
-          if (-not (Test-Path EmberSetup.exe)) { throw "EmberSetup.exe was not produced" }
+          if (-not (Test-Path out/EmberSetup.exe)) { throw "EmberSetup.exe was not produced" }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release
+          path: out/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release
+          path: out
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" ember.exe ember.exe.sha256 EmberSetup.exe --generate-notes --title "${{ github.ref_name }}"
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" out/ember.exe out/ember.exe.minisig out/ember.exe.sha256 out/EmberSetup.exe --generate-notes --title "$TAG"

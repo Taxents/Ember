@@ -9,7 +9,9 @@ use super::parse;
 use super::session::{ORIGIN, Session};
 use crate::{Error, Result, net};
 use serde_json::{Value, json};
-use std::sync::RwLock;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, RwLock};
 
 const API: &str = "https://music.youtube.com/youtubei/v1";
 const CLIENT_NAME: &str = "WEB_REMIX";
@@ -20,12 +22,26 @@ const ANDROID_VERSION: &str = "7.21.50";
 
 pub struct Client {
     session: RwLock<Option<Session>>,
+    /// A signed-in call came back signed out (or 401): the session no longer works.
+    expired: AtomicBool,
+    /// "Not interested" token → the token that undoes it, from the pages seen.
+    undo: Mutex<HashMap<String, String>>,
+}
+
+/// What adding to a playlist did.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Added {
+    /// The tracks YouTube left out because the playlist already has them (asked to skip
+    /// duplicates). Empty when everything was added, or when YouTube didn't say what it added.
+    pub skipped: Vec<String>,
 }
 
 impl Client {
     pub fn new(session: Option<Session>) -> Self {
         Client {
             session: RwLock::new(session),
+            expired: AtomicBool::new(false),
+            undo: Mutex::new(HashMap::new()),
         }
     }
 
@@ -40,6 +56,13 @@ impl Client {
 
     pub fn set_session(&self, s: Option<Session>) {
         *self.session.write().unwrap() = s;
+        self.expired.store(false, Ordering::Relaxed);
+    }
+
+    /// A signed-in call found the session signed out (YouTube said `loggedOut`, or HTTP 401):
+    /// the cookies have expired or were revoked. Cleared by `set_session`.
+    pub fn session_expired(&self) -> bool {
+        self.expired.load(Ordering::Relaxed)
     }
 
     /// POST to `endpoint` with the client context added. `query` is appended to the URL
@@ -66,7 +89,11 @@ impl Client {
             headers.push(("Authorization", &auth));
             headers.push(("X-Goog-AuthUser", "0"));
         }
-        net::post_json(&url, &headers, &body)
+        let r = net::post_json(&url, &headers, &body);
+        if session.is_some() && signed_out(&r) && !self.expired.swap(true, Ordering::Relaxed) {
+            log::warn!("youtube: the session is signed out ({endpoint})");
+        }
+        r
     }
 
     /// Like `call`, but fails clearly when signed out (for library and account actions).
@@ -111,8 +138,23 @@ impl Client {
 
     // ---- browsing --------------------------------------------------------------------------
 
+    /// Notes the undo tokens a page's "Not interested" entries carry.
+    fn keep_undo(&self, v: &Value) {
+        let found = parse::feedback_undo(v);
+        if found.is_empty() {
+            return;
+        }
+        let mut undo = self.undo.lock().unwrap();
+        if undo.len() > 5000 {
+            undo.clear();
+        }
+        undo.extend(found);
+    }
+
     fn feed_page(&self, id: &str, params: Option<&str>) -> Result<Feed> {
-        Ok(parse::feed(&self.browse(id, params)?))
+        let v = self.browse(id, params)?;
+        self.keep_undo(&v);
+        Ok(parse::feed(&v))
     }
 
     pub fn home(&self) -> Result<Feed> {
@@ -142,7 +184,9 @@ impl Client {
 
     /// More shelves of a feed (Home scrolls this way).
     pub fn feed_more(&self, c: &Continuation) -> Result<Feed> {
-        Ok(parse::feed(&self.continue_on("browse", json!({}), c)?))
+        let v = self.continue_on("browse", json!({}), c)?;
+        self.keep_undo(&v);
+        Ok(parse::feed(&v))
     }
 
     pub fn search(&self, query: &str, filter: Option<SearchFilter>) -> Result<SearchResults> {
@@ -343,6 +387,17 @@ impl Client {
         Ok(())
     }
 
+    /// Takes back a "Not interested" already sent with `feedback(token)`, as the website's
+    /// "Removed from Home · Undo" does. `Ok(false)`: the page `token` came from carried no undo
+    /// token, so there's nothing to send.
+    pub fn undo_feedback(&self, token: &str) -> Result<bool> {
+        let undo = self.undo.lock().unwrap().get(token).cloned();
+        match undo {
+            Some(u) => self.feedback(&u).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
     /// Adds or removes an album/playlist from the library (`playlist_id` of an album is its
     /// `OLAK5uy_…` id).
     pub fn save_playlist(&self, playlist_id: &str, save: bool) -> Result<()> {
@@ -377,13 +432,39 @@ impl Client {
         Ok(())
     }
 
-    /// Appends tracks (duplicates allowed, like the website's "add anyway").
+    /// Appends tracks, quietly skipping any the playlist already has.
     pub fn add_to_playlist(&self, playlist_id: &str, video_ids: &[String]) -> Result<()> {
+        self.add_to_playlist_checked(playlist_id, video_ids, false)
+            .map(|_| ())
+    }
+
+    /// Appends tracks. Without `force`, ones the playlist already has are skipped and listed in
+    /// `Added::skipped` (so the app can offer "Add anyway"); with it they're added again, like
+    /// the website's "Add anyway".
+    pub fn add_to_playlist_checked(
+        &self,
+        playlist_id: &str,
+        video_ids: &[String],
+        force: bool,
+    ) -> Result<Added> {
         let actions: Vec<Value> = video_ids
             .iter()
-            .map(|v| json!({ "action": "ACTION_ADD_VIDEO", "addedVideoId": v, "dedupeOption": "DEDUPE_OPTION_SKIP" }))
+            .map(|v| {
+                let mut a = json!({ "action": "ACTION_ADD_VIDEO", "addedVideoId": v });
+                if !force {
+                    a["dedupeOption"] = json!("DEDUPE_OPTION_SKIP");
+                }
+                a
+            })
             .collect();
-        self.edit_playlist(playlist_id, actions)
+        let v = self.edit_playlist_raw(playlist_id, actions)?;
+        Ok(Added {
+            skipped: if force {
+                Vec::new()
+            } else {
+                parse::skipped_adds(&v, video_ids)
+            },
+        })
     }
 
     /// Removes tracks; they need the `set_video_id` from the playlist's own listing.
@@ -430,6 +511,11 @@ impl Client {
     }
 
     fn edit_playlist(&self, playlist_id: &str, actions: Vec<Value>) -> Result<()> {
+        self.edit_playlist_raw(playlist_id, actions).map(|_| ())
+    }
+
+    /// Sends playlist edits; the reply when they went through.
+    fn edit_playlist_raw(&self, playlist_id: &str, actions: Vec<Value>) -> Result<Value> {
         let id = playlist_id.trim_start_matches("VL");
         let v = self.call_signed_in(
             "browse/edit_playlist",
@@ -437,7 +523,7 @@ impl Client {
             "",
         )?;
         match v["status"].as_str() {
-            Some("STATUS_SUCCEEDED") | None if v["error"].is_null() => Ok(()),
+            Some("STATUS_SUCCEEDED") | None if v["error"].is_null() => Ok(v),
             _ => Err(status_error(&v)),
         }
     }
@@ -540,10 +626,14 @@ impl Client {
             .get(&url)
             .header("User-Agent", net::BROWSER_UA)
             .header("Origin", ORIGIN);
-        if let Some(s) = &session {
+        // The URL comes from the response: the account's cookies go only to YouTube itself.
+        if let Some(s) = &session
+            && youtube_https(&url)
+        {
             req = req
                 .header("Cookie", s.cookie_header())
-                .header("Authorization", s.authorization());
+                .header("Authorization", s.authorization())
+                .header("X-Goog-AuthUser", "0");
         }
         let resp = req.call().map_err(|e| Error::Net(e.to_string()))?;
         match resp.status().as_u16() {
@@ -579,6 +669,31 @@ fn watch_body(video_id: Option<&str>, playlist_id: Option<&str>, params: Option<
         body["params"] = json!(p);
     }
     body
+}
+
+/// A reply that shows the session no longer signs in: HTTP 401, or YouTube saying `loggedOut`.
+fn signed_out(r: &Result<Value>) -> bool {
+    match r {
+        Ok(v) => v["responseContext"]["mainAppWebResponseContext"]["loggedOut"] == true,
+        Err(Error::Net(m)) => m.starts_with("HTTP 401 "),
+        Err(_) => false,
+    }
+}
+
+/// `url` is `https://` on youtube.com or one of its subdomains.
+fn youtube_https(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') {
+        return false;
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(h, _)| h)
+        .to_ascii_lowercase();
+    host == "youtube.com" || host.ends_with(".youtube.com")
 }
 
 fn status_error(v: &Value) -> Error {
@@ -618,4 +733,37 @@ fn cpn() -> String {
             ALPHABET[(x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 58) as usize] as char
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracking_cookies_only_to_youtube() {
+        assert!(youtube_https(
+            "https://s.youtube.com/api/stats/playback?a=1"
+        ));
+        assert!(youtube_https("https://music.youtube.com/x"));
+        assert!(youtube_https("https://www.YouTube.com:443/x"));
+        assert!(!youtube_https("http://s.youtube.com/api"));
+        assert!(!youtube_https("https://youtube.com.evil.example/api"));
+        assert!(!youtube_https("https://evilyoutube.com/api"));
+        assert!(!youtube_https("https://s.youtube.com@evil.example/api"));
+        assert!(!youtube_https("https://evil.example/?u=s.youtube.com"));
+    }
+
+    #[test]
+    fn signed_out_replies() {
+        let out = json!({"responseContext": {"mainAppWebResponseContext": {"loggedOut": true}}});
+        let ok = json!({"responseContext": {"mainAppWebResponseContext": {"loggedOut": false}}});
+        assert!(signed_out(&Ok(out)));
+        assert!(!signed_out(&Ok(ok)));
+        assert!(signed_out(&Err(Error::Net(
+            "HTTP 401 from music.youtube.com".into()
+        ))));
+        assert!(!signed_out(&Err(Error::Net(
+            "HTTP 403 from music.youtube.com".into()
+        ))));
+    }
 }

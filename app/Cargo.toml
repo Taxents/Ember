@@ -39,6 +39,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 sha2 = "0.10"
+minisign-verify = "0.3.0"
 
 [build-dependencies]
 slint-build = "=1.18.1"

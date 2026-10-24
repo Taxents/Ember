@@ -376,7 +376,7 @@ fn main() {
     forward_engine_events();
     workers::spawn(images::prune_disk);
     update::clean_up();
-    update::watch(update_status);
+    update::watch(update::show);
 
     // Window handle work needs the native window, which exists once the event loop runs.
     let _ = slint::invoke_from_event_loop(|| {
@@ -465,7 +465,8 @@ fn wire(ui: &AppWindow) {
     g.on_np_open(|what| {
         with(|a| a.np_open(&what));
     });
-    g.on_check_updates(|| update::check_now(update_status));
+    g.on_check_updates(|| update::check_now(update::show));
+    update::wire(&g);
     g.on_clear_cache(|| {
         workers::run(
             || {
@@ -4870,35 +4871,6 @@ fn place_cards(cards: &mut [Card]) {
         c.at = at;
         at += card_units(c.video);
     }
-}
-
-/// Shows an update check's progress: the sidebar's notice and Settings' line.
-fn update_status(s: update::Status) {
-    let _ = slint::invoke_from_event_loop(move || {
-        with(|a| {
-            let ui = a.ui();
-            let g = ui.global::<Ui>();
-            // Settings says only whether this is the newest version; the rest stays quiet.
-            let text = match &s {
-                update::Status::UpToDate => "Up to date",
-                update::Status::Downloading(v) => {
-                    g.set_update_available(v.into());
-                    "Outdated"
-                }
-                update::Status::Ready(v) => {
-                    g.set_update_available(SharedString::new());
-                    g.set_update_ready(v.into());
-                    "Outdated"
-                }
-                update::Status::Failed => {
-                    g.set_update_available(SharedString::new());
-                    return;
-                }
-                update::Status::Checking | update::Status::Off => return,
-            };
-            g.set_update_status(text.into());
-        });
-    });
 }
 
 /// How much a folder holds, all the way down.

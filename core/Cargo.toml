@@ -36,3 +36,5 @@ windows = { version = "0.62", features = [
 ] }
 # The `implement` macro (an IStream for Media Foundation) names this crate; already in the tree.
 windows-core = "0.62"
+# The Unison key id; already in the tree (iroh).
+getrandom = "0.3"
