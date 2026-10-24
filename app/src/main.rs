@@ -232,6 +232,8 @@ struct App {
     together: Option<listen::Session>,
     together_timer: Timer,
     toast: toast::Toast,
+    /// The song playing and its length, until it's been heard long enough to count as played.
+    play_report: Option<(String, Option<u64>)>,
     /// Lyrics were shown this session (see [`App::lyrics_wanted`]).
     lyrics_opened: bool,
     /// A request failed on the network; `offline_timer` checks until one gets through.
@@ -339,6 +341,7 @@ fn main() {
         metrics: None,
         metrics_timer: Timer::default(),
         toast: Default::default(),
+        play_report: None,
         lyrics_opened: false,
         offline: false,
         offline_timer: Timer::default(),
@@ -2382,6 +2385,33 @@ impl App {
             });
     }
 
+    /// Tells YouTube a song was played once 30 s of it were heard (a shorter song: once it's
+    /// nearly over), so skipping through a queue doesn't fill the history.
+    fn report_play_when_heard(&mut self, pos: Option<&music_core::audio::Position>) {
+        let (Some(p), Some((id, duration))) = (pos, &self.play_report) else {
+            return;
+        };
+        if p.id != *id {
+            return;
+        }
+        let duration = p.duration_ms.or(*duration);
+        let enough = duration.map_or(30_000, |d| d.saturating_sub(2_000).clamp(1_000, 30_000));
+        if p.ms < enough {
+            return;
+        }
+        let id = id.clone();
+        self.play_report = None;
+        if !self.client.signed_in() {
+            return;
+        }
+        let client = self.client.clone();
+        workers::spawn(move || {
+            if let Err(e) = client.report_play(&id) {
+                log::warn!("history: {e}");
+            }
+        });
+    }
+
     /// Quick skips are over: what's played now was chosen some other way.
     fn cancel_skip(&mut self) {
         self.skip_timer.stop();
@@ -2483,15 +2513,9 @@ impl App {
                     self.autoplay_from(t, None);
                 }
                 self.show_now_playing(true);
-                // Live radio isn't YouTube's to know about.
-                if !station && self.client.signed_in() {
-                    let (client, id) = (self.client.clone(), id.clone());
-                    workers::spawn(move || {
-                        if let Err(e) = client.report_play(&id) {
-                            log::warn!("history: {e}");
-                        }
-                    });
-                }
+                // Into YouTube's history once it's really been listened to (see `tick`); live
+                // radio isn't YouTube's to know about.
+                self.play_report = (!station).then(|| (id.clone(), *duration_ms));
             }
             Event::Finished => self.tick(),
             Event::Failed { id, error, .. } => {
@@ -2735,6 +2759,7 @@ impl App {
             }
         }
         np.playing = playing;
+        self.report_play_when_heard(pos.as_ref());
         // Compared with what Windows was told, not with `np`: a new song sets `np` first.
         if self.reported_playing != Some(playing) {
             self.reported_playing = Some(playing);

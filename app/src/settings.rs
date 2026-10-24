@@ -40,9 +40,19 @@ impl Default for Settings {
             panel_tab: 1,
             hidden_playlists: Vec::new(),
             playlist_order: Vec::new(),
-            together_name: std::env::var("USERNAME").unwrap_or_default(),
+            together_name: default_name(),
         }
     }
+}
+
+/// A Listen Along name that doesn't give away the Windows account's: "Ember listener 417".
+fn default_name() -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos())
+        % 900
+        + 100;
+    format!("Ember listener {n}")
 }
 
 /// The queue as it was, in play order.
@@ -74,7 +84,12 @@ fn save<T: Serialize>(name: &str, v: &T) {
 
 impl Settings {
     pub fn load() -> Self {
-        load("settings.json")
+        let mut s: Settings = load("settings.json");
+        // Older versions defaulted to the Windows user name, which friends would see.
+        if std::env::var("USERNAME").is_ok_and(|u| !u.is_empty() && u == s.together_name) {
+            s.together_name = default_name();
+        }
+        s
     }
 
     pub fn save(&self) {
