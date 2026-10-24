@@ -309,6 +309,17 @@ export global Ui {
     callback previous();
     callback seek(int);
     callback set-volume(float);
+    // The level before muting, for Ctrl+M or the speaker icon to bring back.
+    in-out property <float> volume-before-mute: 1.0;
+    public function toggle-mute() {
+        if (self.volume <= 0.001) {
+            self.volume = max(self.volume-before-mute, 0.05);
+        } else {
+            self.volume-before-mute = self.volume;
+            self.volume = 0;
+        }
+        self.set-volume(self.volume);
+    }
     callback toggle-shuffle();
     callback cycle-repeat();
     callback toggle-like();
@@ -407,6 +418,33 @@ component SideRow inherits Rectangle {
     border-radius: 6px;
     background: selected ? Theme.smoke : ta.has-hover ? Theme.smoke.with-alpha(0.45) : transparent;
     opacity: root.dragging ? 0.5 : 1;
+    accessible-role: list-item;
+    accessible-label: root.label;
+    accessible-item-selected: root.selected;
+    accessible-action-default => {
+        root.clicked();
+    }
+    side-focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(e) => {
+            if (e.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            if (e.text == Key.Menu || (e.modifiers.shift && e.text == Key.F10)) {
+                root.menu({ x: self.absolute-position.x + 20px, y: self.absolute-position.y + root.height });
+                return accept;
+            }
+            reject
+        }
+    }
+
+    if side-focus.has-focus: Rectangle {
+        border-radius: 6px;
+        border-width: 2px;
+        border-color: Theme.amber;
+    }
+
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => {
@@ -521,6 +559,7 @@ component SectionHeader inherits Rectangle {
 component SearchField inherits Rectangle {
     in property <bool> collapsed;
     callback accepted(string);
+    callback cancelled();
     out property <bool> has-focus: input.has-focus;
     public function focus-input() {
         input.focus();
@@ -555,18 +594,30 @@ component SearchField inherits Rectangle {
         font-size: 13px;
         vertical-alignment: center;
     }
-    input := TextInput {
+    // Esc leaves the field, back to the shortcuts.
+    FocusScope {
         x: 32px;
         width: parent.width - 40px;
-        visible: !root.collapsed;
-        color: Theme.ivory;
-        selection-background-color: Theme.oxide;
-        font-size: 13px;
-        vertical-alignment: center;
-        single-line: true;
-        accepted => {
-            if (self.text != "") {
-                root.accepted(self.text);
+        focus-on-click: false;
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.cancelled();
+                return accept;
+            }
+            reject
+        }
+        input := TextInput {
+            visible: !root.collapsed;
+            accessible-label: "Search";
+            color: Theme.ivory;
+            selection-background-color: Theme.oxide;
+            font-size: 13px;
+            vertical-alignment: center;
+            single-line: true;
+            accepted => {
+                if (self.text != "") {
+                    root.accepted(self.text);
+                }
             }
         }
     }
@@ -604,9 +655,13 @@ component Sidebar inherits Rectangle {
                     Ui.search(q);
                     root.searched();
                 }
+                cancelled => {
+                    root.searched();
+                }
             }
             IconButton {
                 icon: "sidebar";
+                tooltip: Ui.sidebar-collapsed ? "Expand sidebar" : "Collapse sidebar";
                 size: 30px;
                 icon-size: 16px;
                 clicked => {
@@ -1518,6 +1573,33 @@ component CollectionRow inherits Rectangle {
         background: Theme.amber;
     }
 
+    accessible-role: list-item;
+    accessible-label: root.track.title + ", " + root.track.artist + (root.track.duration != "" ? ", " + root.track.duration : "");
+    accessible-item-selected: root.track.current;
+    accessible-action-default => {
+        root.activated();
+    }
+    row-focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(e) => {
+            if (e.text == Key.Return) {
+                root.activated();
+                return accept;
+            }
+            if (e.text == Key.Menu || (e.modifiers.shift && e.text == Key.F10)) {
+                Ui.context("track", root.index, "", { x: self.absolute-position.x + 40px, y: self.absolute-position.y + root.height });
+                return accept;
+            }
+            reject
+        }
+    }
+
+    if row-focus.has-focus: Rectangle {
+        border-radius: 8px;
+        border-width: 2px;
+        border-color: Theme.amber;
+    }
+
     ta := TouchArea {
         double-clicked => {
             root.activated();
@@ -1693,6 +1775,32 @@ component CardView inherits Rectangle {
         Ui.card-shown(root.line, root.index);
     }
 
+    accessible-role: list-item;
+    accessible-label: root.card.title + (root.card.subtitle != "" ? ", " + root.card.subtitle : "");
+    accessible-action-default => {
+        Ui.card-clicked(root.line, root.index);
+    }
+    card-focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(e) => {
+            if (e.text == Key.Return) {
+                Ui.card-clicked(root.line, root.index);
+                return accept;
+            }
+            if (e.text == Key.Menu || (e.modifiers.shift && e.text == Key.F10)) {
+                Ui.context("card", root.line, root.index, { x: self.absolute-position.x + 20px, y: self.absolute-position.y + 20px });
+                return accept;
+            }
+            reject
+        }
+    }
+
+    if card-focus.has-focus: Rectangle {
+        border-radius: 8px;
+        border-width: 2px;
+        border-color: Theme.amber;
+    }
+
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => {
@@ -1848,6 +1956,7 @@ component ShelfRow inherits Rectangle {
             width: 32px;
             IconButton {
                 icon: "back";
+                tooltip: "Scroll left";
                 enabled: flick.content-x < -1px;
                 clicked => {
                     flick.content-x = min(0px, flick.content-x + flick.width * 0.8);
@@ -1859,6 +1968,7 @@ component ShelfRow inherits Rectangle {
             width: 32px;
             IconButton {
                 icon: "forward";
+                tooltip: "Scroll right";
                 enabled: flick.content-x > flick.width - flick.content-width + 1px;
                 clicked => {
                     flick.content-x = max(flick.width - flick.content-width, flick.content-x - flick.width * 0.8);
@@ -2436,6 +2546,7 @@ component SettingsPage inherits Rectangle {
                 }
                 if Ui.hidden-count > 0: IconButton {
                     icon: root.hidden-open ? "chevron-down" : "chevron-right";
+                    tooltip: root.hidden-open ? "Hide the list" : "Show hidden playlists";
                     clicked => {
                         root.hidden-open = !root.hidden-open;
                     }
@@ -2560,6 +2671,8 @@ component TopBar inherits Rectangle {
             width: 32px;
             IconButton {
                 icon: "back";
+                tooltip: "Back";
+                tooltip-below: true;
                 enabled: Ui.can-back;
                 clicked => {
                     Ui.back();
@@ -2571,6 +2684,8 @@ component TopBar inherits Rectangle {
             width: 32px;
             IconButton {
                 icon: "forward";
+                tooltip: "Forward";
+                tooltip-below: true;
                 enabled: Ui.can-forward;
                 clicked => {
                     Ui.forward();
@@ -2616,6 +2731,33 @@ component QueueRow inherits Rectangle {
         height: 2px;
         background: Theme.amber;
     }
+    accessible-role: list-item;
+    accessible-label: root.track.title + ", " + root.track.artist;
+    accessible-item-selected: root.track.current;
+    accessible-action-default => {
+        Ui.queue-jump(root.index);
+    }
+    queue-focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(e) => {
+            if (e.text == Key.Return) {
+                Ui.queue-jump(root.index);
+                return accept;
+            }
+            if (e.text == Key.Menu || (e.modifiers.shift && e.text == Key.F10)) {
+                Ui.context("queue", root.index, "", { x: self.absolute-position.x + 20px, y: self.absolute-position.y + root.height });
+                return accept;
+            }
+            reject
+        }
+    }
+
+    if queue-focus.has-focus: Rectangle {
+        border-radius: 8px;
+        border-width: 2px;
+        border-color: Theme.amber;
+    }
+
     ta := TouchArea {
         mouse-cursor: pointer;
         double-clicked => {
@@ -2688,6 +2830,7 @@ component QueueRow inherits Rectangle {
                 x: parent.width - 26px;
                 visible: root.hovered && !root.track.current;
                 icon: "close";
+                tooltip: "Remove from queue";
                 size: 26px;
                 icon-size: 14px;
                 clicked => {
@@ -3595,6 +3738,8 @@ component NowPlayingBar inherits Rectangle {
                 width: 32px;
                 IconButton {
                     icon: "shuffle";
+                    tooltip: Ui.shuffle ? "Shuffle on" : "Shuffle";
+                    toggle: true;
                     active: Ui.shuffle;
                     icon-size: 16px;
                     clicked => {
@@ -3607,6 +3752,7 @@ component NowPlayingBar inherits Rectangle {
                 width: 32px;
                 IconButton {
                     icon: "previous";
+                    tooltip: "Previous";
                     icon-size: 18px;
                     enabled: Ui.np.active;
                     clicked => {
@@ -3623,11 +3769,48 @@ component NowPlayingBar inherits Rectangle {
                 background: pp.pressed ? Theme.amber.darker(0.15) : pp.has-hover ? Theme.amber.brighter(0.08) : Theme.amber;
                 drop-shadow-blur: 12px;
                 drop-shadow-color: #E9A15F44;
+                accessible-role: button;
+                accessible-label: Ui.np.playing ? "Pause" : "Play";
+                accessible-action-default => {
+                    Ui.play-pause();
+                }
                 pp := TouchArea {
                     mouse-cursor: pointer;
                     clicked => {
                         Ui.play-pause();
                     }
+                }
+
+                pp-focus := FocusScope {
+                    focus-on-click: false;
+                    key-pressed(e) => {
+                        if (e.text == " " || e.text == Key.Return) {
+                            Ui.play-pause();
+                            return accept;
+                        }
+                        reject
+                    }
+                }
+
+                if pp-focus.has-focus: Rectangle {
+                    border-radius: 18px;
+                    border-width: 2px;
+                    border-color: Theme.ivory;
+                }
+
+                // Loading: a ring turning round the button.
+                if Ui.np.loading: Path {
+                    width: 44px;
+                    height: 44px;
+                    x: -4px;
+                    y: -4px;
+                    viewbox-width: 44;
+                    viewbox-height: 44;
+                    stroke: Theme.amber;
+                    stroke-width: 2px;
+                    commands: "M 22 2 A 20 20 0 0 1 42 22";
+                    transform-rotation: 360deg * mod(animation-tick(), 900ms) / 900ms;
+                    transform-origin: { x: 22px, y: 22px };
                 }
 
                 Icon {
@@ -3643,6 +3826,7 @@ component NowPlayingBar inherits Rectangle {
                 width: 32px;
                 IconButton {
                     icon: "next";
+                    tooltip: "Next";
                     icon-size: 18px;
                     enabled: Ui.np.active;
                     clicked => {
@@ -3655,6 +3839,8 @@ component NowPlayingBar inherits Rectangle {
                 width: 32px;
                 IconButton {
                     icon: Ui.repeat == 2 ? "repeat-one" : "repeat";
+                    tooltip: Ui.repeat == 2 ? "Repeat one" : Ui.repeat == 1 ? "Repeat all" : "Repeat";
+                    toggle: true;
                     active: Ui.repeat != 0;
                     icon-size: 16px;
                     clicked => {
@@ -3681,6 +3867,9 @@ component NowPlayingBar inherits Rectangle {
                 x: 50px;
                 width: parent.width - 100px;
                 thickness: 3px;
+                label: "Position";
+                value-text: Fmt.time(Ui.np.position-ms) + " of " + Fmt.time(Ui.np.duration-ms);
+                step: Ui.np.duration-ms > 0 ? min(1, 5000 / Ui.np.duration-ms) : 0.05;
                 knob: Ui.np.active && !Ui.np-live;
                 value: Ui.np-live ? 1 : root.progress;
                 released(v) => {
@@ -3711,6 +3900,8 @@ component NowPlayingBar inherits Rectangle {
             width: 32px;
             IconButton {
                 icon: Ui.np.liked ? "heart-filled" : "heart";
+                tooltip: Ui.np.liked ? "Remove from liked" : "Like";
+                toggle: true;
                 active: Ui.np.liked;
                 enabled: Ui.np.active && Ui.signed-in;
                 icon-size: 17px;
@@ -3744,6 +3935,8 @@ component NowPlayingBar inherits Rectangle {
             width: 32px;
             IconButton {
                 icon: "queue";
+                tooltip: "Queue";
+                toggle: true;
                 active: Ui.panel-open && Ui.panel-tab == 1;
                 icon-size: 17px;
                 clicked => {
@@ -3762,6 +3955,8 @@ component NowPlayingBar inherits Rectangle {
             width: 32px;
             IconButton {
                 icon: "eq";
+                tooltip: "Equalizer";
+                toggle: true;
                 active: Ui.eq-open || Ui.eq-enabled;
                 icon-size: 17px;
                 clicked => {
@@ -3778,6 +3973,8 @@ component NowPlayingBar inherits Rectangle {
             width: 32px;
             IconButton {
                 icon: "together";
+                tooltip: "Listen Along";
+                toggle: true;
                 active: Ui.together-open || Ui.together-state != 0;
                 icon-size: 17px;
                 clicked => {
@@ -3814,11 +4011,15 @@ component NowPlayingBar inherits Rectangle {
 
         Rectangle {
             width: 20px;
-            Icon {
-                name: Ui.volume <= 0.001 ? "mute" : "volume";
-                width: 17px;
-                height: 17px;
-                color: Theme.beige;
+            IconButton {
+                icon: Ui.volume <= 0.001 ? "mute" : "volume";
+                tooltip: Ui.volume <= 0.001 ? "Unmute (Ctrl+M)" : "Mute (Ctrl+M)";
+                x: (parent.width - self.width) / 2;
+                size: 28px;
+                icon-size: 17px;
+                clicked => {
+                    Ui.toggle-mute();
+                }
             }
         }
 
@@ -3828,6 +4029,7 @@ component NowPlayingBar inherits Rectangle {
                 x: 8px;
                 width: 96px;
                 thickness: 3px;
+                label: "Volume";
                 value: Ui.volume;
                 fill: Theme.ivory;
                 changed(v) => {
@@ -3938,7 +4140,34 @@ export component AppWindow inherits Window {
     keys := FocusScope {
         key-pressed(e) => {
             if (e.modifiers.control && (e.text == "f" || e.text == "F")) {
+                if (Ui.sidebar-collapsed) {
+                    Ui.sidebar-collapsed = false;
+                    Ui.sidebar-changed();
+                }
                 sidebar.focus-search();
+                return accept;
+            }
+            // Ctrl+↑/↓ volume by 5 %, Ctrl+M mutes or brings the sound back.
+            if (e.modifiers.control && (e.text == Key.UpArrow || e.text == Key.DownArrow)) {
+                Ui.volume = clamp(Ui.volume + (e.text == Key.UpArrow ? 0.05 : -0.05), 0, 1);
+                Ui.set-volume(Ui.volume);
+                return accept;
+            }
+            if (e.modifiers.control && (e.text == "m" || e.text == "M")) {
+                Ui.toggle-mute();
+                return accept;
+            }
+            // Alt+←/→ back and forward, Ctrl+, Settings.
+            if (e.modifiers.alt && e.text == Key.LeftArrow) {
+                Ui.back();
+                return accept;
+            }
+            if (e.modifiers.alt && e.text == Key.RightArrow) {
+                Ui.forward();
+                return accept;
+            }
+            if (e.modifiers.control && e.text == ",") {
+                Ui.navigate(PageKind.settings, "", "Settings");
                 return accept;
             }
             if (e.text == Key.Escape) {

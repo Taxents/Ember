@@ -71,6 +71,8 @@ export component Icon inherits Path {
 }
 
 // A round, borderless icon button. `active` lights it in amber.
+// Tab reaches it (a click doesn't take the keyboard), Enter or Space presses it, and its name is
+// what a screen reader says and what shows on hover.
 export component IconButton inherits Rectangle {
     in property <string> icon;
     in property <bool> active;
@@ -78,6 +80,10 @@ export component IconButton inherits Rectangle {
     in property <length> size: 32px;
     in property <length> icon-size: 18px;
     in property <string> tooltip;
+    // A toggle (shuffle, repeat, like): `active` is read out as on or off.
+    in property <bool> toggle;
+    // The hover label shows below rather than above (buttons at the top of the window).
+    in property <bool> tooltip-below;
     out property <bool> hovered: ta.has-hover;
     callback clicked();
     width: size;
@@ -85,6 +91,16 @@ export component IconButton inherits Rectangle {
     border-radius: size / 2;
     background: ta.pressed ? Theme.smoke : ta.has-hover && enabled ? Theme.hover : transparent;
     opacity: enabled ? 1 : 0.4;
+    accessible-role: button;
+    accessible-label: root.tooltip != "" ? root.tooltip : root.icon;
+    accessible-enabled: root.enabled;
+    accessible-checkable: root.toggle;
+    accessible-checked: root.active;
+    accessible-action-default => {
+        if (root.enabled) {
+            root.clicked();
+        }
+    }
     ta := TouchArea {
         mouse-cursor: enabled ? pointer : default;
         clicked => {
@@ -94,17 +110,84 @@ export component IconButton inherits Rectangle {
         }
     }
 
+    fs := FocusScope {
+        focus-on-click: false;
+        enabled: root.enabled;
+        key-pressed(e) => {
+            if (e.text == " " || e.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    if fs.has-focus: Rectangle {
+        border-radius: root.border-radius;
+        border-width: 2px;
+        border-color: Theme.amber;
+    }
+
     Icon {
         name: root.icon;
         width: root.icon-size;
         height: root.icon-size;
         color: root.active ? Theme.amber : ta.has-hover && root.enabled ? Theme.ivory : Theme.beige;
     }
+
+    // The name, after a moment's hover.
+    property <bool> tip;
+    changed hovered => {
+        if (!self.hovered) {
+            self.tip = false;
+        }
+    }
+    Timer {
+        interval: 600ms;
+        running: root.hovered && !root.tip && root.tooltip != "";
+        triggered => {
+            root.tip = true;
+        }
+    }
+    if root.tip: Rectangle {
+        y: root.tooltip-below ? root.height + 6px : -self.height - 6px;
+        x: (root.width - self.width) / 2;
+        height: 24px;
+        width: tip-text.preferred-width + 16px;
+        border-radius: 6px;
+        background: #2A1E1AF2;
+        border-width: 1px;
+        border-color: #F1E5D21A;
+        tip-text := Text {
+            text: root.tooltip;
+            color: Theme.ivory;
+            font-size: 11px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
 }
 
 // A horizontal value bar (progress, volume). Reports drags as 0..1 while dragging and on release.
 export component ValueBar inherits Rectangle {
     in property <float> value; // 0..1
+    // What a screen reader calls it ("Volume", "Position"), and how its value reads.
+    in property <string> label;
+    in property <string> value-text: round(root.value * 100) + "%";
+    // Arrow keys and screen readers move it by this much.
+    in property <float> step: 0.05;
+    accessible-role: slider;
+    accessible-label: root.label;
+    accessible-value: root.value-text;
+    accessible-value-minimum: 0;
+    accessible-value-maximum: 100;
+    accessible-value-step: root.step * 100;
+    accessible-action-increment => {
+        root.released(min(1, root.value + root.step));
+    }
+    accessible-action-decrement => {
+        root.released(max(0, root.value - root.step));
+    }
     in property <length> thickness: 4px;
     in property <color> fill: Theme.amber;
     in property <bool> knob: true;
@@ -143,6 +226,27 @@ export component ValueBar inherits Rectangle {
         drop-shadow-color: #E9A15F80;
     }
 
+    fs := FocusScope {
+        focus-on-click: false;
+        key-pressed(e) => {
+            if (e.text == Key.RightArrow || e.text == Key.UpArrow) {
+                root.released(min(1, root.value + root.step));
+                return accept;
+            }
+            if (e.text == Key.LeftArrow || e.text == Key.DownArrow) {
+                root.released(max(0, root.value - root.step));
+                return accept;
+            }
+            reject
+        }
+    }
+
+    if fs.has-focus: Rectangle {
+        border-radius: 4px;
+        border-width: 2px;
+        border-color: Theme.amber;
+    }
+
     ta := TouchArea {
         mouse-cursor: pointer;
         moved => {
@@ -176,11 +280,33 @@ export component PillButton inherits Rectangle {
     border-color: #F1E5D214;
     drop-shadow-blur: primary ? 18px : 0;
     drop-shadow-color: primary ? #E9A15F55 : transparent;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => {
+        root.clicked();
+    }
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => {
             root.clicked();
         }
+    }
+
+    fs := FocusScope {
+        focus-on-click: false;
+        key-pressed(e) => {
+            if (e.text == " " || e.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    if fs.has-focus: Rectangle {
+        border-radius: root.border-radius;
+        border-width: 2px;
+        border-color: Theme.ivory;
     }
 
     HorizontalLayout {
