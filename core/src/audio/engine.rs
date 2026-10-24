@@ -707,18 +707,23 @@ impl Worker {
     }
 
     fn set_next(&mut self, id: Option<String>) {
-        if self.next.as_ref().map(|t| &t.id) == id.as_ref() && id.is_some() {
+        let Some(id) = id else {
+            // Nothing follows: whatever was opened or being opened ahead goes.
+            self.next = None;
+            self.next_id = None;
+            self.loading_next = false;
+            self.next_when = None;
             return;
-        }
-        if self.next_id == id {
+        };
+        if self.next.as_ref().is_some_and(|t| t.id == id) || self.next_id.as_ref() == Some(&id) {
             return;
         }
         self.next = None;
         self.loading_next = false;
-        if self.next_when.as_ref().map(|(i, _)| i) != id.as_ref() {
+        if self.next_when.as_ref().is_some_and(|(i, _)| *i != id) {
             self.next_when = None;
         }
-        self.next_id = id;
+        self.next_id = Some(id);
     }
 
     fn seek(&mut self, ms: u64) {
@@ -1366,16 +1371,22 @@ mod tests {
         /// The device plays `ms` of audio, 10 ms per callback (silence once the ring is dry).
         fn play_out(&mut self, ms: u64) {
             for _ in 0..ms / 10 {
-                if !self.w.shared.paused.load(Ordering::Relaxed) {
-                    let mut c = self.w.consumer.lock().unwrap();
-                    let n = (c.slots() / CH).min(RATE as usize / 100);
-                    if let Ok(chunk) = c.read_chunk(n * CH) {
-                        chunk.commit_all();
-                    }
-                    self.w.shared.played.fetch_add(n as u64, Ordering::Relaxed);
-                }
+                self.consume(10);
                 self.settle();
             }
+        }
+
+        /// The device takes `ms` from the ring, with the worker not running meanwhile.
+        fn consume(&mut self, ms: u64) {
+            if self.w.shared.paused.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut c = self.w.consumer.lock().unwrap();
+            let n = (c.slots() / CH).min((RATE * ms / 1000) as usize);
+            if let Ok(chunk) = c.read_chunk(n * CH) {
+                chunk.commit_all();
+            }
+            self.w.shared.played.fetch_add(n as u64, Ordering::Relaxed);
         }
 
         fn position(&self) -> Option<Position> {
@@ -1568,13 +1579,26 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "M2"]
     fn clearing_the_next_track_drops_a_preloaded_one() {
         let mut r = Rig::new();
         r.cmd(Cmd::Play("a".into()));
         r.cmd(Cmd::SetNext(Some("b".into())));
         r.play_out(100);
         assert!(r.w.next.is_some());
+        r.cmd(Cmd::SetNext(None));
+        r.play_out(2500);
+        assert_eq!(r.events(), ["started a", "finished"]);
+    }
+
+    #[test]
+    fn clearing_the_next_track_while_it_loads_drops_it() {
+        let mut r = Rig::new();
+        r.track("b", |s| s.load_delay = Duration::from_millis(50));
+        r.cmd(Cmd::Play("a".into()));
+        assert!(r.w.handle(Cmd::SetNext(Some("b".into()))));
+        r.consume(200);
+        r.w.pump();
+        assert!(r.w.loading_next);
         r.cmd(Cmd::SetNext(None));
         r.play_out(2500);
         assert_eq!(r.events(), ["started a", "finished"]);
