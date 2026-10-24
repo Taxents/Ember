@@ -226,6 +226,7 @@ where
     dev.build_output_stream(
         config,
         move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+            no_denormals();
             // When this buffer's first frame will be heard, on the device's own clock.
             let ts = info.timestamp();
             let delay = ts.playback.saturating_duration_since(ts.callback);
@@ -235,6 +236,25 @@ where
         None,
     )
     .map_err(|e| Error::Device(e.to_string()))
+}
+
+/// Flushes denormals to zero on this thread (SSE FTZ and DAZ). An EQ filter ringing down into
+/// silence otherwise spends many times the usual cost on every sample.
+#[inline]
+pub(crate) fn no_denormals() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: only this thread's SSE control register changes, and only the FTZ (bit 15) and
+    // DAZ (bit 6) flags, which no Rust code relies on.
+    unsafe {
+        let mut csr = 0u32;
+        std::arch::asm!("stmxcsr [{}]", in(reg) &mut csr, options(nostack, preserves_flags));
+        csr |= 0x8040;
+        std::arch::asm!(
+            "ldmxcsr [{}]",
+            in(reg) &csr,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
 }
 
 /// Whether a stream error means the stream is dead or on the wrong device. Glitches, a refused
@@ -680,6 +700,19 @@ mod tests {
         assert!(after[384 * 2..].iter().all(|&s| s == -0.8));
         let all = [out, after].concat();
         assert!(largest_step(&all) < 0.01, "{}", largest_step(&all));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn denormals_become_zero_on_the_audio_thread() {
+        std::thread::spawn(|| {
+            let tiny = std::hint::black_box(f32::MIN_POSITIVE);
+            assert!(tiny * std::hint::black_box(0.5) > 0.0);
+            no_denormals();
+            assert_eq!(tiny * std::hint::black_box(0.5), 0.0);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
