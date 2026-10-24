@@ -100,7 +100,11 @@ impl Timing {
     /// When `ms` into the track is heard.
     pub fn instant_of(&self, ms: f64) -> Instant {
         let d = Duration::from_secs_f64((ms - self.ms).abs() / 1000.0);
-        if ms >= self.ms { self.at + d } else { self.at - d }
+        if ms >= self.ms {
+            self.at + d
+        } else {
+            self.at - d
+        }
     }
 }
 
@@ -874,7 +878,10 @@ impl Worker {
     fn can_decode(&self) -> bool {
         let room = self.ring_free() > self.dev_rate as usize / 4 * CH;
         let work = !self.carry.is_empty()
-            || self.cur.as_ref().is_some_and(|t| !t.eof && !t.src.stalled())
+            || self
+                .cur
+                .as_ref()
+                .is_some_and(|t| !t.eof && !t.src.stalled())
             || (self.cur.as_ref().is_some_and(|t| t.eof) && self.next.is_some());
         room && work
     }

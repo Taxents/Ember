@@ -92,7 +92,10 @@ pub fn parse_code(text: &str) -> Option<String> {
             && key.chars().all(|c| Z32.contains(c))
             && iroh::PublicKey::from_z32(key).is_ok()
     };
-    let token_end = |s: &str| s.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(s.len());
+    let token_end = |s: &str| {
+        s.find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(s.len())
+    };
     let mut from = 0;
     while let Some(pos) = lower[from..].find(CODE_PREFIX) {
         let start = from + pos + CODE_PREFIX.len();
@@ -122,7 +125,10 @@ mod tests {
     fn code_shape() {
         let c = sample_code();
         assert_eq!(c.len(), 6 + 52);
-        assert!(c.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'));
+        assert!(
+            c.chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        );
         assert!(code_to_id(&c).is_some());
     }
 
@@ -131,12 +137,21 @@ mod tests {
         let c = sample_code();
         assert_eq!(parse_code(&c).as_deref(), Some(c.as_str()));
         assert_eq!(parse_code(&format!("  {c}\n")).as_deref(), Some(c.as_str()));
-        assert_eq!(parse_code(&format!("join me: `{c}` thx!")).as_deref(), Some(c.as_str()));
+        assert_eq!(
+            parse_code(&format!("join me: `{c}` thx!")).as_deref(),
+            Some(c.as_str())
+        );
         assert_eq!(parse_code(&c.to_uppercase()).as_deref(), Some(c.as_str()));
-        assert_eq!(parse_code(&format!("ember-nope then {c}")).as_deref(), Some(c.as_str()));
+        assert_eq!(
+            parse_code(&format!("ember-nope then {c}")).as_deref(),
+            Some(c.as_str())
+        );
         assert_eq!(parse_code(&format!("**{c}**")).as_deref(), Some(c.as_str()));
         let bare = &c[6..];
-        assert_eq!(parse_code(&format!("code {bare}")).as_deref(), Some(c.as_str()));
+        assert_eq!(
+            parse_code(&format!("code {bare}")).as_deref(),
+            Some(c.as_str())
+        );
     }
 
     #[test]
@@ -149,7 +164,10 @@ mod tests {
         // 'l' and 'v' aren't in the z-base-32 alphabet.
         let bad = format!("ember-{}", "l".repeat(52));
         assert_eq!(parse_code(&bad), None);
-        assert!(matches!(Guest::<(), ()>::join("hello", "me"), Err(Error::InvalidCode)));
+        assert!(matches!(
+            Guest::<(), ()>::join("hello", "me"),
+            Err(Error::InvalidCode)
+        ));
     }
 
     #[test]

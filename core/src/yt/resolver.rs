@@ -133,7 +133,10 @@ impl Resolver {
             let st = self.state.lock().unwrap();
             st.video_formats
                 .get(video_id)
-                .filter(|v| v.first().is_none_or(|v| v.expires_at > unix_now() + URL_MARGIN_S))
+                .filter(|v| {
+                    v.first()
+                        .is_none_or(|v| v.expires_at > unix_now() + URL_MARGIN_S)
+                })
                 .cloned()
         };
         let formats = match cached {
@@ -333,7 +336,9 @@ fn parse_video(video_id: &str, v: &Value) -> Vec<VideoInfo> {
             mime.starts_with("video/mp4") && mime.contains("avc1") && f["url"].is_string()
         })
         .filter_map(|f| {
-            let height = f["height"].as_u64().filter(|&h| h > 0 && h <= VIDEO_MAX_H)? as u32;
+            let height = f["height"]
+                .as_u64()
+                .filter(|&h| h > 0 && h <= VIDEO_MAX_H)? as u32;
             Some(VideoInfo {
                 video_id: video_id.to_string(),
                 url: f["url"].as_str()?.to_string(),
@@ -352,10 +357,7 @@ fn parse_video(video_id: &str, v: &Value) -> Vec<VideoInfo> {
 /// plenty for a panel), the smallest at least `height` tall, else the tallest.
 fn pick_video(formats: &[VideoInfo], height: u32) -> Option<VideoInfo> {
     let calm = formats.iter().any(|f| f.fps <= 30);
-    let ok: Vec<&VideoInfo> = formats
-        .iter()
-        .filter(|f| !calm || f.fps <= 30)
-        .collect();
+    let ok: Vec<&VideoInfo> = formats.iter().filter(|f| !calm || f.fps <= 30).collect();
     ok.iter()
         .filter(|f| f.height >= height)
         .min_by_key(|f| f.height)
@@ -379,7 +381,10 @@ mod tests {
             {"itag": 251, "url": "u251", "mimeType": "audio/webm; codecs=\"opus\""}
         ]}});
         let f = parse_video("x", &v);
-        assert_eq!(f.iter().map(|f| f.itag).collect::<Vec<_>>(), [298, 136, 135, 134]);
+        assert_eq!(
+            f.iter().map(|f| f.itag).collect::<Vec<_>>(),
+            [298, 136, 135, 134]
+        );
         assert_eq!(pick_video(&f, 300).unwrap().itag, 134);
         assert_eq!(pick_video(&f, 450).unwrap().itag, 135);
         assert_eq!(pick_video(&f, 600).unwrap().itag, 136);

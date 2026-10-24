@@ -414,9 +414,12 @@ pub fn art(id: &str, title: &str) -> Image {
 
 /// Looks for the station's logo on a worker and swaps it in where the station shows.
 fn ask_logo(id: &str) {
-    let Some(st) = radio::channel_of(id)
-        .and_then(|c| seen().get(c).cloned().or_else(|| store().station(c).cloned()))
-    else {
+    let Some(st) = radio::channel_of(id).and_then(|c| {
+        seen()
+            .get(c)
+            .cloned()
+            .or_else(|| store().station(c).cloned())
+    }) else {
         return;
     };
     let id = id.to_string();
@@ -899,7 +902,10 @@ impl App {
         for ri in 0..self.rows.len() {
             let n = match &self.rows[ri] {
                 RowRef::Shelf(items, _) => items.len(),
-                RowRef::Grid(_) => self.page_rows.row_data(ri).map_or(0, |r| r.cards.row_count()),
+                RowRef::Grid(_) => self
+                    .page_rows
+                    .row_data(ri)
+                    .map_or(0, |r| r.cards.row_count()),
                 _ => continue,
             };
             for j in 0..n {

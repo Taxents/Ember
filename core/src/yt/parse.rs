@@ -1115,8 +1115,8 @@ pub type TimedLine = (u64, u64, String);
 
 /// The Android app's timed lyrics, in order, and their source ("Musixmatch").
 pub fn timed_lyrics(v: &Value) -> Option<(Vec<TimedLine>, String)> {
-    let d = &v["contents"]["elementRenderer"]["newElement"]["type"]["componentType"]["model"]
-        ["timedLyricsModel"]["lyricsData"];
+    let d = &v["contents"]["elementRenderer"]["newElement"]["type"]["componentType"]["model"]["timedLyricsModel"]
+        ["lyricsData"];
     let ms = |x: &Value| {
         x.as_str()
             .and_then(|s| s.parse().ok())
@@ -1145,7 +1145,8 @@ pub fn timed_lyrics(v: &Value) -> Option<(Vec<TimedLine>, String)> {
 
 /// "View song credits": a dialog of roles and names.
 pub fn credits(v: &Value) -> Credits {
-    let d = &v["onResponseReceivedActions"][0]["openPopupAction"]["popup"]["dismissableDialogRenderer"];
+    let d =
+        &v["onResponseReceivedActions"][0]["openPopupAction"]["popup"]["dismissableDialogRenderer"];
     Credits {
         sections: arr(&d["sections"])
             .iter()

@@ -503,13 +503,17 @@ impl Client {
             ],
             &body,
         )?;
-        Ok(parse::timed_lyrics(&v)
-            .map(|(lines, source)| crate::lyrics::from_lines(lines, &source)))
+        Ok(
+            parse::timed_lyrics(&v)
+                .map(|(lines, source)| crate::lyrics::from_lines(lines, &source)),
+        )
     }
 
     /// "View song credits".
     pub fn credits(&self, video_id: &str) -> Result<Credits> {
-        Ok(parse::credits(&self.browse(&format!("MPTC{video_id}"), None)?))
+        Ok(parse::credits(
+            &self.browse(&format!("MPTC{video_id}"), None)?,
+        ))
     }
 
     /// The Related tab: its shelves, and the "About the artist" text.

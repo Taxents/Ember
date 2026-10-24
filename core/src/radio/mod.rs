@@ -12,8 +12,8 @@
 //!   through a [`relay`].
 
 pub mod icy;
-pub mod logo;
 pub mod live;
+pub mod logo;
 pub mod relay;
 pub mod store;
 

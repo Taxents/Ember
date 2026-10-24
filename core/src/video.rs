@@ -19,8 +19,8 @@ use crate::audio::stream::HttpStream;
 use crate::yt::{Resolver, VideoInfo};
 use crate::{Error, Result};
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use windows::Win32::Foundation::{E_NOTIMPL, HMODULE, S_FALSE, S_OK, STG_E_INVALIDFUNCTION};
 use windows::Win32::Graphics::Direct3D::*;
@@ -373,10 +373,7 @@ impl Decoder {
     /// The output size, after opening or a format change.
     fn read_size(&mut self) -> Result<()> {
         unsafe {
-            let cur = self
-                .reader
-                .GetCurrentMediaType(STREAM)
-                .map_err(media)?;
+            let cur = self.reader.GetCurrentMediaType(STREAM).map_err(media)?;
             let fs = cur.GetUINT64(&MF_MT_FRAME_SIZE).map_err(media)?;
             let (w, h) = ((fs >> 32) as u32, fs as u32);
             self.full = (w, h);
@@ -391,7 +388,10 @@ impl Decoder {
                 .GetBlob(&MF_MT_MINIMUM_DISPLAY_APERTURE, p, None)
                 .is_ok()
             {
-                let (x, y) = (area.OffsetX.value.max(0) as u32, area.OffsetY.value.max(0) as u32);
+                let (x, y) = (
+                    area.OffsetX.value.max(0) as u32,
+                    area.OffsetY.value.max(0) as u32,
+                );
                 let (cw, ch) = (area.Area.cx.max(0) as u32, area.Area.cy.max(0) as u32);
                 if cw > 0 && ch > 0 && x + cw <= w && y + ch <= h {
                     self.crop = (x, y);
@@ -534,7 +534,12 @@ impl Decoder {
                     }
                 }
             } else {
-                for (o, i) in out.as_chunks_mut::<4>().0.iter_mut().zip(row.as_chunks::<4>().0) {
+                for (o, i) in out
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(row.as_chunks::<4>().0)
+                {
                     o[0] = i[2];
                     o[1] = i[1];
                     o[2] = i[0];
@@ -697,7 +702,13 @@ fn mp4_head(r: &mut (impl Read + Seek)) -> Result<Head> {
 
 /// Boxes in `start..end` at `depth` (0 = file), following moov > trak > edts > elst and
 /// moov > trak > mdia > mdhd. Stops after `moov`.
-fn walk(r: &mut (impl Read + Seek), start: u64, end: u64, depth: u32, h: &mut Head) -> std::io::Result<()> {
+fn walk(
+    r: &mut (impl Read + Seek),
+    start: u64,
+    end: u64,
+    depth: u32,
+    h: &mut Head,
+) -> std::io::Result<()> {
     let mut at = start;
     while at + 8 <= end {
         r.seek(SeekFrom::Start(at))?;

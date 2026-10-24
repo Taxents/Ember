@@ -60,7 +60,10 @@ pub fn check(report: &dyn Fn(Status)) -> Status {
     let none = serde_json::Value::Null;
     let release = releases
         .as_array()
-        .and_then(|l| l.iter().find(|r| r["prerelease"] == false && r["draft"] == false))
+        .and_then(|l| {
+            l.iter()
+                .find(|r| r["prerelease"] == false && r["draft"] == false)
+        })
         .unwrap_or(&none);
     let Some(version) = release["tag_name"]
         .as_str()

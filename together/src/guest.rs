@@ -84,7 +84,14 @@ where
     pub fn join(code: &str, name: &str) -> Result<Self, Error> {
         let code = crate::parse_code(code).ok_or(Error::InvalidCode)?;
         let id = crate::code_to_id(&code).ok_or(Error::InvalidCode)?;
-        Self::join_on(Net::Public, Target { id, direct: Vec::new() }, name)
+        Self::join_on(
+            Net::Public,
+            Target {
+                id,
+                direct: Vec::new(),
+            },
+            name,
+        )
     }
 
     /// Joins a [`Host::start_local`](crate::Host::start_local) host by its
@@ -94,7 +101,14 @@ where
         let (code, addr) = local_code.split_once('@').ok_or(Error::InvalidCode)?;
         let id = crate::code_to_id(code).ok_or(Error::InvalidCode)?;
         let addr = addr.parse().map_err(|_| Error::InvalidCode)?;
-        Self::join_on(Net::Local, Target { id, direct: vec![addr] }, name)
+        Self::join_on(
+            Net::Local,
+            Target {
+                id,
+                direct: vec![addr],
+            },
+            name,
+        )
     }
 
     fn join_on(net: Net, target: Target, name: &str) -> Result<Self, Error> {
@@ -197,7 +211,9 @@ async fn guest_main<Down: DeserializeOwned + Send + 'static>(
         Ok(ep) => ep,
         Err(e) => {
             log::error!("together: couldn't bind endpoint: {e}");
-            let _ = events.send(GuestEvent::Closed(format!("Couldn't start networking ({e})")));
+            let _ = events.send(GuestEvent::Closed(format!(
+                "Couldn't start networking ({e})"
+            )));
             return;
         }
     };
@@ -229,7 +245,9 @@ impl<Down> Copy for Ctx<'_, Down> {}
 
 impl<Down> Ctx<'_, Down> {
     fn on_pong(&self, payload: &[u8], t4: u64) {
-        let Some((t1, t2, t3)) = wire::parse_pong(payload) else { return };
+        let Some((t1, t2, t3)) = wire::parse_pong(payload) else {
+            return;
+        };
         let Ok(mut c) = self.clock.lock() else { return };
         if !c.est.add(t1, t2, t3, t4) {
             return;
@@ -264,7 +282,10 @@ async fn run<Down: DeserializeOwned>(
         log::warn!("together: dial timed out");
         return Some(UNREACHABLE.into());
     };
-    log::info!("together: connected in {} ms", started.elapsed().as_millis());
+    log::info!(
+        "together: connected in {} ms",
+        started.elapsed().as_millis()
+    );
 
     let hs = tokio::select! {
         r = timeout(HANDSHAKE_TIMEOUT, handshake(&conn, name)) => r,
@@ -334,7 +355,10 @@ async fn dial(ep: &Endpoint, target: &Target) -> Connection {
 const UNREACHABLE: &str =
     "Couldn't reach the host. Check the invite code and that the host is still sharing.";
 
-async fn handshake(conn: &Connection, name: String) -> Result<(SendStream, RecvStream, String), ()> {
+async fn handshake(
+    conn: &Connection,
+    name: String,
+) -> Result<(SendStream, RecvStream, String), ()> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|_| ())?;
     let hello = wire::control_frame(&Control::Hello {
         proto: wire::PROTO,
@@ -359,7 +383,10 @@ async fn write_frames(mut send: SendStream, mut rx: mpsc::UnboundedReceiver<Byte
 }
 
 /// Reads host frames until the stream ends; `Err` on undecodable data.
-async fn read_host<Down: DeserializeOwned>(recv: &mut RecvStream, ctx: Ctx<'_, Down>) -> Result<(), ()> {
+async fn read_host<Down: DeserializeOwned>(
+    recv: &mut RecvStream,
+    ctx: Ctx<'_, Down>,
+) -> Result<(), ()> {
     loop {
         match wire::read_frame(recv).await {
             Ok(None) => return Ok(()),
@@ -418,7 +445,11 @@ async fn ping_loop<Down>(conn: &Connection, ctx: Ctx<'_, Down>) {
             }
             let _ = ctx.out_tx.send(wire::frame(F_CLOCK, &p));
         }
-        let wait = if start.elapsed() < FAST_PING_FOR { FAST_PING } else { SLOW_PING };
+        let wait = if start.elapsed() < FAST_PING_FOR {
+            FAST_PING
+        } else {
+            SLOW_PING
+        };
         tokio::time::sleep(wait).await;
     }
 }

@@ -532,7 +532,11 @@ pub fn parse_ttml(s: &str) -> Lyrics {
 
     for tok in xml_tokens(s) {
         match tok {
-            Tok::Open { name, attrs, closed } => match name {
+            Tok::Open {
+                name,
+                attrs,
+                closed,
+            } => match name {
                 "ttm:agent" if !in_p => {
                     let id = attr(&attrs, "xml:id").unwrap_or_default().to_string();
                     let n = match attr(&attrs, "type") {
@@ -645,7 +649,11 @@ pub fn parse_ttml(s: &str) -> Lyrics {
     }
     Lyrics {
         lines,
-        timing: if word_timed { Timing::Word } else { Timing::Line },
+        timing: if word_timed {
+            Timing::Word
+        } else {
+            Timing::Line
+        },
         source: String::new(),
     }
 }
@@ -823,7 +831,13 @@ pub fn line_at(lines: &[Line], ms: u64) -> Option<usize> {
 /// A video id fit for a file name.
 fn safe_name(id: &str) -> String {
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -875,7 +889,11 @@ mod tests {
             .collect();
         assert_eq!(
             w,
-            [(1000, 1500, "Hello "), (1500, 1800, "wor"), (1800, 2400, "ld")]
+            [
+                (1000, 1500, "Hello "),
+                (1500, 1800, "wor"),
+                (1800, 2400, "ld")
+            ]
         );
         assert_eq!(l[0].text(), "Hello world");
     }

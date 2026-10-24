@@ -70,7 +70,10 @@ impl<Up> Shared<Up> {
     fn push(&self, peer: PeerId, frame: Bytes) {
         let full = match self.peers.lock() {
             Ok(peers) => match peers.get(&peer) {
-                Some(p) => matches!(p.tx.try_send(frame), Err(mpsc::error::TrySendError::Full(_))),
+                Some(p) => matches!(
+                    p.tx.try_send(frame),
+                    Err(mpsc::error::TrySendError::Full(_))
+                ),
                 None => false,
             },
             Err(_) => false,
@@ -86,7 +89,10 @@ impl<Up> Shared<Up> {
             Ok(peers) => peers
                 .iter()
                 .filter(|(_, p)| {
-                    matches!(p.tx.try_send(frame.clone()), Err(mpsc::error::TrySendError::Full(_)))
+                    matches!(
+                        p.tx.try_send(frame.clone()),
+                        Err(mpsc::error::TrySendError::Full(_))
+                    )
                 })
                 .map(|(id, _)| *id)
                 .collect(),
@@ -156,7 +162,11 @@ where
             .ok_or_else(|| Error::Network("runtime unavailable".into()))?
             .map_err(Error::Network)?;
         let code = format!("{}{}", crate::CODE_PREFIX, ep.id().to_z32());
-        let local_addr = if net == Net::Local { net::local_addr(&ep) } else { None };
+        let local_addr = if net == Net::Local {
+            net::local_addr(&ep)
+        } else {
+            None
+        };
         let (tx, rx) = crossbeam_channel::unbounded();
         let shared = Arc::new(Shared {
             name: wire::clean_name(name),
@@ -191,7 +201,9 @@ where
     /// For [`Host::start_local`] hosts: the code plus `@127.0.0.1:port`.
     #[doc(hidden)]
     pub fn local_code(&self) -> Option<String> {
-        self.inner.local_addr.map(|a| format!("{}@{a}", self.inner.code))
+        self.inner
+            .local_addr
+            .map(|a| format!("{}@{a}", self.inner.code))
     }
 
     /// Session events. Poll with `try_recv` from the UI thread or block on it
@@ -287,7 +299,10 @@ async fn accept_loop<Up: DeserializeOwned + Send + 'static>(
         let (ep2, sh2) = (ep.clone(), shared.clone());
         tokio::spawn(async move {
             let t = now_us();
-            if timeout(Duration::from_secs(20), ep2.online()).await.is_err() {
+            if timeout(Duration::from_secs(20), ep2.online())
+                .await
+                .is_err()
+            {
                 log::warn!("together: endpoint not online after 20 s");
                 sh2.emit(HostEvent::Failed(
                     "Couldn't reach the Listen Along servers. Friends may not be able to join; check your internet connection.".into(),
@@ -358,7 +373,9 @@ async fn serve_guest<Up: DeserializeOwned + Send + 'static>(
     }));
     let rtt = Arc::new(AtomicU64::new(0));
     let peer = {
-        let Ok(mut peers) = shared.peers.lock() else { return };
+        let Ok(mut peers) = shared.peers.lock() else {
+            return;
+        };
         if peers.len() >= MAX_GUESTS {
             drop(peers);
             log::info!("together: refusing a guest, session full");
@@ -388,7 +405,11 @@ async fn serve_guest<Up: DeserializeOwned + Send + 'static>(
     if let Err(code) = ended {
         conn.close(code.into(), b"protocol error");
     }
-    let still_listed = shared.peers.lock().map(|mut p| p.remove(&peer).is_some()).unwrap_or(false);
+    let still_listed = shared
+        .peers
+        .lock()
+        .map(|mut p| p.remove(&peer).is_some())
+        .unwrap_or(false);
     if still_listed {
         conn.close(close::NORMAL.into(), b"");
     }
@@ -396,7 +417,9 @@ async fn serve_guest<Up: DeserializeOwned + Send + 'static>(
     writer.abort();
     log::info!(
         "together: guest {peer} left ({})",
-        conn.close_reason().map(|r| r.to_string()).unwrap_or_default()
+        conn.close_reason()
+            .map(|r| r.to_string())
+            .unwrap_or_default()
     );
     shared.emit(HostEvent::Left { peer });
 }
@@ -465,7 +488,9 @@ async fn answer_datagrams(conn: &Connection, tx: &mpsc::Sender<Bytes>, rtt: &Ato
             }
         };
         let t2 = now_us();
-        let Some((t1, guest_rtt)) = wire::parse_ping(&d) else { continue };
+        let Some((t1, guest_rtt)) = wire::parse_ping(&d) else {
+            continue;
+        };
         if guest_rtt > 0 {
             rtt.store(guest_rtt, Ordering::Relaxed);
         }

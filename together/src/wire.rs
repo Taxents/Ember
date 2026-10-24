@@ -64,7 +64,9 @@ pub(crate) async fn read_frame(recv: &mut RecvStream) -> Result<Option<(u8, Vec<
         return Err(format!("frame too large ({len} bytes)"));
     }
     let mut payload = vec![0u8; len];
-    recv.read_exact(&mut payload).await.map_err(|e| e.to_string())?;
+    recv.read_exact(&mut payload)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(Some((header[0], payload)))
 }
 
@@ -109,13 +111,13 @@ fn le(b: &[u8]) -> u64 {
 
 /// Keeps display names printable and short.
 pub(crate) fn clean_name(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(48)
-        .collect();
+    let s: String = name.chars().filter(|c| !c.is_control()).take(48).collect();
     let s = s.trim();
-    if s.is_empty() { "Someone".to_string() } else { s.to_string() }
+    if s.is_empty() {
+        "Someone".to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 #[cfg(test)]

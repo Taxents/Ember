@@ -28,7 +28,12 @@ fn next<T: std::fmt::Debug>(rx: &Receiver<T>, secs: u64, what: &str) -> T {
 }
 
 /// Waits for an event matching `f`, skipping others.
-fn wait_for<T: std::fmt::Debug, R>(rx: &Receiver<T>, secs: u64, what: &str, mut f: impl FnMut(T) -> Option<R>) -> R {
+fn wait_for<T: std::fmt::Debug, R>(
+    rx: &Receiver<T>,
+    secs: u64,
+    what: &str,
+    mut f: impl FnMut(T) -> Option<R>,
+) -> R {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -73,7 +78,9 @@ fn exercise(host: Host<Up, Down>, guest: Guest<Up, Down>) {
     assert_eq!(m, (peer, Up::Hi("hello".into())));
     for i in 0..50 {
         match next(host.events(), 10, "Count") {
-            HostEvent::Msg { msg: Up::Count(n), .. } => assert_eq!(n, i),
+            HostEvent::Msg {
+                msg: Up::Count(n), ..
+            } => assert_eq!(n, i),
             e => panic!("unexpected {e:?}"),
         }
     }
@@ -152,7 +159,10 @@ fn exercise(host: Host<Up, Down>, guest: Guest<Up, Down>) {
 fn local_session() {
     let host = Host::<Up, Down>::start_local("Hostess").unwrap();
     assert!(host.code().starts_with("ember-"));
-    assert_eq!(together::parse_code(&format!("join: {} !", host.code())), Some(host.code()));
+    assert_eq!(
+        together::parse_code(&format!("join: {} !", host.code())),
+        Some(host.code())
+    );
     let guest = Guest::<Up, Down>::join_local(&host.local_code().unwrap(), "Guesty").unwrap();
     exercise(host, guest);
 }
@@ -165,28 +175,38 @@ fn local_kick_leave_and_bad_data() {
     // Kick.
     let g1 = Guest::<Up, Down>::join_local(&code, "one").unwrap();
     let (p1, _) = joined(&host);
-    wait_for(g1.events(), 10, "Connected", |e| matches!(e, GuestEvent::Connected { .. }).then_some(()));
+    wait_for(g1.events(), 10, "Connected", |e| {
+        matches!(e, GuestEvent::Connected { .. }).then_some(())
+    });
     host.kick(p1);
     let r = wait_for(g1.events(), 10, "Closed", |e| match e {
         GuestEvent::Closed(r) => Some(r),
         _ => None,
     });
     assert_eq!(r, "The host removed you from the session");
-    wait_for(host.events(), 10, "Left", |e| matches!(e, HostEvent::Left { peer } if peer == p1).then_some(()));
+    wait_for(host.events(), 10, "Left", |e| {
+        matches!(e, HostEvent::Left { peer } if peer == p1).then_some(())
+    });
     host.send(p1, &Down::Seq(1)); // departed peer: ignored
 
     // Guest leaves on drop.
     let g2 = Guest::<Up, Down>::join_local(&code, "two").unwrap();
     let (p2, _) = joined(&host);
     drop(g2);
-    wait_for(host.events(), 10, "Left", |e| matches!(e, HostEvent::Left { peer } if peer == p2).then_some(()));
+    wait_for(host.events(), 10, "Left", |e| {
+        matches!(e, HostEvent::Left { peer } if peer == p2).then_some(())
+    });
 
     // A guest speaking a different message type gets dropped, no panic.
     let g3 = Guest::<String, Down>::join_local(&code, "three").unwrap();
     let (p3, _) = joined(&host);
     g3.send(&"not an Up".to_string());
-    wait_for(host.events(), 10, "Left", |e| matches!(e, HostEvent::Left { peer } if peer == p3).then_some(()));
-    wait_for(g3.events(), 10, "Closed", |e| matches!(e, GuestEvent::Closed(_)).then_some(()));
+    wait_for(host.events(), 10, "Left", |e| {
+        matches!(e, HostEvent::Left { peer } if peer == p3).then_some(())
+    });
+    wait_for(g3.events(), 10, "Closed", |e| {
+        matches!(e, GuestEvent::Closed(_)).then_some(())
+    });
     assert!(host.peers().is_empty());
 }
 
@@ -213,7 +233,10 @@ fn local_session_full() {
 
 #[test]
 fn invalid_code() {
-    assert!(matches!(Guest::<Up, Down>::join("hello there", "x"), Err(together::Error::InvalidCode)));
+    assert!(matches!(
+        Guest::<Up, Down>::join("hello there", "x"),
+        Err(together::Error::InvalidCode)
+    ));
 }
 
 #[test]

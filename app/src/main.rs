@@ -3,8 +3,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod images;
-mod logos;
 mod listen;
+mod logos;
 mod lyric_view;
 mod pages;
 mod radio;
@@ -455,7 +455,9 @@ fn wire(ui: &AppWindow) {
     });
     g.on_unhide_playlist(|id| {
         with(|a| {
-            a.settings.hidden_playlists.retain(|h| h.as_str() != id.as_str());
+            a.settings
+                .hidden_playlists
+                .retain(|h| h.as_str() != id.as_str());
             a.settings.save();
             a.forget_pages(PageKind::AllPlaylists);
             a.load_playlists();
@@ -952,9 +954,15 @@ impl App {
         use PageKind as K;
         let ui = self.ui();
         let g = ui.global::<Ui>();
-        let tracks = matches!(r.kind, K::Album | K::Playlist | K::Liked | K::Songs | K::History);
+        let tracks = matches!(
+            r.kind,
+            K::Album | K::Playlist | K::Liked | K::Songs | K::History
+        );
         let grid = matches!(r.kind, K::Albums | K::Artists | K::AllPlaylists);
-        if matches!(r.kind, K::Album | K::Playlist | K::Liked | K::Artist | K::Song) {
+        if matches!(
+            r.kind,
+            K::Album | K::Playlist | K::Liked | K::Artist | K::Song
+        ) {
             // A playlist opened from the sidebar is one of yours, known already.
             let from = from.or_else(|| {
                 (r.kind == K::Playlist)
@@ -1606,9 +1614,10 @@ impl App {
             };
             // Lists give plays rounded ("1.6B") or not at all, and some leave out lengths: ask
             // the player for the exact count, again once a week.
-            let fresh = self.plays.get(&t.video_id).is_some_and(|p| {
-                music_core::paths::unix_now().saturating_sub(p.1) < 7 * 24 * 3600
-            });
+            let fresh = self
+                .plays
+                .get(&t.video_id)
+                .is_some_and(|p| music_core::paths::unix_now().saturating_sub(p.1) < 7 * 24 * 3600);
             if !fresh || (t.duration_ms.is_none() && !self.lengths.contains_key(&t.video_id)) {
                 self.ask_stats(t.video_id.clone());
             }
@@ -1698,40 +1707,40 @@ impl App {
                         a.plays_asked.remove(&id);
                     }
                     Some(r) => match r {
-                    Ok(VideoStats {
-                        plays,
-                        duration_ms: ms,
-                        ..
-                    }) => {
-                        if let Some(n) = plays {
-                            a.plays
-                                .insert(id.clone(), (n, music_core::paths::unix_now()));
-                            a.save_plays_later();
-                        }
-                        if let Some(ms) = ms {
-                            a.lengths.insert(id.clone(), ms);
-                        }
-                        for (ri, r) in a.rows.iter().enumerate() {
-                            let RowRef::Track(ti) = r else { continue };
-                            let t = &mut a.page_tracks[*ti];
-                            if t.video_id != id {
-                                continue;
-                            }
-                            let Some(mut row) = a.page_rows.row_data(ri) else {
-                                continue;
-                            };
+                        Ok(VideoStats {
+                            plays,
+                            duration_ms: ms,
+                            ..
+                        }) => {
                             if let Some(n) = plays {
-                                t.plays = Some(n);
-                                row.plays = fmt_count(n).into();
+                                a.plays
+                                    .insert(id.clone(), (n, music_core::paths::unix_now()));
+                                a.save_plays_later();
                             }
-                            if let Some(ms) = ms.filter(|_| t.duration_ms.is_none()) {
-                                t.duration_ms = Some(ms);
-                                row.duration = fmt_ms(ms).into();
+                            if let Some(ms) = ms {
+                                a.lengths.insert(id.clone(), ms);
                             }
-                            a.page_rows.set_row_data(ri, row);
+                            for (ri, r) in a.rows.iter().enumerate() {
+                                let RowRef::Track(ti) = r else { continue };
+                                let t = &mut a.page_tracks[*ti];
+                                if t.video_id != id {
+                                    continue;
+                                }
+                                let Some(mut row) = a.page_rows.row_data(ri) else {
+                                    continue;
+                                };
+                                if let Some(n) = plays {
+                                    t.plays = Some(n);
+                                    row.plays = fmt_count(n).into();
+                                }
+                                if let Some(ms) = ms.filter(|_| t.duration_ms.is_none()) {
+                                    t.duration_ms = Some(ms);
+                                    row.duration = fmt_ms(ms).into();
+                                }
+                                a.page_rows.set_row_data(ri, row);
+                            }
                         }
-                    }
-                    Err(e) => log::warn!("stats {id}: {e}"),
+                        Err(e) => log::warn!("stats {id}: {e}"),
                     },
                 });
             },
@@ -1793,7 +1802,10 @@ impl App {
                 }
                 RowRef::Shelf(items, _) => items,
                 RowRef::Grid(start) => {
-                    let n = self.page_rows.row_data(ri).map_or(0, |r| r.cards.row_count());
+                    let n = self
+                        .page_rows
+                        .row_data(ri)
+                        .map_or(0, |r| r.cards.row_count());
                     let end = (start + n).min(self.grid.len());
                     &self.grid[*start..end]
                 }
@@ -1916,7 +1928,8 @@ impl App {
         ) {
             let t = self.page_tracks[ti].clone();
             // A music video found by search opens on its song page, the picture centred.
-            let video = t.kind == TrackKind::Video && self.history[self.at].kind == PageKind::Search;
+            let video =
+                t.kind == TrackKind::Video && self.history[self.at].kind == PageKind::Search;
             if video {
                 self.autoplay_from(t.clone(), None);
                 return self.open_video(&t);
@@ -2504,7 +2517,11 @@ impl App {
     /// screen (the panel's lyrics tab, or this song's page).
     /// Moves the lyrics along; whether any row changed (a frame is drawn anyway).
     fn lyrics_tick(&mut self) -> bool {
-        if self.lyrics.as_ref().is_none_or(|l| l.lyrics.lines.is_empty()) {
+        if self
+            .lyrics
+            .as_ref()
+            .is_none_or(|l| l.lyrics.lines.is_empty())
+        {
             return false;
         }
         let Some(p) = self.player.engine.position() else {
@@ -2565,7 +2582,10 @@ impl App {
         if !waiting {
             self.waiting_since = None;
         }
-        let waited = self.waiting_since.get_or_insert_with(std::time::Instant::now).elapsed();
+        let waited = self
+            .waiting_since
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed();
         if waiting && (3000..3250).contains(&waited.as_millis()) {
             log::warn!(
                 "{}: no audible position after 3 s",
@@ -2923,9 +2943,8 @@ impl App {
                             })
                             .collect();
                         // What YouTube now agrees with needn't be remembered.
-                        a.library_wish.retain(|(id, wish)| {
-                            all.iter().any(|p| p.id == *id) != wish.is_some()
-                        });
+                        a.library_wish
+                            .retain(|(id, wish)| all.iter().any(|p| p.id == *id) != wish.is_some());
                         a.set_playlists(all);
                     }
                     Err(e) => log::warn!("playlists: {e}"),
@@ -2975,7 +2994,8 @@ impl App {
             return;
         }
         let p = self.playlists.remove(from);
-        self.playlists.insert(if to > from { to - 1 } else { to }, p);
+        self.playlists
+            .insert(if to > from { to - 1 } else { to }, p);
         self.settings.playlist_order = self
             .playlists
             .iter()
@@ -2983,7 +3003,12 @@ impl App {
             .map(|p| p.id.clone())
             .collect();
         self.save_later();
-        let all = self.playlists.iter().chain(&self.hidden_lists).cloned().collect();
+        let all = self
+            .playlists
+            .iter()
+            .chain(&self.hidden_lists)
+            .cloned()
+            .collect();
         self.set_playlists(all);
     }
 
@@ -3279,7 +3304,8 @@ impl App {
                 let (client, playlist) = (self.client.clone(), p.id.clone());
                 let generation = self.generation;
                 let showing = self.history[self.at].id == playlist;
-                self.page_cache.remove(&format!("{:?}|{}", PageKind::Playlist, playlist));
+                self.page_cache
+                    .remove(&format!("{:?}|{}", PageKind::Playlist, playlist));
                 workers::run_ordered(
                     move || client.add_to_playlist(&playlist, &ids),
                     move |r| {
@@ -3618,7 +3644,12 @@ impl App {
             let rid = r.id.clone();
             self.library_wish.retain(|(w, _)| *w != rid);
             self.library_wish.push((rid, card));
-            let all = self.playlists.iter().chain(&self.hidden_lists).cloned().collect();
+            let all = self
+                .playlists
+                .iter()
+                .chain(&self.hidden_lists)
+                .cloned()
+                .collect();
             self.set_playlists(all);
         }
         let ui = self.ui();
@@ -3899,7 +3930,11 @@ impl App {
         else {
             return;
         };
-        match t.album.as_ref().and_then(|a| Some((a.id.clone()?, a.name.clone()))) {
+        match t
+            .album
+            .as_ref()
+            .and_then(|a| Some((a.id.clone()?, a.name.clone())))
+        {
             Some((id, title)) if what == "album" => self.navigate(Route {
                 kind: PageKind::Album,
                 id,

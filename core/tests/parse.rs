@@ -364,7 +364,11 @@ fn timed_lyrics() {
     };
     let (lines, source) = parse::timed_lyrics(&v).unwrap();
     assert!(lines.len() > 10);
-    assert!(lines.windows(2).all(|w| w[0].0 <= w[1].0 && w[0].0 <= w[0].1));
+    assert!(
+        lines
+            .windows(2)
+            .all(|w| w[0].0 <= w[1].0 && w[0].0 <= w[0].1)
+    );
     assert_eq!(source, "Musixmatch");
 }
 
@@ -380,7 +384,11 @@ fn unison_ttml() {
     assert!(l.lines.iter().any(|x| x.background));
     for x in &l.lines {
         assert!(!x.text().is_empty() && x.start <= x.end, "{x:?}");
-        assert!(x.words.iter().all(|w| w.start <= w.end && !w.text.contains("  ")));
+        assert!(
+            x.words
+                .iter()
+                .all(|w| w.start <= w.end && !w.text.contains("  "))
+        );
     }
 }
 
@@ -392,5 +400,9 @@ fn credits() {
     let c = parse::credits(&v);
     let roles: Vec<_> = c.sections.iter().map(|s| s.role.as_str()).collect();
     assert!(roles.contains(&"Written by"), "{roles:?}");
-    assert!(c.sections.iter().all(|s| s.names.iter().all(|n| !n.trim().is_empty())));
+    assert!(
+        c.sections
+            .iter()
+            .all(|s| s.names.iter().all(|n| !n.trim().is_empty()))
+    );
 }

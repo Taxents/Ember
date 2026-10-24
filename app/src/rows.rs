@@ -291,9 +291,7 @@ impl PageRows {
 fn height(r: &TrackRow, measured: Option<f32>, m: &Metrics) -> f32 {
     let tiles = r.cards.row_count() > 0 && r.cards.row_data(0).is_some_and(|c| c.tile);
     match r.kind {
-        RowKind::Header => {
-            m.banner_h + 16.0 + if m.video { m.video_h() + 24.0 } else { 0.0 }
-        }
+        RowKind::Header => m.banner_h + 16.0 + if m.video { m.video_h() + 24.0 } else { 0.0 },
         RowKind::Title => {
             if m.playable {
                 176.0

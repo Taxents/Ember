@@ -670,8 +670,18 @@ pub fn lyrics_for(client: &Client, t: &Track, lyrics_id: Option<&str>) -> Option
 /// "2019-11-28" -> "28 November 2019".
 fn long_date(d: &str) -> Option<String> {
     const MONTHS: [&str; 12] = [
-        "January", "February", "March", "April", "May", "June", "July", "August", "September",
-        "October", "November", "December",
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
     ];
     let mut p = d.splitn(3, '-');
     let (y, m, day) = (p.next()?, p.next()?, p.next()?);
@@ -833,11 +843,17 @@ pub fn card_url(item: &Item, px: u32) -> Option<String> {
         let wide: Vec<Thumb> = t
             .thumbs
             .iter()
-            .filter(|th| th.url.contains("ytimg.com") && th.height > 0 && th.width * 9 >= th.height * 15)
+            .filter(|th| {
+                th.url.contains("ytimg.com") && th.height > 0 && th.width * 9 >= th.height * 15
+            })
             .cloned()
             .collect();
-        return crate::images::url_for(&wide, px)
-            .or_else(|| Some(format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", t.video_id)));
+        return crate::images::url_for(&wide, px).or_else(|| {
+            Some(format!(
+                "https://i.ytimg.com/vi/{}/mqdefault.jpg",
+                t.video_id
+            ))
+        });
     }
     crate::images::url_for(thumbs(item), px)
 }

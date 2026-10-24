@@ -91,7 +91,11 @@ pub(crate) struct ClockEstimator {
 
 /// `(min fwd - min back) / 2` over samples detrended to `ref_us`, and the
 /// local time that estimate belongs to.
-fn split_min<'a>(samples: impl IntoIterator<Item = &'a Sample>, slope: f64, ref_us: f64) -> Option<(f64, f64)> {
+fn split_min<'a>(
+    samples: impl IntoIterator<Item = &'a Sample>,
+    slope: f64,
+    ref_us: f64,
+) -> Option<(f64, f64)> {
     let mut f: Option<(f64, f64)> = None;
     let mut b: Option<(f64, f64)> = None;
     for s in samples {
@@ -141,7 +145,13 @@ impl ClockEstimator {
     /// Current round trip: median of the last 8 samples (follows changes
     /// quickly but ignores single spikes). None before the first sample.
     pub(crate) fn rtt_us(&self) -> Option<u64> {
-        let mut recent: Vec<u64> = self.samples.iter().rev().take(8).map(|s| s.rtt_us).collect();
+        let mut recent: Vec<u64> = self
+            .samples
+            .iter()
+            .rev()
+            .take(8)
+            .map(|s| s.rtt_us)
+            .collect();
         if recent.is_empty() {
             return None;
         }
@@ -165,7 +175,8 @@ impl ClockEstimator {
         if fit.len() >= FIT_MIN_SAMPLES && span >= FIT_MIN_SPAN_US {
             let fwd: Vec<(f64, f64)> = fit.iter().map(|s| (s.at_us - newest, s.fwd_us)).collect();
             let back: Vec<(f64, f64)> = fit.iter().map(|s| (s.at_us - newest, s.back_us)).collect();
-            if let (Some((af, bf)), Some((ab, bb))) = (lower_envelope(&fwd), lower_envelope(&back)) {
+            if let (Some((af, bf)), Some((ab, bb))) = (lower_envelope(&fwd), lower_envelope(&back))
+            {
                 let slope = (bf - bb) / 2.0;
                 if slope.is_finite() && slope.abs() <= MAX_SLOPE {
                     return Some(ClockModel {
@@ -213,7 +224,10 @@ fn lower_envelope(pts: &[(f64, f64)]) -> Option<(f64, f64)> {
         return None;
     }
     let xm = pts.iter().map(|p| p.0).sum::<f64>() / pts.len() as f64;
-    let i = hull.windows(2).position(|w| w[1].0 >= xm).unwrap_or(hull.len() - 2);
+    let i = hull
+        .windows(2)
+        .position(|w| w[1].0 >= xm)
+        .unwrap_or(hull.len() - 2);
     let (p, q) = (hull[i], hull[i + 1]);
     let dx = q.0 - p.0;
     if dx <= 0.0 {
@@ -254,7 +268,11 @@ mod tests {
     /// jittery, asymmetric path with occasional big spikes and 5% loss.
     /// Returns (seconds elapsed, samples so far, estimation error in us) at
     /// every sample once a model exists, and the final estimator.
-    pub(super) fn simulate(seed: u64, p: &Path, total_s: f64) -> (Vec<(f64, usize, f64, f64)>, ClockEstimator) {
+    pub(super) fn simulate(
+        seed: u64,
+        p: &Path,
+        total_s: f64,
+    ) -> (Vec<(f64, usize, f64, f64)>, ClockEstimator) {
         let mut rng = Rng(seed | 1);
         let host_of = |local: f64| local + p.offset0_us + p.drift * local;
         let mut est = ClockEstimator::default();
@@ -264,7 +282,11 @@ mod tests {
         while t - start < total_s * 1e6 {
             let t1 = t;
             let elapsed = t - start;
-            t += if elapsed < 3e6 { 250_000.0 } else { 1_000_000.0 };
+            t += if elapsed < 3e6 {
+                250_000.0
+            } else {
+                1_000_000.0
+            };
             if rng.next_f64() < 0.05 {
                 continue; // lost
             }
@@ -355,7 +377,11 @@ mod tests {
         let errs = errors_after(&path, 40, 300.0, 3.0);
         let max = pct(&errs, 1.0);
         assert!(max <= 500.0, "max error {max:.0} us");
-        assert!(pct(&errs, 0.5) <= 50.0, "median error {:.0} us", pct(&errs, 0.5));
+        assert!(
+            pct(&errs, 0.5) <= 50.0,
+            "median error {:.0} us",
+            pct(&errs, 0.5)
+        );
     }
 
     #[test]
@@ -389,9 +415,15 @@ mod tests {
             for (secs, n, err, slope) in pts {
                 // Drift is fitted after a minute and settles within two.
                 if secs >= 120.0 {
-                    assert!(err.abs() <= 500.0, "seed {seed} at {secs:.1}s (n={n}): error {err:.0} us slope {slope:e}");
+                    assert!(
+                        err.abs() <= 500.0,
+                        "seed {seed} at {secs:.1}s (n={n}): error {err:.0} us slope {slope:e}"
+                    );
                 } else if secs >= 3.0 {
-                    assert!(err.abs() <= 1_000.0, "seed {seed} at {secs:.1}s (n={n}): error {err:.0} us");
+                    assert!(
+                        err.abs() <= 1_000.0,
+                        "seed {seed} at {secs:.1}s (n={n}): error {err:.0} us"
+                    );
                 }
             }
             let slope = est.model().unwrap().slope;
@@ -401,7 +433,11 @@ mod tests {
 
     #[test]
     fn model_inverse_roundtrip() {
-        let m = ClockModel { ref_local_us: 5e9, offset_us: -1234.5, slope: 5e-6 };
+        let m = ClockModel {
+            ref_local_us: 5e9,
+            offset_us: -1234.5,
+            slope: 5e-6,
+        };
         for l in [5_000_000_000u64, 5_060_000_000, 4_900_000_000] {
             let h = m.local_to_host(l);
             let back = m.host_to_local(h);

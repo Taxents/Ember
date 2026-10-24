@@ -168,8 +168,10 @@ mod tests {
         assert_eq!(bare("Radio Plus Gent 107.7 FM"), "Radio Plus Gent");
         assert_eq!(bare("Urgent FM 105.3"), "Urgent");
         assert_eq!(
-            wikimedia_png("https://upload.wikimedia.org/wikipedia/commons/0/08/VRT_Radio_1_logo.svg")
-                .as_deref(),
+            wikimedia_png(
+                "https://upload.wikimedia.org/wikipedia/commons/0/08/VRT_Radio_1_logo.svg"
+            )
+            .as_deref(),
             Some(
                 "https://upload.wikimedia.org/wikipedia/commons/thumb/0/08/VRT_Radio_1_logo.svg/512px-VRT_Radio_1_logo.svg.png"
             )

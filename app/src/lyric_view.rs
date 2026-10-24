@@ -295,7 +295,12 @@ mod tests {
 
     #[test]
     fn markup_parses() {
-        for s in ["1. Not a list", "# not a heading", "- dash <b> & `x` *y* [z](w)", "♪"] {
+        for s in [
+            "1. Not a list",
+            "# not a heading",
+            "- dash <b> & `x` *y* [z](w)",
+            "♪",
+        ] {
             assert!(StyledText::from_markdown(&plain(s)).is_ok(), "{s}");
         }
         let line = Line {
@@ -309,7 +314,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        let (a, b) = (Color::from_rgb_u8(233, 161, 95), Color::from_argb_u8(140, 241, 229, 210));
+        let (a, b) = (
+            Color::from_rgb_u8(233, 161, 95),
+            Color::from_argb_u8(140, 241, 229, 210),
+        );
         for t in [0, 400, 1250, 1999, 5000] {
             let (m, g) = fill(&line, t, a, b);
             assert!(StyledText::from_markdown(&m).is_ok(), "{m}");

@@ -10,7 +10,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const FANART_KEY: &str = env!("FANART_KEY");
-const UA: &str = concat!("Ember/", env!("CARGO_PKG_VERSION"), " ( https://github.com/Taxents/Ember )");
+const UA: &str = concat!(
+    "Ember/",
+    env!("CARGO_PKG_VERSION"),
+    " ( https://github.com/Taxents/Ember )"
+);
 /// Answers (logo or none) are kept this long.
 const TTL: u64 = 30 * 86400;
 

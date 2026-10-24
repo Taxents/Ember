@@ -126,9 +126,7 @@ impl App {
             return None;
         }
         let page_kind = self.header.as_ref().and_then(|h| match &h.play {
-            Some(crate::pages::HeroPlay::Item(Item::Track(t))) if t.video_id == cur => {
-                Some(t.kind)
-            }
+            Some(crate::pages::HeroPlay::Item(Item::Track(t))) if t.video_id == cur => Some(t.kind),
             _ => None,
         });
         let kind = page_kind.or_else(|| self.known.get(cur).map(|t| t.kind))?;

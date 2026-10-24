@@ -51,15 +51,28 @@ pub enum Down {
     },
     Members(Vec<String>),
     /// Get `id` ready from `ms`, held, and say `Ready`.
-    Prepare { seq: u64, id: String, ms: u64 },
+    Prepare {
+        seq: u64,
+        id: String,
+        ms: u64,
+    },
     /// Start what `seq` prepared at this time (host clock, µs).
-    Start { seq: u64, at: u64 },
+    Start {
+        seq: u64,
+        at: u64,
+    },
     /// The song after this one starts at this time (host clock, µs; `None`: not known yet).
-    Next { id: String, at: Option<u64> },
+    Next {
+        id: String,
+        at: Option<u64>,
+    },
     Pause,
     Stop,
     /// A station said what it plays.
-    Title { id: String, title: String },
+    Title {
+        id: String,
+        title: String,
+    },
     /// A station's bytes follow (raw frames: the epoch, 8 bytes little-endian, then bytes).
     RadioStart {
         epoch: u64,
@@ -67,7 +80,9 @@ pub enum Down {
         content_type: String,
         kbps: Option<u32>,
     },
-    RadioEnd { epoch: u64 },
+    RadioEnd {
+        epoch: u64,
+    },
 }
 
 /// Listener to host.
@@ -75,7 +90,9 @@ pub enum Down {
 pub enum Up {
     /// The clock is in step with the host's: starts can be timed.
     Synced,
-    Ready { seq: u64 },
+    Ready {
+        seq: u64,
+    },
     /// Start me again in step.
     Resync,
     Request(Req),
@@ -94,7 +111,10 @@ pub enum Req {
         start: Option<usize>,
         shuffle: Option<bool>,
     },
-    Add { tracks: Vec<Track>, next: bool },
+    Add {
+        tracks: Vec<Track>,
+        next: bool,
+    },
     Remove(usize),
     Move(usize, usize),
     Shuffle(bool),
@@ -298,7 +318,9 @@ impl App {
 
     /// Ends hosting or listening (`why`: said in the panel).
     pub(crate) fn together_leave(&mut self, why: &str) {
-        let Some(s) = self.together.take() else { return };
+        let Some(s) = self.together.take() else {
+            return;
+        };
         self.together_timer.stop();
         match s {
             Session::Hosting(_) => {
@@ -487,12 +509,26 @@ impl App {
         let seq = h.seq;
         if t.paused {
             // Ready and held: the resume's start includes them.
-            h.link.send(peer, &Down::Prepare { seq, id: t.id, ms: t.ms as u64 });
+            h.link.send(
+                peer,
+                &Down::Prepare {
+                    seq,
+                    id: t.id,
+                    ms: t.ms as u64,
+                },
+            );
             return;
         }
         let ms = t.ms_at(Instant::now()) + JOIN_LEAD_MS;
         h.joins.insert(seq, (peer, ms));
-        h.link.send(peer, &Down::Prepare { seq, id: t.id, ms: ms as u64 });
+        h.link.send(
+            peer,
+            &Down::Prepare {
+                seq,
+                id: t.id,
+                ms: ms as u64,
+            },
+        );
         h.next_sent = None;
     }
 
@@ -532,7 +568,10 @@ impl App {
         let at = Instant::now() + START_MARGIN + Duration::from_micros(rtt);
         let b = h.barrier.take().unwrap();
         if !b.waiting.is_empty() {
-            log::info!("together: {} not ready, starting without them", b.waiting.len());
+            log::info!(
+                "together: {} not ready, starting without them",
+                b.waiting.len()
+            );
         }
         self.player.engine.start_at(at);
         h.link.broadcast(&Down::Start {
@@ -551,7 +590,12 @@ impl App {
         h.seq += 1;
         h.joins.clear();
         h.next_sent = None;
-        let waiting = h.members.iter().filter(|m| m.synced).map(|m| m.peer).collect();
+        let waiting = h
+            .members
+            .iter()
+            .filter(|m| m.synced)
+            .map(|m| m.peer)
+            .collect();
         h.barrier = Some(Barrier {
             seq: h.seq,
             id: id.to_string(),
@@ -583,7 +627,9 @@ impl App {
         let Some(Session::Hosting(h)) = &mut self.together else {
             return;
         };
-        let Some(t) = self.player.engine.timing() else { return };
+        let Some(t) = self.player.engine.timing() else {
+            return;
+        };
         if t.held || t.paused || h.barrier.is_some() || radio::is_station(&t.id) {
             return;
         }
@@ -674,7 +720,11 @@ impl App {
         let Some(t) = self.player.engine.timing() else {
             return false;
         };
-        let ms = if radio::is_station(&t.id) { 0 } else { t.ms as u64 };
+        let ms = if radio::is_station(&t.id) {
+            0
+        } else {
+            t.ms as u64
+        };
         self.player.engine.cue(&t.id, ms, None);
         true
     }
@@ -863,16 +913,17 @@ impl App {
         let Some(Session::Listening(l)) = &mut self.together else {
             return;
         };
-        let local = |l: &Listening, at: u64| {
-            l.link.host_to_local_us(at).map(together::to_instant)
-        };
+        let local = |l: &Listening, at: u64| l.link.host_to_local_us(at).map(together::to_instant);
         if let Some((_, at)) = l.start
             && let Some(t) = local(l, at)
         {
             l.start = None;
             l.prepared = None;
             if t < Instant::now() {
-                log::warn!("together: start came {} ms late", (Instant::now() - t).as_millis());
+                log::warn!(
+                    "together: start came {} ms late",
+                    (Instant::now() - t).as_millis()
+                );
             }
             self.player.engine.start_at(t);
         }
