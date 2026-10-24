@@ -223,8 +223,8 @@ struct App {
     /// Seek to this once the restored track starts.
     resume_at: Option<u64>,
     minimized: bool,
-    /// Another window is active: the clock moves once a second and the meter rests.
-    unfocused: bool,
+    /// A pause (`false`) or resume (`true`) asked of the engine and when, shown until it's taken.
+    toggled: Option<(bool, std::time::Instant)>,
     /// The signed-out toast was shown for the current expiry.
     told_expired: bool,
     /// Runs while skips come quickly; when it ends, the song they stopped at plays.
@@ -354,7 +354,7 @@ fn main() {
         account: None,
         resume_at: None,
         minimized: false,
-        unfocused: false,
+        toggled: None,
         told_expired: false,
         skip_timer: Timer::default(),
         skip_pending: false,

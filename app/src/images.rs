@@ -16,6 +16,8 @@ const MEMORY_ITEMS: usize = 200;
 const DISK_BYTES: u64 = 300 * 1024 * 1024;
 /// Image hosts fetched from (each also covers its subdomains). gstatic.com serves the fixed
 /// covers (Liked Music, Episodes for later).
+/// music.youtube.com is allowed only under `MIX_ART`, which draws the generated covers (Replay,
+/// Discover Mix, Supermix).
 const HOSTS: [&str; 5] = [
     "ytimg.com",
     "googleusercontent.com",
@@ -23,6 +25,7 @@ const HOSTS: [&str; 5] = [
     "gstatic.com",
     "fanart.tv",
 ];
+const MIX_ART: &str = "music.youtube.com/image/";
 
 /// The URL to fetch for showing `thumbs` at `px` physical pixels square.
 pub fn url_for(thumbs: &[Thumb], px: u32) -> Option<String> {
@@ -51,6 +54,9 @@ pub fn allowed(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };
+    if rest.starts_with(MIX_ART) {
+        return true;
+    }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.contains('@') {
         return false;
@@ -402,6 +408,11 @@ mod tests {
     fn image_hosts() {
         assert!(allowed("https://i.ytimg.com/vi/x/hqdefault.jpg"));
         assert!(allowed("https://lh3.googleusercontent.com/abc=w120-h120"));
+        assert!(allowed("https://music.youtube.com/image/mixart?r=abc"));
+        assert!(!allowed("https://music.youtube.com/watch?v=abc"));
+        assert!(!allowed(
+            "https://music.youtube.com.evil.example/image/mixart"
+        ));
         assert!(allowed("https://yt3.ggpht.com/abc"));
         assert!(allowed(
             "https://assets.fanart.tv/fanart/music/x/hdmusiclogo/y.png"

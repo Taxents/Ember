@@ -25,7 +25,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, HICON, ICONINFO, IsIconic, RegisterWindowMessageW, SIZE_MAXIMIZED,
-    SIZE_MINIMIZED, SIZE_RESTORED, WA_INACTIVE, WM_ACTIVATE, WM_COMMAND, WM_SIZE, WM_XBUTTONUP,
+    SIZE_MINIMIZED, SIZE_RESTORED, WM_COMMAND, WM_SIZE, WM_XBUTTONUP,
 };
 use windows::core::{HSTRING, w};
 
@@ -44,8 +44,6 @@ pub enum Remote {
     Forward,
     /// The media flyout's seek bar was moved, to this many ms.
     Seek(u64),
-    /// The window became the active one (true) or another one did.
-    Focused(bool),
 }
 
 /// Draw at the display's real resolution instead of letting Windows stretch a 96-DPI bitmap.
@@ -166,7 +164,6 @@ unsafe extern "system" fn subclass(
             }
             _ => {}
         },
-        WM_ACTIVATE => emit(Remote::Focused((wp.0 & 0xFFFF) as u32 != WA_INACTIVE)),
         // Side buttons: XBUTTON1 is back, XBUTTON2 forward.
         WM_XBUTTONUP => {
             match (wp.0 >> 16) & 0xFFFF {

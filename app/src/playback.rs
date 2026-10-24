@@ -502,10 +502,12 @@ impl App {
             Some(p) if p.paused => {
                 if !self.together_resume() {
                     self.player.engine.resume();
+                    self.toggled = Some((true, std::time::Instant::now()));
                 }
             }
             Some(_) => {
                 self.player.engine.pause();
+                self.toggled = Some((false, std::time::Instant::now()));
                 self.together_paused();
             }
             None => self.player.play_current(),
@@ -806,8 +808,7 @@ impl App {
             return false;
         };
         let page = g.get_page();
-        let visible = (g.get_panel_open() && g.get_panel_tab() == 0)
-            || (page.kind == PageKind::Song && page.id.as_str() == f.id);
+        let visible = lyrics_on_screen(&g, &page, &f.id);
         let theme = ui.global::<Theme>();
         let (sung, todo) = (theme.get_amber(), theme.get_ivory().with_alpha(0.5));
         if let Some(line) = f.at(p.ms, visible, sung, todo) {
@@ -826,7 +827,16 @@ impl App {
     pub(crate) fn tick(&mut self) {
         let pos = self.player.engine.position();
         self.lyrics_tick();
-        let playing = pos.as_ref().is_some_and(|p| !p.paused);
+        let mut playing = pos.as_ref().is_some_and(|p| !p.paused);
+        // The engine takes a pause or resume a moment after it's asked: until it has, show what
+        // was asked for, or the button flips back and the clock stops while the song plays.
+        if let Some((asked, at)) = self.toggled {
+            if pos.is_some() && playing != asked && at.elapsed() < Duration::from_secs(2) {
+                playing = asked;
+            } else {
+                self.toggled = None;
+            }
+        }
         let ui = self.ui();
         let g = ui.global::<Ui>();
         let mut np = g.get_np();
@@ -888,33 +898,19 @@ impl App {
             );
         }
         let want = (playing || waiting && waited < Duration::from_secs(20)) && !self.minimized;
-        // The meter's timer moves the clock too (see `meter_tick`); with another window active
-        // it's only the clock, once a second.
+        // The meter's timer moves the clock and the lyrics too (see `meter_tick`).
         if want && !self.meter_timer.running() {
             g.set_levels(ModelRc::from(self.levels.clone()));
-            if self.unfocused {
-                self.meter_timer
-                    .start(TimerMode::Repeated, Duration::from_secs(1), || {
-                        with(|a| {
-                            a.tick();
-                            a.lyrics_tick();
-                        });
-                    });
-            } else {
-                self.meter_timer
-                    .start(TimerMode::Repeated, Duration::from_millis(33), || {
-                        with(|a| a.meter_tick());
-                    });
-            }
+            self.meter_timer
+                .start(TimerMode::Repeated, Duration::from_millis(33), || {
+                    with(|a| a.meter_tick());
+                });
         } else if !want && self.meter_timer.running() {
             self.meter_timer.stop();
         }
     }
 
     pub(crate) fn remote(&mut self, r: Remote) {
-        if let Remote::Focused(on) = r {
-            return self.focus_changed(on);
-        }
         log::info!("remote: {r:?}");
         match r {
             Remote::PlayPause => self.play_pause(),
@@ -935,24 +931,12 @@ impl App {
             Remote::Minimized => self.minimize(),
             Remote::Restored => self.restore(),
             Remote::Seek(ms) => self.seek(ms),
-            Remote::Focused(_) => {}
         }
     }
+}
 
-    /// The meter's timer runs at its other pace from the next tick.
-    pub(crate) fn focus_changed(&mut self, focused: bool) {
-        if self.unfocused == !focused {
-            return;
-        }
-        self.unfocused = !focused;
-        if self.unfocused {
-            // The visualizer rests rather than freezing mid-beat.
-            for (i, m) in self.meter.iter_mut().enumerate() {
-                m.1 = 0.0;
-                self.levels.set_row_data(i, 0.0);
-            }
-        }
-        self.meter_timer.stop();
-        self.tick();
-    }
+/// Lyrics for song `id` are showing: the panel's lyrics tab, or that song's page.
+fn lyrics_on_screen(g: &Ui, page: &PageState, id: &str) -> bool {
+    (g.get_panel_open() && g.get_panel_tab() == 0)
+        || (page.kind == PageKind::Song && page.id.as_str() == id)
 }
