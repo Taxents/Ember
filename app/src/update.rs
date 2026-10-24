@@ -1,6 +1,8 @@
-//! Updates from GitHub releases. A release is a `vX.Y.Z` tag with three assets: `ember.exe`,
-//! `ember.exe.minisig` (its minisign signature, made by the release workflow with the key whose
-//! public half is `PUBLIC_KEY`) and `ember.exe.sha256` (its SHA-256 in hex).
+//! Updates from GitHub releases. A release is a `vX.Y.Z` tag with `EmberSetup.exe` (what people
+//! download) and three assets for this: `ember.update` (the new ember.exe, named so it isn't
+//! mistaken for something to run from Downloads), `ember.update.minisig` (its minisign signature,
+//! made by the release workflow with the key whose public half is `PUBLIC_KEY`) and
+//! `ember.update.sha256` (its SHA-256 in hex).
 //!
 //! Checking only looks: it reads the release list and reports `Available`, and the sidebar says so.
 //! Nothing is downloaded until the user chooses "Download and install" (`install_now`). Then the
@@ -26,7 +28,7 @@ use std::time::Duration;
 /// Where releases are published ("owner/name").
 const REPO: &str = "Taxents/Ember";
 const UA: &str = concat!("Ember/", env!("CARGO_PKG_VERSION"));
-const ASSET: &str = "ember.exe";
+const ASSET: &str = "ember.update";
 /// The largest exe accepted.
 const MAX_EXE: u64 = 200 * 1024 * 1024;
 
@@ -131,7 +133,7 @@ pub fn check(report: &dyn Fn(Status)) -> Status {
     })();
     let Some(found) = found else {
         // An unsigned release (from before signing) is never offered.
-        log::info!("update {version}: no signed ember.exe in the release");
+        log::info!("update {version}: no signed {ASSET} in the release");
         return done(Status::UpToDate);
     };
     *FOUND.lock().unwrap() = Some(found);

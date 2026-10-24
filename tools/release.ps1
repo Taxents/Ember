@@ -1,11 +1,12 @@
 # Cuts a release: sets the app's version, commits, tags v<version> and pushes. GitHub Actions
-# then builds ember.exe, signs it (ember.exe.minisig) and publishes it; installed apps show
+# then builds ember.exe and publishes EmberSetup.exe (what people download) and ember.update (the
+# same exe for the in-app updater) with its signature (ember.update.minisig); installed apps show
 # "Ember <version> is available" and install it when the user chooses to.
 #   tools\release.ps1 -Version 0.2.0
 #
 # Signing a build by hand (say, to re-sign a release asset) with the offline key:
-#   tools\release.ps1 -Sign path\to\ember.exe -Version 0.2.0 -Key path\to\ember.key
-# writes path\to\ember.exe.minisig. The trusted comment names the version; the app refuses a
+#   tools\release.ps1 -Sign path\to\ember.update -Version 0.2.0 -Key path\to\ember.key
+# writes path\to\ember.update.minisig. The trusted comment names the version; the app refuses a
 # signature made for another one.
 #
 # One-time setup of the signing key (https://jedisct1.github.io/minisign/):
@@ -27,7 +28,7 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "version must look like 1.2.3"
 if ($Sign) {
     if (-not $Key) { throw "-Sign needs -Key (the minisign secret key file)" }
     if (-not (Get-Command minisign -ErrorAction SilentlyContinue)) { throw "minisign isn't on PATH" }
-    minisign -S -s $Key -m $Sign -x "$Sign.minisig" -t "version:$Version file:ember.exe"
+    minisign -S -s $Key -m $Sign -x "$Sign.minisig" -t "version:$Version file:ember.update"
     if ($LASTEXITCODE -ne 0) { throw "minisign failed ($LASTEXITCODE)" }
     Write-Host "Wrote $Sign.minisig"
     return

@@ -1,4 +1,5 @@
-# Builds a release when a version tag (v1.2.3) is pushed: ember.exe, its minisign signature and its
+# Builds a release when a version tag (v1.2.3) is pushed: ember.update (ember.exe under a name nobody
+# runs from Downloads), its minisign signature and its
 # SHA-256, which the app's updater downloads and checks, plus EmberSetup.exe, the installer for new
 # users. The tag must match the app's Cargo.toml version.
 #
@@ -63,9 +64,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
           Copy-Item target/release/ember.exe out/ember.exe
-          (Get-FileHash out/ember.exe -Algorithm SHA256).Hash.ToLower() | Set-Content out/ember.exe.sha256 -NoNewline -Encoding ascii
+          Copy-Item out/ember.exe out/ember.update
+          (Get-FileHash out/ember.update -Algorithm SHA256).Hash.ToLower() | Set-Content out/ember.update.sha256 -NoNewline -Encoding ascii
 
-      # ember.exe.minisig: the app installs an update only if this verifies against the public key
+      # ember.update.minisig: the app installs an update only if this verifies against the public key
       # built into it (app/src/update.rs), and only if the trusted comment names its version.
       - name: Sign
         shell: pwsh
@@ -83,14 +85,14 @@ jobs:
           Set-Content -Path $key -Value $env:MINISIGN_SECRET_KEY -Encoding ascii
           try {
             $v = "$env:TAG".TrimStart('v')
-            & $minisign -S -s $key -m out/ember.exe -x out/ember.exe.minisig -t "version:$v file:ember.exe"
+            & $minisign -S -s $key -m out/ember.update -x out/ember.update.minisig -t "version:$v file:ember.update"
             if ($LASTEXITCODE -ne 0) { throw "minisign failed ($LASTEXITCODE)" }
           } finally {
             Remove-Item $key -Force
           }
 
       # EmberSetup.exe: the installer people download the first time (installer/ember.iss).
-      # The updater keeps using ember.exe and its signature above.
+      # The updater keeps using ember.update and its signature above.
       - name: Build the installer
         shell: pwsh
         env:
@@ -129,4 +131,4 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG" out/ember.exe out/ember.exe.minisig out/ember.exe.sha256 out/EmberSetup.exe --generate-notes --title "$TAG"
+          gh release create "$TAG" out/EmberSetup.exe out/ember.update out/ember.update.minisig out/ember.update.sha256 --title "$TAG" --generate-notes --notes "**Download EmberSetup.exe** to install Ember. The ember.update files are for updates the app installs by itself."
