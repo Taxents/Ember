@@ -321,9 +321,6 @@ mod raw {
     }
 
     pub async fn connect(local_code: &str) -> Result<(Endpoint, Connection), String> {
-        let (code, addr) = local_code.split_once('@').unwrap();
-        let id = iroh::PublicKey::from_z32(code.strip_prefix("ember-").unwrap()).unwrap();
-        let addr: SocketAddr = addr.parse().unwrap();
         let ep = Endpoint::builder(presets::Minimal)
             .clear_ip_transports()
             .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -331,11 +328,17 @@ mod raw {
             .bind()
             .await
             .unwrap();
+        let c = dial(&ep, local_code).await?;
+        Ok((ep, c))
+    }
+
+    /// Another connection from the same endpoint (the same guest, as when it rejoins).
+    pub async fn dial(ep: &Endpoint, local_code: &str) -> Result<Connection, String> {
+        let (code, addr) = local_code.split_once('@').unwrap();
+        let id = iroh::PublicKey::from_z32(code.strip_prefix("ember-").unwrap()).unwrap();
+        let addr: SocketAddr = addr.parse().unwrap();
         let to = EndpointAddr::from_parts(id, [TransportAddr::Ip(addr)]);
-        match ep.connect(to, ALPN).await {
-            Ok(c) => Ok((ep, c)),
-            Err(e) => Err(e.to_string()),
-        }
+        ep.connect(to, ALPN).await.map_err(|e| e.to_string())
     }
 
     pub fn header(kind: u8, len: usize) -> Vec<u8> {
@@ -433,6 +436,34 @@ fn raw_oversized_and_early_frames_are_refused() {
     }
     assert_eq!(joins, 3);
     assert!(lefts >= 2);
+}
+
+/// A guest back on a new link before the host noticed the old one died: the old one is
+/// replaced at once, not left as a second member.
+#[test]
+fn raw_a_guest_back_on_a_new_link_replaces_its_old_self() {
+    let host = Host::<Up, Down>::start_local("H").unwrap();
+    let code = host.local_code().unwrap();
+    raw::rt().block_on(async {
+        let (ep, c1) = raw::connect(&code).await.unwrap();
+        let (_s1, _r1) = raw::hello(&c1, "same").await;
+        let (p1, _) = joined(&host);
+        let c2 = raw::dial(&ep, &code).await.unwrap();
+        let (_s2, _r2) = raw::hello(&c2, "same").await;
+        assert_eq!(raw::closed_with(&c1, 5).await, Some(0), "old link closed");
+        let mut joined_again = None;
+        let mut left = false;
+        while let Ok(e) = host.events().recv_timeout(Duration::from_millis(500)) {
+            match e {
+                HostEvent::Joined { peer, .. } => joined_again = Some(peer),
+                HostEvent::Left { peer } => left |= peer == p1,
+                _ => {}
+            }
+        }
+        let p2 = joined_again.expect("joined again");
+        assert!(left, "the old peer left");
+        assert_eq!(host.peers(), vec![p2]);
+    });
 }
 
 /// More than 8 connections stuck before their hello: the rest are refused until one finishes.

@@ -52,6 +52,8 @@ struct Peer {
     tx: mpsc::Sender<Bytes>,
     rtt: Arc<Rtt>,
     conn: Connection,
+    /// The guest's endpoint (TLS-authenticated, and the same when it rejoins).
+    remote: iroh::EndpointId,
 }
 
 /// The host's own measure of one guest's round trip: its pings ([`wire::host_ping`]) and their
@@ -465,10 +467,24 @@ async fn serve_guest<Up: DeserializeOwned + Send + 'static>(
         name: shared.name.clone(),
     }));
     let rtt = Arc::new(Rtt::default());
+    let remote = conn.remote_id();
     let peer = {
         let Ok(mut peers) = shared.peers.lock() else {
             return;
         };
+        // The same guest again (rejoining before its old link timed out): the old one goes,
+        // rather than lingering as a second member until QUIC notices. Its task reports `Left`.
+        let old: Vec<PeerId> = peers
+            .iter()
+            .filter(|(_, p)| p.remote == remote)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in old {
+            if let Some(p) = peers.remove(&id) {
+                log::info!("together: guest {id} is back on a new link");
+                p.conn.close(close::NORMAL.into(), b"replaced");
+            }
+        }
         if peers.len() >= MAX_GUESTS {
             drop(peers);
             log::info!("together: refusing a guest, session full");
@@ -482,6 +498,7 @@ async fn serve_guest<Up: DeserializeOwned + Send + 'static>(
                 tx: tx.clone(),
                 rtt: rtt.clone(),
                 conn: conn.clone(),
+                remote,
             },
         );
         id
