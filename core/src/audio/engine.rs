@@ -732,6 +732,12 @@ impl Worker {
     }
 
     fn seek(&mut self, ms: u64) {
+        if self.loading_play {
+            // Still opening: it starts there instead.
+            let when = self.pending.and_then(|(_, w)| w);
+            self.pending = Some((ms, when));
+            return;
+        }
         let played = self.shared.played.load(Ordering::Relaxed);
         let audible = self
             .timeline
@@ -1101,6 +1107,8 @@ impl Worker {
             self.cur = None;
             self.prev = None;
             self.shared.expecting.store(false, Ordering::Relaxed);
+            // Nothing is audible any more: no position, so play and previous start afresh.
+            self.timeline.lock().unwrap().marks.clear();
             let _ = self.events.send(Event::Finished);
         } else if drained && ended {
             // Waiting on a late next track: silence here isn't an underrun.
@@ -1655,7 +1663,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "L2"]
     fn nothing_is_audible_after_the_end() {
         let mut r = Rig::new();
         r.cmd(Cmd::Play("a".into()));
@@ -1665,7 +1672,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "L2"]
     fn a_seek_while_loading_is_where_it_starts() {
         let mut r = Rig::new();
         r.track("a", |s| s.load_delay = Duration::from_millis(100));

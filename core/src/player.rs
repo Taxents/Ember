@@ -51,6 +51,8 @@ pub struct Player<E = Engine> {
     failures: usize,
     /// Listening along: the queue only mirrors someone else's, and never drives the engine.
     pub follower: bool,
+    /// Played to the end: nothing is audible, the current track is the one that ended.
+    ended: bool,
 }
 
 impl<E: Playback> Player<E> {
@@ -66,6 +68,7 @@ impl<E: Playback> Player<E> {
             skip: HashSet::new(),
             failures: 0,
             follower: false,
+            ended: false,
         }
     }
 
@@ -232,15 +235,21 @@ impl<E: Playback> Player<E> {
         }
     }
 
-    /// Previous track, or restart this one if more than 3 s in.
+    /// Previous track, or restart this one if more than 3 s in (or played to the end).
     pub fn previous(&mut self) {
         // Live radio has nothing to restart: always the previous station.
         let live = self.current().is_some_and(crate::radio::is_station);
-        if !live && self.engine.position().is_some_and(|p| p.ms > 3000)
+        let pos = self.engine.position();
+        if !live && (self.ended || pos.as_ref().is_some_and(|p| p.ms > 3000))
             || self.at == 0 && self.repeat != Repeat::All
         {
-            if !self.follower {
-                self.engine.seek(0);
+            if self.follower {
+                return;
+            }
+            // Nothing audible to seek in (the end, or a failed start): play it again.
+            match pos {
+                Some(_) => self.engine.seek(0),
+                None => self.play_current(),
             }
             return;
         }
@@ -273,7 +282,9 @@ impl<E: Playback> Player<E> {
     /// Keeps the queue in step with the engine. Call for every engine event.
     pub fn on_event(&mut self, e: &Event) {
         match e {
+            Event::Finished => self.ended = true,
             Event::Started { id, .. } => {
+                self.ended = false;
                 // A gapless hand-over moved us on by itself: catch up.
                 if self.current() != Some(id.as_str()) {
                     if let Some(i) = self
@@ -682,7 +693,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "L2"]
     fn previous_after_the_queue_ended_replays_the_last_track() {
         let mut p = player("a b", 1);
         started(&mut p, "b");
@@ -691,5 +701,14 @@ mod tests {
         *p.engine.pos.borrow_mut() = None;
         p.previous();
         assert_eq!(played(&p), "b b");
+    }
+
+    #[test]
+    fn previous_on_a_first_track_that_never_started_tries_it_again() {
+        let mut p = player("a b", 0);
+        failed(&mut p, "b");
+        p.previous();
+        assert_eq!(played(&p), "a a");
+        assert!(p.engine.seeks.borrow().is_empty());
     }
 }
