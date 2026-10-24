@@ -30,9 +30,9 @@ const ASSET: &str = "ember.exe";
 /// The largest exe accepted.
 const MAX_EXE: u64 = 200 * 1024 * 1024;
 
-/// The minisign public key releases are signed with (the second line of `minisign.pub`). While
-/// it's still this placeholder, updates are found but never installed. See `tools/release.ps1`.
-const PUBLIC_KEY: &str = "PLACEHOLDER-run-minisign-G-and-paste-the-public-key-here";
+/// The minisign public key releases are signed with (the second line of `ember.pub`; its secret
+/// half is the `MINISIGN_SECRET_KEY` repository secret). See `tools/release.ps1`.
+const PUBLIC_KEY: &str = "RWRF2StWuqEeLNcq2Lp7wdDSfXBMRGlkoEUGuIkltIfYFw9E3tr26y9y";
 
 /// Deletes what the last update left behind. Call once at start.
 pub fn clean_up() {
@@ -613,7 +613,12 @@ sMIVovIC6uCpVtbX+JtFy05OQWaoX2TCKIylUTu65dz1kYWDLHdtISlTq3rkJfee1yV/k5SCFDz0s5Vd
 
     #[test]
     fn placeholder_key_refuses() {
-        assert!(public_key(PUBLIC_KEY).is_err());
+        assert!(public_key("PLACEHOLDER-run-minisign-G").is_err());
+    }
+
+    #[test]
+    fn release_key_is_a_key() {
+        assert!(public_key(PUBLIC_KEY).is_ok());
     }
 
     #[test]

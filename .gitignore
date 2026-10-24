@@ -14,3 +14,7 @@
 # Dev scripts; cutting a release stays.
 /tools/*
 !/tools/release.ps1
+
+# The release signing key: never commit it.
+ember.key
+*.key
