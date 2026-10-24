@@ -76,8 +76,9 @@ struct Disk {
     video_formats: HashMap<String, Vec<VideoInfo>>,
 }
 
-/// The last answer for one video, shared by everyone who asked while it was being fetched.
-type Slot = Arc<Mutex<Option<(Instant, (StreamInfo, Vec<VideoInfo>))>>>;
+/// The last answer for one video (a failure too), shared by everyone who asked while it was
+/// being fetched.
+type Slot = Arc<Mutex<Option<(Instant, Result<(StreamInfo, Vec<VideoInfo>)>)>>>;
 
 pub struct Resolver {
     state: Mutex<Disk>,
@@ -170,34 +171,57 @@ impl Resolver {
     /// Asks YouTube for the streams and caches them. Asks made while the same video is being
     /// fetched wait and share that answer rather than sending their own.
     fn fetch(&self, video_id: &str) -> Result<(StreamInfo, Vec<VideoInfo>)> {
+        /// Takes the video out of `inflight` when the last one holding its slot is done, however
+        /// that ends (a panic included).
+        struct Leave<'a> {
+            inflight: &'a Mutex<HashMap<String, Slot>>,
+            id: &'a str,
+            slot: Option<Slot>,
+        }
+        impl Drop for Leave<'_> {
+            fn drop(&mut self) {
+                // Let go of the slot under the map's lock, so every count is seen in order.
+                let mut inflight = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+                drop(self.slot.take());
+                // Only the map's left: nobody else is waiting on it.
+                if inflight
+                    .get(self.id)
+                    .is_some_and(|s| Arc::strong_count(s) == 1)
+                {
+                    inflight.remove(self.id);
+                }
+            }
+        }
+
         let asked = Instant::now();
         let slot = self
             .inflight
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(video_id.to_string())
             .or_default()
             .clone();
-        let r = {
-            let mut last = slot.lock().unwrap();
-            match &*last {
-                // Fetched while this one waited.
-                Some((at, got)) if *at >= asked => Ok(got.clone()),
-                _ => {
-                    let r = self.fetch_now(video_id);
-                    if let Ok(got) = &r {
-                        *last = Some((Instant::now(), got.clone()));
-                    }
-                    r
-                }
-            }
+        let leave = Leave {
+            inflight: &self.inflight,
+            id: video_id,
+            slot: Some(slot),
         };
-        let mut inflight = self.inflight.lock().unwrap();
-        // The map's and ours: nobody else is waiting on it.
-        if Arc::strong_count(&slot) == 2 {
-            inflight.remove(video_id);
+        // A panic in an earlier fetch only means it left no answer.
+        let mut last = leave
+            .slot
+            .as_ref()
+            .expect("slot")
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match &*last {
+            // Answered while this one waited, success or not: that's the answer.
+            Some((at, got)) if *at >= asked => got.clone(),
+            _ => {
+                let r = self.fetch_now(video_id);
+                *last = Some((Instant::now(), r.clone()));
+                r
+            }
         }
-        r
     }
 
     fn fetch_now(&self, video_id: &str) -> Result<(StreamInfo, Vec<VideoInfo>)> {
@@ -467,6 +491,32 @@ mod tests {
         assert_eq!(pick_video(&f, 600).unwrap().itag, 136);
         assert_eq!(pick_video(&f, 2000).unwrap().itag, 136);
         assert!(pick_video(&[], 300).is_none());
+    }
+
+    #[test]
+    fn shared_answers_survive_a_panic() {
+        let r = Resolver {
+            state: Mutex::new(Disk::default()),
+            path: std::env::temp_dir().join("ember-resolver-test.json"),
+            itags: vec![],
+            inflight: Mutex::new(HashMap::new()),
+        };
+        // A fetch that panicked holding the slot, and an answer arriving after this ask.
+        let slot: Slot = Default::default();
+        let s2 = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = s2.lock().unwrap();
+            panic!("fetch panicked");
+        })
+        .join();
+        assert!(slot.is_poisoned());
+        let later = Instant::now() + std::time::Duration::from_secs(60);
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((later, Err(Error::Unavailable("first".into()))));
+        r.inflight.lock().unwrap().insert("x".into(), slot);
+        let got = r.fetch("x");
+        assert!(matches!(got, Err(Error::Unavailable(m)) if m == "first"));
+        assert!(r.inflight.lock().unwrap().is_empty(), "the entry is gone");
     }
 
     #[test]
