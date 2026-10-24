@@ -1,8 +1,8 @@
 //! Artwork: fetched at the size it's shown, cached on disk, decoded on a worker, and kept in a
 //! small in-memory cache that's emptied when the window is minimized.
 //!
-//! Only `https://` images from YouTube's and fanart.tv's image hosts are fetched: URLs can come
-//! from a Listen Along guest, and a request to any other host would tell it our address.
+//! Only `https://` images from YouTube's, Google's and fanart.tv's image hosts are fetched: URLs
+//! can come from a Listen Along guest, and a request to any other host would tell it our address.
 
 use music_core::paths::{cache_dir, write_atomic};
 use music_core::yt::model::{Thumb, best_thumb, sized};
@@ -14,11 +14,13 @@ use std::time::{Duration, SystemTime};
 
 const MEMORY_ITEMS: usize = 200;
 const DISK_BYTES: u64 = 300 * 1024 * 1024;
-/// Image hosts fetched from (each also covers its subdomains).
-const HOSTS: [&str; 4] = [
+/// Image hosts fetched from (each also covers its subdomains). gstatic.com serves the fixed
+/// covers (Liked Music, Episodes for later).
+const HOSTS: [&str; 5] = [
     "ytimg.com",
     "googleusercontent.com",
     "ggpht.com",
+    "gstatic.com",
     "fanart.tv",
 ];
 
@@ -32,6 +34,16 @@ pub fn url_for(thumbs: &[Thumb], px: u32) -> Option<String> {
             t.url.clone()
         },
     )
+}
+
+/// The URL to fetch `url` from: `https://` on one of `HOSTS`. Scheme-relative ones (`//host/…`,
+/// as YouTube sometimes sends) get `https:`.
+pub fn fetchable(url: &str) -> Option<String> {
+    let url = match url.strip_prefix("//") {
+        Some(rest) => format!("https://{rest}"),
+        None => url.to_string(),
+    };
+    allowed(&url).then_some(url)
 }
 
 /// `url` is one images are fetched from: `https://` on one of `HOSTS`.
@@ -250,13 +262,17 @@ fn touch(path: &Path) {
 
 /// Fetches the image and keeps it at `path`.
 fn download(url: &str, path: &Path) -> Option<Vec<u8>> {
-    if !allowed(url) {
+    let Some(url) = fetchable(url) else {
         log::info!("image {}: host not allowed", music_core::net::short(url));
         return None;
-    }
-    let mut r = music_core::net::agent().get(url).call().ok()?;
+    };
+    let mut r = music_core::net::agent().get(&url).call().ok()?;
     if r.status().as_u16() != 200 {
-        log::warn!("image {}: HTTP {}", music_core::net::short(url), r.status());
+        log::warn!(
+            "image {}: HTTP {}",
+            music_core::net::short(&url),
+            r.status()
+        );
         return None;
     }
     let b = r
@@ -391,6 +407,14 @@ mod tests {
             "https://assets.fanart.tv/fanart/music/x/hdmusiclogo/y.png"
         ));
         assert!(allowed("https://I.YTIMG.COM:443/vi/x.jpg"));
+        assert!(allowed(
+            "https://www.gstatic.com/youtube/media/ytm/images/pbg/liked-music-@576.png"
+        ));
+        assert_eq!(
+            fetchable("//yt3.ggpht.com/abc").as_deref(),
+            Some("https://yt3.ggpht.com/abc")
+        );
+        assert_eq!(fetchable("//evil.example/abc"), None);
         assert!(!allowed("http://i.ytimg.com/vi/x.jpg"));
         assert!(!allowed("https://evil.example/x.jpg"));
         assert!(!allowed("https://ytimg.com.evil.example/x.jpg"));
