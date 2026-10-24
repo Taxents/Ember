@@ -763,6 +763,12 @@ impl App {
         self.hwnd = Some(hwnd);
         log::info!("window {:#x}", hwnd.0 as usize);
         win::dark_title_bar(hwnd);
+        // Where it was, or (a first start, or an older version's size only) where Windows put
+        // it, moved and shrunk to fit the screen.
+        if let Some((x, y, w, h, maximized)) = self.settings.place.or_else(|| win::placement(hwnd))
+        {
+            win::place(hwnd, x, y, w, h, maximized);
+        }
         win::install(hwnd, |r| {
             with(|a| a.remote(r));
         });
@@ -779,6 +785,11 @@ impl App {
         workers::finish_ordered(Duration::from_secs(3));
         let size = self.ui().window().size().to_logical(self.scale());
         self.settings.window = (size.width, size.height);
+        if let Some(h) = self.hwnd
+            && let Some(p) = win::placement(h)
+        {
+            self.settings.place = Some(p);
+        }
         self.settings.save();
         self.save_queue();
         self.player.engine.stop();

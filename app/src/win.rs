@@ -485,3 +485,77 @@ pub fn paste_text(hwnd: HWND) -> Option<String> {
         text
     }
 }
+
+// ---- window placement --------------------------------------------------------------------------
+
+/// Where the window was, in screen pixels: its restored (not maximized) rectangle, and whether
+/// it was maximized.
+pub fn placement(hwnd: HWND) -> Option<(i32, i32, i32, i32, bool)> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowPlacement, SW_SHOWMAXIMIZED, WINDOWPLACEMENT,
+    };
+    let mut wp = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetWindowPlacement(hwnd, &mut wp) }.ok()?;
+    // The restored rectangle is in work-area coordinates of the window's monitor.
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let mon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY) };
+    let _ = unsafe { GetMonitorInfoW(mon, &mut mi) };
+    let (dx, dy) = (
+        mi.rcWork.left - mi.rcMonitor.left,
+        mi.rcWork.top - mi.rcMonitor.top,
+    );
+    let r = wp.rcNormalPosition;
+    Some((
+        r.left + dx,
+        r.top + dy,
+        r.right - r.left,
+        r.bottom - r.top,
+        wp.showCmd == SW_SHOWMAXIMIZED.0 as u32,
+    ))
+}
+
+/// Puts the window back where [`placement`] found it, inside the work area of the nearest
+/// monitor (smaller if it no longer fits, as on a smaller screen or at a larger scale).
+pub fn place(hwnd: HWND, x: i32, y: i32, w: i32, h: i32, maximized: bool) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SW_MAXIMIZE, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindow,
+    };
+    let want = RECT {
+        left: x,
+        top: y,
+        right: x + w,
+        bottom: y + h,
+    };
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let mon = unsafe { MonitorFromRect(&want, MONITOR_DEFAULTTONEAREST) };
+    if !unsafe { GetMonitorInfoW(mon, &mut mi) }.as_bool() {
+        return;
+    }
+    let work = mi.rcWork;
+    let w = w.min(work.right - work.left).max(200);
+    let h = h.min(work.bottom - work.top).max(200);
+    let x = x.clamp(work.left, work.right - w);
+    let y = y.clamp(work.top, work.bottom - h);
+    unsafe {
+        let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        if maximized {
+            let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+        }
+    }
+}

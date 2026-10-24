@@ -14,8 +14,10 @@ pub struct Settings {
     pub eq: EqSettings,
     /// "Flat", "Bass", "Vocal", "Treble", or empty for custom.
     pub eq_preset: String,
-    /// Logical pixels.
+    /// Logical pixels: the size a first start (or one without `place`) opens at.
     pub window: (f32, f32),
+    /// Where the window was: x, y, width, height in screen pixels, and maximized.
+    pub place: Option<(i32, i32, i32, i32, bool)>,
     pub sidebar_collapsed: bool,
     pub panel_open: bool,
     pub panel_tab: i32,
@@ -35,6 +37,7 @@ impl Default for Settings {
             eq: EqSettings::default(),
             eq_preset: "Flat".into(),
             window: (1280.0, 800.0),
+            place: None,
             sidebar_collapsed: false,
             panel_open: false,
             panel_tab: 1,
