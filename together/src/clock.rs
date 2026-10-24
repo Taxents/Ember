@@ -49,7 +49,7 @@ const FIT_MIN_SPAN_US: f64 = 60_000_000.0;
 /// Real clocks drift by at most tens of ppm; anything bigger is noise.
 const MAX_SLOPE: f64 = 200e-6;
 /// Round trips longer than this are useless and dropped.
-const MAX_RTT_US: u64 = 5_000_000;
+pub(crate) const MAX_RTT_US: u64 = 5_000_000;
 
 #[derive(Clone, Copy, Debug)]
 struct Sample {

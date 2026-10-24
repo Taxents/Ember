@@ -87,6 +87,14 @@ pub fn track(st: &Station) -> Track {
     }
 }
 
+/// A station's track from what's known of it here (lists seen, favourites, recents).
+pub fn known_station(id: &str) -> Option<Track> {
+    let c = radio::channel_of(id)?;
+    let st = seen().get(c).cloned();
+    let st = st.or_else(|| store().station(c).cloned())?;
+    Some(track(&st))
+}
+
 /// The station behind a track (from the lists seen, else from the track itself).
 pub fn station_of(t: &Track) -> Option<Station> {
     let channel = radio::channel_of(&t.video_id)?;

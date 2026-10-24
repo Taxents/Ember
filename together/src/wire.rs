@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const ALPN: &[u8] = b"ember/together/1";
 /// Bumped when the frame contents change incompatibly (the ALPN covers framing).
-pub(crate) const PROTO: u32 = 1;
+/// 2: the host pings guests itself; queue requests carry ids and a queue version.
+pub(crate) const PROTO: u32 = 2;
 
 /// Internal control message (JSON).
 pub(crate) const F_CTRL: u8 = 0;
@@ -19,8 +20,17 @@ pub(crate) const F_RAW: u8 = 2;
 /// Clock ping/pong carried on the stream when datagrams are unavailable.
 pub(crate) const F_CLOCK: u8 = 3;
 
-/// Upper bound on a frame payload; a bigger length means a broken peer.
+/// Upper bound on a host -> guest frame payload; a bigger length means a broken peer.
 pub(crate) const MAX_FRAME: usize = 8 * 1024 * 1024;
+/// Upper bound on control and clock frames, and on anything before the handshake.
+pub(crate) const MAX_CTRL: usize = 4 * 1024;
+/// Upper bound on a guest's message (about 2,000 queued songs).
+pub(crate) const MAX_UP: usize = 256 * 1024;
+
+/// How large a frame of `kind` a guest may send the host.
+pub(crate) fn max_up(kind: u8) -> usize {
+    if kind == F_MSG { MAX_UP } else { MAX_CTRL }
+}
 
 /// QUIC application close codes.
 pub(crate) mod close {
@@ -30,6 +40,8 @@ pub(crate) mod close {
     pub(crate) const FULL: u32 = 3;
     pub(crate) const TOO_SLOW: u32 = 4;
     pub(crate) const PROTOCOL: u32 = 5;
+    /// The link dropped (only sent by the test hook that simulates it); the guest rejoins.
+    pub(crate) const LINK_LOST: u32 = 6;
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -51,8 +63,15 @@ pub(crate) fn control_frame(c: &Control) -> Bytes {
     frame(F_CTRL, &serde_json::to_vec(c).unwrap_or_default())
 }
 
-/// Reads one frame. `Ok(None)` when the peer finished the stream cleanly.
-pub(crate) async fn read_frame(recv: &mut RecvStream) -> Result<Option<(u8, Vec<u8>)>, String> {
+/// How [`read_frame`]'s error for an oversized frame starts.
+pub(crate) const TOO_LARGE: &str = "frame too large";
+
+/// Reads one frame no bigger than `max(kind)`. `Ok(None)` when the peer finished the stream
+/// cleanly. A bigger length is refused before any of its payload is read.
+pub(crate) async fn read_frame(
+    recv: &mut RecvStream,
+    max: impl Fn(u8) -> usize,
+) -> Result<Option<(u8, Vec<u8>)>, String> {
     let mut header = [0u8; 5];
     match recv.read_exact(&mut header).await {
         Ok(()) => {}
@@ -60,8 +79,8 @@ pub(crate) async fn read_frame(recv: &mut RecvStream) -> Result<Option<(u8, Vec<
         Err(e) => return Err(e.to_string()),
     }
     let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if len > MAX_FRAME {
-        return Err(format!("frame too large ({len} bytes)"));
+    if len > max(header[0]).min(MAX_FRAME) {
+        return Err(format!("{TOO_LARGE} ({len} bytes, kind {})", header[0]));
     }
     let mut payload = vec![0u8; len];
     recv.read_exact(&mut payload)
@@ -70,7 +89,8 @@ pub(crate) async fn read_frame(recv: &mut RecvStream) -> Result<Option<(u8, Vec<
     Ok(Some((header[0], payload)))
 }
 
-/// Ping: `'P' t1 guest_rtt` (guest_rtt 0 = unknown).
+/// Ping: `'P' t1 guest_rtt` (guest_rtt 0 = unknown; the host ignores it and measures the
+/// round trip itself, see [`host_ping`]).
 pub(crate) fn ping(t1: u64, guest_rtt: u64) -> Bytes {
     let mut b = BytesMut::with_capacity(17);
     b.put_u8(b'P');
@@ -103,10 +123,43 @@ pub(crate) fn parse_pong(b: &[u8]) -> Option<(u64, u64, u64)> {
     Some((le(&b[1..9]), le(&b[9..17]), le(&b[17..25])))
 }
 
+/// The host's own ping: `'H' t` (host clock). The guest sends it straight back as an
+/// [`echo`], so the host measures each guest's round trip without trusting it.
+pub(crate) fn host_ping(t: u64) -> Bytes {
+    let mut b = BytesMut::with_capacity(9);
+    b.put_u8(b'H');
+    b.put_u64_le(t);
+    b.freeze()
+}
+
+/// The guest's answer to a [`host_ping`]: `'E' t`.
+pub(crate) fn echo(t: u64) -> Bytes {
+    let mut b = BytesMut::with_capacity(9);
+    b.put_u8(b'E');
+    b.put_u64_le(t);
+    b.freeze()
+}
+
+/// `t` of a `kind` (`b'H'` or `b'E'`) message.
+pub(crate) fn parse_stamp(kind: u8, b: &[u8]) -> Option<u64> {
+    (b.len() == 9 && b[0] == kind).then(|| le(&b[1..9]))
+}
+
 fn le(b: &[u8]) -> u64 {
     let mut a = [0u8; 8];
     a.copy_from_slice(b);
     u64::from_le_bytes(a)
+}
+
+/// How long to wait between clock pings, `since` the link came up: every 250 ms for the first
+/// 3 s (so the clock is ready quickly), then every second.
+pub(crate) fn ping_every(since: std::time::Duration) -> std::time::Duration {
+    use std::time::Duration;
+    if since < Duration::from_secs(3) {
+        Duration::from_millis(250)
+    } else {
+        Duration::from_secs(1)
+    }
 }
 
 /// Keeps display names printable and short.
@@ -130,6 +183,18 @@ mod tests {
         assert_eq!(parse_pong(&pong(3, 4, u64::MAX)), Some((3, 4, u64::MAX)));
         assert_eq!(parse_ping(&pong(3, 4, 5)), None);
         assert_eq!(parse_pong(b"Qshort"), None);
+        assert_eq!(parse_stamp(b'H', &host_ping(7)), Some(7));
+        assert_eq!(parse_stamp(b'E', &echo(9)), Some(9));
+        assert_eq!(parse_stamp(b'E', &host_ping(9)), None);
+        assert_eq!(parse_stamp(b'H', &ping(1, 2)), None);
+    }
+
+    #[test]
+    fn frame_limits() {
+        assert_eq!(max_up(F_MSG), MAX_UP);
+        assert_eq!(max_up(F_CTRL), MAX_CTRL);
+        assert_eq!(max_up(F_CLOCK), MAX_CTRL);
+        assert_eq!(max_up(F_RAW), MAX_CTRL);
     }
 
     #[test]

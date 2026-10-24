@@ -348,7 +348,9 @@ export global Ui {
 
     // Listen Along: friends join a host's session and hear the same music in sync.
     in-out property <bool> together-open; // the popover
-    in property <int> together-state; // 0 off, 1 connecting/starting, 2 hosting, 3 listening
+    // 0 off, 1 connecting/starting, 2 hosting, 3 listening, 4 listening but the link dropped
+    // (rejoining by itself; still playing)
+    in property <int> together-state;
     in property <string> together-code; // hosting: the invite code
     in property <string> together-host; // listening: the host's name
     // Everyone in the session, host first, already worded by Rust ("Sam (host)").
@@ -3180,7 +3182,7 @@ component TogetherPanel inherits Rectangle {
 
             Text {
                 text: Ui.together-state == 2 ? "You're hosting"
-                    : Ui.together-state == 3 ? "Listening along with " + Ui.together-host : "Listen Along";
+                    : Ui.together-state == 3 || Ui.together-state == 4 ? "Listening along with " + Ui.together-host : "Listen Along";
                 color: Theme.ivory;
                 font-size: 15px;
                 font-weight: 700;
@@ -3331,6 +3333,41 @@ component TogetherPanel inherits Rectangle {
 
             TogetherButton {
                 text: "Cancel";
+                clicked => {
+                    Ui.together-leave();
+                }
+            }
+        }
+
+        // Listening, but the link dropped: it rejoins by itself (the music plays on meanwhile).
+        if Ui.together-state == 4: HorizontalLayout {
+            spacing: 12px;
+            HorizontalLayout {
+                spacing: 4px;
+                alignment: center;
+                for d in [0, 1, 2]: Rectangle {
+                    width: 6px;
+                    height: 6px;
+                    y: (28px - 6px) / 2;
+                    border-radius: 3px;
+                    background: Theme.amber;
+                    opacity: 0.3 + 0.7 * abs(sin((animation-tick() / 1ms * 0.24 - d * 60) * 1deg));
+                }
+            }
+
+            Text {
+                text: "Reconnecting to " + Ui.together-host + "…";
+                color: Theme.beige;
+                font-size: 13px;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+
+            Rectangle { }
+
+            TogetherButton {
+                text: "Leave";
+                danger: true;
                 clicked => {
                     Ui.together-leave();
                 }

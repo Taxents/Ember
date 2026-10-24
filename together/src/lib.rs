@@ -13,9 +13,15 @@
 //! samples plus a drift slope, see [`Guest::host_to_local_us`]. Both sides
 //! timestamp with [`now_us`].
 //!
+//! The host measures each guest's round trip itself (its own pings, echoed by
+//! the guest), so a guest can't make everyone's starts wait on a made-up delay.
+//!
 //! Everything public is synchronous and thread-safe. Each session runs its own
 //! small tokio runtime (2 worker threads) which lives exactly as long as the
-//! [`Host`] / [`Guest`]. Events are delivered on crossbeam channels.
+//! [`Host`] / [`Guest`]. Events are delivered on bounded crossbeam channels
+//! ([`EVENTS`]): when nobody drains them, reading from the network waits, so a
+//! peer that floods messages is held back by QUIC flow control instead of
+//! filling memory.
 
 mod clock;
 mod guest;
@@ -28,6 +34,9 @@ use std::time::{Duration, Instant};
 
 pub use guest::{Guest, GuestEvent};
 pub use host::{Host, HostEvent, MAX_GUESTS};
+
+/// Events queued per session before reading from the network waits for them to be taken.
+pub const EVENTS: usize = 1024;
 
 /// Identifies a guest within one hosted session (1, 2, 3, ...; never reused
 /// within the session). Not the iroh key.
@@ -48,6 +57,39 @@ pub fn now_us() -> u64 {
 /// The [`Instant`] for a [`now_us`] value (inverse of [`now_us`]).
 pub fn to_instant(local_us: u64) -> Instant {
     epoch() + Duration::from_micros(local_us)
+}
+
+/// Queues an event, waiting while the channel is full (see [`EVENTS`]) unless the session is
+/// stopping or nobody listens any more. Inside the session's runtime the wait doesn't hold up
+/// its other tasks.
+pub(crate) fn deliver<E>(
+    tx: &crossbeam_channel::Sender<E>,
+    e: E,
+    stop: &tokio::sync::watch::Receiver<bool>,
+) {
+    let e = match tx.try_send(e) {
+        Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => return,
+        Err(crossbeam_channel::TrySendError::Full(e)) => e,
+    };
+    let send = move || {
+        let mut e = e;
+        loop {
+            match tx.send_timeout(e, Duration::from_millis(50)) {
+                Ok(()) | Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return,
+                Err(crossbeam_channel::SendTimeoutError::Timeout(back)) => {
+                    if *stop.borrow() {
+                        return;
+                    }
+                    e = back;
+                }
+            }
+        }
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(send);
+    } else {
+        send();
+    }
 }
 
 /// Errors returned synchronously by [`Host::start`] and [`Guest::join`].

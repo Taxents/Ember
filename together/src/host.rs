@@ -1,11 +1,11 @@
 //! The hosting side: accepts guests, fans messages out, answers clock pings.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
@@ -13,9 +13,10 @@ use iroh::Endpoint;
 use iroh::endpoint::{Connection, Incoming, RecvStream, SendStream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::timeout;
 
+use crate::clock::MAX_RTT_US;
 use crate::net::{self, Net, Session};
 use crate::wire::{self, Control, F_CLOCK, F_CTRL, F_MSG, F_RAW, close};
 use crate::{Error, PeerId, now_us};
@@ -25,6 +26,12 @@ pub const MAX_GUESTS: usize = 10;
 /// Frames queued per guest before it is considered too slow and dropped.
 const QUEUE: usize = 2048;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Connections allowed to be between accepting and their `Hello` at once; more are refused.
+const MAX_HANDSHAKES: usize = 8;
+/// Round trips the host's estimate is the median of.
+const RTT_SAMPLES: usize = 8;
+/// Pings awaiting their echo; an echo of anything else is ignored.
+const RTT_PENDING: usize = 16;
 
 /// Something that happened in a hosted session.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,8 +50,52 @@ pub enum HostEvent<Up> {
 
 struct Peer {
     tx: mpsc::Sender<Bytes>,
-    rtt_us: Arc<AtomicU64>,
+    rtt: Arc<Rtt>,
     conn: Connection,
+}
+
+/// The host's own measure of one guest's round trip: its pings ([`wire::host_ping`]) and their
+/// echoes, timed on the host's clock. Nothing the guest says about its delay is trusted; the
+/// most it can do is answer slowly, and a round trip counts as at most [`MAX_RTT_US`].
+#[derive(Default)]
+struct Rtt {
+    m: Mutex<RttState>,
+    /// Median of the recent round trips, µs (0: none yet).
+    us: AtomicU64,
+}
+
+#[derive(Default)]
+struct RttState {
+    pending: VecDeque<u64>,
+    recent: VecDeque<u64>,
+}
+
+impl Rtt {
+    fn sent(&self, t: u64) {
+        if let Ok(mut m) = self.m.lock() {
+            if m.pending.len() == RTT_PENDING {
+                m.pending.pop_front();
+            }
+            m.pending.push_back(t);
+        }
+    }
+
+    fn echoed(&self, t: u64, now: u64) {
+        let Ok(mut m) = self.m.lock() else { return };
+        // Only pings sent and not yet answered count (each once).
+        let Some(i) = m.pending.iter().position(|&p| p == t) else {
+            return;
+        };
+        m.pending.drain(..=i);
+        if m.recent.len() == RTT_SAMPLES {
+            m.recent.pop_front();
+        }
+        m.recent
+            .push_back(now.saturating_sub(t).clamp(1, MAX_RTT_US));
+        let mut v: Vec<u64> = m.recent.iter().copied().collect();
+        v.sort_unstable();
+        self.us.store(v[v.len() / 2], Ordering::Relaxed);
+    }
 }
 
 struct Shared<Up> {
@@ -52,11 +103,22 @@ struct Shared<Up> {
     peers: Mutex<HashMap<PeerId, Peer>>,
     next_id: AtomicU64,
     events: Sender<HostEvent<Up>>,
+    stop: watch::Receiver<bool>,
+    /// Test hook: connections are refused until then (see [`Host::drop_link`]).
+    refuse_until: Mutex<Option<Instant>>,
 }
 
 impl<Up> Shared<Up> {
     fn emit(&self, e: HostEvent<Up>) {
-        let _ = self.events.send(e);
+        crate::deliver(&self.events, e, &self.stop);
+    }
+
+    fn refusing(&self) -> bool {
+        self.refuse_until
+            .lock()
+            .ok()
+            .and_then(|r| *r)
+            .is_some_and(|t| Instant::now() < t)
     }
 
     /// Removes a peer and closes its connection; its task then reports `Left`.
@@ -167,12 +229,14 @@ where
         } else {
             None
         };
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crossbeam_channel::bounded(crate::EVENTS);
         let shared = Arc::new(Shared {
             name: wire::clean_name(name),
             peers: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             events: tx,
+            stop: stop.clone(),
+            refuse_until: Mutex::new(None),
         });
         let handle = session
             .handle()
@@ -251,11 +315,11 @@ where
         self.inner.shared.push_all(wire::frame(F_RAW, bytes));
     }
 
-    /// The guest's latest filtered round trip in microseconds (median of its
-    /// recent clock pings), or None before it reported one.
+    /// The round trip to the guest in microseconds, as the host measured it (median of its
+    /// last 8 pings, each counted as at most 5 s), or None before the first echo.
     pub fn rtt_us(&self, peer: PeerId) -> Option<u64> {
         let peers = self.inner.shared.peers.lock().ok()?;
-        match peers.get(&peer)?.rtt_us.load(Ordering::Relaxed) {
+        match peers.get(&peer)?.rtt.us.load(Ordering::Relaxed) {
             0 => None,
             v => Some(v),
         }
@@ -265,6 +329,18 @@ where
     /// A [`HostEvent::Left`] follows.
     pub fn kick(&self, peer: PeerId) {
         self.inner.shared.drop_peer(peer, close::KICKED, b"removed");
+    }
+
+    /// Test hook: the guest's link drops as if the network went away, and nobody can connect
+    /// for `refuse_for`. The guest sees a lost connection and rejoins by itself.
+    #[doc(hidden)]
+    pub fn drop_link(&self, peer: PeerId, refuse_for: Duration) {
+        if let Ok(mut r) = self.inner.shared.refuse_until.lock() {
+            *r = Some(Instant::now() + refuse_for);
+        }
+        self.inner
+            .shared
+            .drop_peer(peer, close::LINK_LOST, b"link lost");
     }
 
     /// Ends the session for everyone, waiting up to ~1.5 s for the close to be
@@ -312,13 +388,27 @@ async fn accept_loop<Up: DeserializeOwned + Send + 'static>(
             }
         });
     }
+    let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
     loop {
-        tokio::select! {
+        let inc = tokio::select! {
             _ = stopped(&mut stop) => break,
             inc = ep.accept() => match inc {
-                Some(inc) => { tokio::spawn(serve_guest(inc, shared.clone(), stop.clone())); }
+                Some(inc) => inc,
                 None => break,
             },
+        };
+        if shared.refusing() {
+            inc.refuse();
+            continue;
+        }
+        match handshakes.clone().try_acquire_owned() {
+            Ok(permit) => {
+                tokio::spawn(serve_guest(inc, shared.clone(), stop.clone(), permit));
+            }
+            Err(_) => {
+                log::info!("together: too many connections handshaking, refusing one");
+                inc.refuse();
+            }
         }
     }
     let peers: Vec<Peer> = shared
@@ -337,6 +427,7 @@ async fn serve_guest<Up: DeserializeOwned + Send + 'static>(
     inc: Incoming,
     shared: Arc<Shared<Up>>,
     mut stop: watch::Receiver<bool>,
+    handshaking: OwnedSemaphorePermit,
 ) {
     let conn = match timeout(HANDSHAKE_TIMEOUT, inc).await {
         Ok(Ok(c)) => c,
@@ -353,7 +444,8 @@ async fn serve_guest<Up: DeserializeOwned + Send + 'static>(
             return;
         }
     };
-    let name = match timeout(HANDSHAKE_TIMEOUT, wire::read_frame(&mut recv)).await {
+    let hello = wire::read_frame(&mut recv, |_| wire::MAX_CTRL);
+    let name = match timeout(HANDSHAKE_TIMEOUT, hello).await {
         Ok(Ok(Some((F_CTRL, p)))) => match serde_json::from_slice::<Control>(&p) {
             Ok(Control::Hello { proto, name }) if proto == wire::PROTO => wire::clean_name(&name),
             _ => {
@@ -366,12 +458,13 @@ async fn serve_guest<Up: DeserializeOwned + Send + 'static>(
             return;
         }
     };
+    drop(handshaking);
 
     let (tx, rx) = mpsc::channel::<Bytes>(QUEUE);
     let _ = tx.try_send(wire::control_frame(&Control::Welcome {
         name: shared.name.clone(),
     }));
-    let rtt = Arc::new(AtomicU64::new(0));
+    let rtt = Arc::new(Rtt::default());
     let peer = {
         let Ok(mut peers) = shared.peers.lock() else {
             return;
@@ -387,7 +480,7 @@ async fn serve_guest<Up: DeserializeOwned + Send + 'static>(
             id,
             Peer {
                 tx: tx.clone(),
-                rtt_us: rtt.clone(),
+                rtt: rtt.clone(),
                 conn: conn.clone(),
             },
         );
@@ -400,6 +493,7 @@ async fn serve_guest<Up: DeserializeOwned + Send + 'static>(
     let ended = tokio::select! {
         r = read_guest(&mut recv, peer, &shared, &tx, &rtt) => r,
         _ = answer_datagrams(&conn, &tx, &rtt) => Ok(()),
+        _ = ping_guest(&conn, &tx, &rtt) => Ok(()),
         _ = stopped(&mut stop) => return,
     };
     if let Err(code) = ended {
@@ -439,11 +533,15 @@ async fn read_guest<Up: DeserializeOwned>(
     peer: PeerId,
     shared: &Shared<Up>,
     tx: &mpsc::Sender<Bytes>,
-    rtt: &AtomicU64,
+    rtt: &Rtt,
 ) -> Result<(), u32> {
     loop {
-        match wire::read_frame(recv).await {
+        match wire::read_frame(recv, wire::max_up).await {
             Ok(None) => return Ok(()),
+            Err(e) if e.starts_with(wire::TOO_LARGE) => {
+                log::warn!("together: guest {peer}: {e}");
+                return Err(close::PROTOCOL);
+            }
             Err(e) => {
                 log::debug!("together: guest {peer} stream ended: {e}");
                 return Ok(());
@@ -456,12 +554,8 @@ async fn read_guest<Up: DeserializeOwned>(
                 }
             },
             Ok(Some((F_CLOCK, p))) => {
-                let t2 = now_us();
-                if let Some((t1, guest_rtt)) = wire::parse_ping(&p) {
-                    if guest_rtt > 0 {
-                        rtt.store(guest_rtt, Ordering::Relaxed);
-                    }
-                    let _ = tx.try_send(wire::frame(F_CLOCK, &wire::pong(t1, t2, now_us())));
+                if let Some(pong) = on_clock(&p, rtt) {
+                    let _ = tx.try_send(wire::frame(F_CLOCK, &pong));
                 }
             }
             Ok(Some((F_CTRL, _))) => {}
@@ -473,9 +567,39 @@ async fn read_guest<Up: DeserializeOwned>(
     }
 }
 
+/// A clock message from a guest: its ping gets the pong returned here; the echo of one of
+/// ours is a round trip measured.
+fn on_clock(p: &[u8], rtt: &Rtt) -> Option<Bytes> {
+    let t2 = now_us();
+    if let Some((t1, _guest_rtt)) = wire::parse_ping(p) {
+        return Some(wire::pong(t1, t2, now_us()));
+    }
+    if let Some(t) = wire::parse_stamp(b'E', p) {
+        rtt.echoed(t, t2);
+    }
+    None
+}
+
+/// Pings the guest (on the same schedule as its own pings) so the host knows the round trip
+/// without asking. Never returns.
+async fn ping_guest(conn: &Connection, tx: &mpsc::Sender<Bytes>, rtt: &Rtt) {
+    let start = Instant::now();
+    loop {
+        let t = now_us();
+        rtt.sent(t);
+        let p = wire::host_ping(t);
+        let dgram_ok = conn.max_datagram_size().is_some_and(|m| m >= p.len())
+            && conn.send_datagram(p.clone()).is_ok();
+        if !dgram_ok {
+            let _ = tx.try_send(wire::frame(F_CLOCK, &p));
+        }
+        tokio::time::sleep(wire::ping_every(start.elapsed())).await;
+    }
+}
+
 /// Answers clock pings arriving as datagrams. Never returns while the
 /// connection is alive (pends if datagrams are unsupported).
-async fn answer_datagrams(conn: &Connection, tx: &mpsc::Sender<Bytes>, rtt: &AtomicU64) {
+async fn answer_datagrams(conn: &Connection, tx: &mpsc::Sender<Bytes>, rtt: &Rtt) {
     loop {
         let d = match conn.read_datagram().await {
             Ok(d) => d,
@@ -487,16 +611,36 @@ async fn answer_datagrams(conn: &Connection, tx: &mpsc::Sender<Bytes>, rtt: &Ato
                 return;
             }
         };
-        let t2 = now_us();
-        let Some((t1, guest_rtt)) = wire::parse_ping(&d) else {
+        let Some(p) = on_clock(&d, rtt) else {
             continue;
         };
-        if guest_rtt > 0 {
-            rtt.store(guest_rtt, Ordering::Relaxed);
-        }
-        let p = wire::pong(t1, t2, now_us());
         if conn.send_datagram(p.clone()).is_err() {
             let _ = tx.try_send(wire::frame(F_CLOCK, &p));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtt_counts_only_its_own_pings() {
+        let r = Rtt::default();
+        r.echoed(5, 10); // never sent
+        assert_eq!(r.us.load(Ordering::Relaxed), 0);
+        r.sent(100);
+        r.sent(200);
+        r.echoed(200, 1_200);
+        assert_eq!(r.us.load(Ordering::Relaxed), 1_000);
+        r.echoed(100, 50_000); // older than one already answered: gone
+        r.echoed(200, 9_000); // answered twice
+        assert_eq!(r.us.load(Ordering::Relaxed), 1_000);
+        // A guest that answers very late counts as at most MAX_RTT_US.
+        for i in 0..RTT_SAMPLES as u64 {
+            r.sent(1_000 + i);
+            r.echoed(1_000 + i, u64::MAX);
+        }
+        assert_eq!(r.us.load(Ordering::Relaxed), MAX_RTT_US);
     }
 }
