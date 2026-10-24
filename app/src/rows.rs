@@ -214,6 +214,11 @@ impl PageRows {
         self.relayout();
     }
 
+    /// How far down the view starts.
+    pub fn scroll(&self) -> f32 {
+        self.0.state.borrow().scroll
+    }
+
     /// The page scrolled: `top` is how far down the view starts.
     pub fn scrolled(&self, top: f32) {
         self.0.state.borrow_mut().scroll = top.max(0.0);

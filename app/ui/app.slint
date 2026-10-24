@@ -272,6 +272,10 @@ export global Ui {
     in property <length> page-height;
     in property <int> page-count;
     in property <int> page-serial;
+    // Where a page opened by Back/Forward was left: read when the page is new, and again
+    // when `scroll-serial` moves (its rows came after it opened).
+    in property <float> page-scroll;
+    in property <int> scroll-serial;
     callback page-metrics(length, length, length, length); // banner height, grid card width, view height, view width
     callback page-scrolled(length); // how far down the view starts
     callback row-measured(int, length); // a row sized by its content (a song's details)
@@ -2164,9 +2168,16 @@ component PageView inherits Rectangle {
     changed view-w => {
         Ui.page-metrics(root.banner-h, root.grid-card, root.view-h, root.view-w);
     }
-    // A new page starts at the top.
+    // A new page starts at the top, or where Back/Forward left it.
     changed serial => {
-        list.content-y = 0;
+        root.scroll-back();
+    }
+    property <int> scroll-serial: Ui.scroll-serial;
+    changed scroll-serial => {
+        root.scroll-back();
+    }
+    function scroll-back() {
+        list.content-y = -min(Ui.page-scroll * 1px, max(0px, list.content-height - list.height));
     }
     // An opened music video: once its panel shows, glide down to centre it in the view, and
     // keep it there while the page fills in, until you scroll yourself or leave the page.

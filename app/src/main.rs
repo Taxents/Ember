@@ -136,6 +136,10 @@ struct App {
     autoplay: Option<Autoplay>,
 
     history: Vec<Route>,
+    /// Where each page in `history` was scrolled to when it was left, and where the one being
+    /// opened by Back/Forward goes back to once its rows are in.
+    scrolls: HashMap<usize, f32>,
+    scroll_wanted: Option<f32>,
     at: usize,
     /// Bumped on every navigation, so late results for an old page are dropped.
     generation: u64,
@@ -294,6 +298,8 @@ fn main() {
         images: Images::new(),
         known: HashMap::new(),
         history: Vec::new(),
+        scrolls: HashMap::new(),
+        scroll_wanted: None,
         at: 0,
         generation: 0,
         art_index: HashMap::new(),
@@ -821,7 +827,10 @@ impl App {
         }
         if !self.history.is_empty() {
             self.history.truncate(self.at + 1);
+            self.scrolls.retain(|&k, _| k < self.at);
+            self.scrolls.insert(self.at, self.page_rows.scroll());
         }
+        self.scroll_wanted = None;
         self.history.push(r);
         self.at = self.history.len() - 1;
         self.load_page();
@@ -849,7 +858,9 @@ impl App {
     fn go(&mut self, d: i32) {
         let to = self.at as i32 + d;
         if to >= 0 && (to as usize) < self.history.len() {
+            self.scrolls.insert(self.at, self.page_rows.scroll());
             self.at = to as usize;
+            self.scroll_wanted = self.scrolls.get(&self.at).copied();
             self.load_page();
         }
     }
@@ -864,7 +875,9 @@ impl App {
         self.menu = None;
         self.ui().global::<Ui>().set_menu_open(false);
         let from = self.opened_from.take();
+        let scroll = self.scroll_wanted.take();
         self.clear_rows();
+        self.ui().global::<Ui>().set_page_scroll(0.0);
         g_serial_bump(&self.ui());
         self.video_sync();
         let ui = self.ui();
@@ -913,8 +926,18 @@ impl App {
             .map(|(l, _)| l.clone());
         let again = cached.is_some();
         match cached {
-            Some(l) => self.page_loaded(generation, Ok(l)),
-            None => self.show_skeleton(&r, from),
+            Some(l) => {
+                self.page_loaded(generation, Ok(l));
+                // The new page's first layout reads it (see PageView's `changed serial`).
+                if let Some(y) = scroll {
+                    self.ui().global::<Ui>().set_page_scroll(y);
+                    self.page_rows.scrolled(y);
+                }
+            }
+            None => {
+                self.show_skeleton(&r, from);
+                self.scroll_wanted = scroll;
+            }
         }
         let client = self.client.clone();
         let hidden = self.settings.hidden_playlists.clone();
@@ -955,8 +978,6 @@ impl App {
         self.extended = false;
     }
 
-    /// A page was fetched: kept for next time, and shown, unless what's shown is it already
-    /// (`again`: it was shown from what was kept).
     /// Song details pile up over a long session: past 5,000, keep only what the queue needs.
     fn trim_caches(&mut self) {
         const MOST: usize = 5000;
@@ -973,6 +994,8 @@ impl App {
         }
     }
 
+    /// A page was fetched: kept for next time, and shown, unless what's shown is it already
+    /// (`again`: it was shown from what was kept).
     fn page_arrived(
         &mut self,
         generation: u64,
@@ -1002,6 +1025,9 @@ impl App {
             let Ok(l) = &res else {
                 return;
             };
+            // Shown again where it's scrolled to, not from the top under a view still down the
+            // page (R4).
+            let keep = self.page_rows.scroll();
             // Feeds differ every time they're asked for: what's shown stays until next time.
             // Your own pages are shown as they are now, where you are on them.
             let feed = matches!(
@@ -1016,7 +1042,23 @@ impl App {
             if feed || self.extended || before == Some(pages::signature(l)) {
                 return;
             }
+            self.show_arrived(generation, res);
+            self.page_rows.scrolled(keep);
+            return;
         }
+        let ok = res.is_ok();
+        self.show_arrived(generation, res);
+        // Back/Forward to a page that had to be fetched: where it was left, now its rows are in.
+        if let Some(y) = self.scroll_wanted.take().filter(|_| ok) {
+            let ui = self.ui();
+            let g = ui.global::<Ui>();
+            g.set_page_scroll(y);
+            g.set_scroll_serial(g.get_scroll_serial().wrapping_add(1));
+            self.page_rows.scrolled(y);
+        }
+    }
+
+    fn show_arrived(&mut self, generation: u64, res: music_core::Result<Loaded>) {
         self.clear_rows();
         let ui = self.ui();
         let g = ui.global::<Ui>();
