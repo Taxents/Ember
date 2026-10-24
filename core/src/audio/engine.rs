@@ -835,6 +835,10 @@ impl Worker {
     fn flush(&mut self) {
         self.shared.flushes.fetch_add(1, Ordering::Relaxed);
         {
+            // Marks go before `played` jumps, under the lock readers take: nobody sees the old
+            // track run on through the dropped audio.
+            let mut tl = self.timeline.lock().unwrap();
+            tl.marks.clear();
             let mut c = self.consumer.lock().unwrap();
             let n = c.slots();
             if let Ok(chunk) = c.read_chunk(n) {
@@ -849,7 +853,6 @@ impl Worker {
         self.shared.clear_gate();
         self.gate_id = None;
         self.cue_wait = None;
-        self.timeline.lock().unwrap().marks.clear();
         self.shared.expecting.store(false, Ordering::Relaxed);
     }
 
@@ -1495,6 +1498,36 @@ mod tests {
         assert_eq!(r.position().map(|p| p.ms), Some(1500));
         r.play_out(100);
         assert_eq!(r.position().map(|p| p.ms), Some(1600));
+    }
+
+    #[test]
+    fn a_seek_never_shows_the_old_place_running_on() {
+        let mut r = Rig::new();
+        r.cmd(Cmd::Play("a".into()));
+        r.play_out(100);
+        r.cmd(Cmd::Seek(1000));
+        let (shared, timeline) = (r.w.shared.clone(), r.w.timeline.clone());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut worst = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some(p) = position(&shared, &timeline) {
+                        worst = worst.max(p.ms);
+                    }
+                }
+                worst
+            })
+        };
+        // Each seek drops most of a second of queued audio.
+        for _ in 0..300 {
+            r.consume(10);
+            r.cmd(Cmd::Seek(1000));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let worst = reader.join().unwrap();
+        assert!(worst <= 1010, "position jumped to {worst} ms");
     }
 
     #[test]
