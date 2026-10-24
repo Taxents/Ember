@@ -130,7 +130,7 @@ pub struct Output {
 }
 
 /// The default device's mix format: (rate, channels).
-pub fn device_format() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
+pub fn device_format() -> Result<Format> {
     let host = cpal::default_host();
     let dev = host
         .default_output_device()
@@ -138,7 +138,61 @@ pub fn device_format() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
     let cfg = dev
         .default_output_config()
         .map_err(|e| Error::Device(e.to_string()))?;
-    Ok((dev, cfg))
+    if pcm(cfg.sample_format()) {
+        return Ok(Format::Usable(dev, cfg));
+    }
+    // A default we can't render (DSD): any PCM format the device also takes.
+    let ranges = dev
+        .supported_output_configs()
+        .map_err(|e| Error::Device(e.to_string()))?
+        .collect();
+    Ok(match pick(&cfg, ranges) {
+        Some(c) => {
+            log::info!(
+                "output: default format {} isn't PCM, using {}",
+                cfg.sample_format(),
+                c.sample_format()
+            );
+            Format::Usable(dev, c)
+        }
+        None => Format::Unsupported(format!(
+            "the output device offers no PCM format (its default is {})",
+            cfg.sample_format()
+        )),
+    })
+}
+
+/// What the default output device can be opened with.
+pub enum Format {
+    Usable(cpal::Device, cpal::SupportedStreamConfig),
+    /// Nothing we can render: trying again won't help.
+    Unsupported(String),
+}
+
+/// Formats [`build`] renders: every PCM one (not DSD).
+fn pcm(f: SampleFormat) -> bool {
+    use SampleFormat::*;
+    matches!(
+        f,
+        I8 | I16 | I24 | I32 | I64 | U8 | U16 | U24 | U32 | U64 | F32 | F64
+    )
+}
+
+/// The best PCM config among `ranges`, at the default's rate when one takes it.
+fn pick(
+    default: &cpal::SupportedStreamConfig,
+    ranges: Vec<cpal::SupportedStreamConfigRange>,
+) -> Option<cpal::SupportedStreamConfig> {
+    let rate = default.sample_rate();
+    let mut ranges: Vec<_> = ranges
+        .into_iter()
+        .filter(|r| pcm(r.sample_format()))
+        .collect();
+    ranges.sort_by(|a, b| b.cmp_default_heuristics(a));
+    match ranges.iter().position(|r| r.contains_rate(rate)) {
+        Some(i) => Some(ranges.swap_remove(i).with_sample_rate(rate)),
+        None => ranges.into_iter().next().map(|r| r.with_max_sample_rate()),
+    }
 }
 
 impl Output {
@@ -156,8 +210,17 @@ impl Output {
         let config: cpal::StreamConfig = (*cfg).into();
         let stream = match cfg.sample_format() {
             SampleFormat::F32 => build::<f32>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::F64 => build::<f64>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::I8 => build::<i8>(dev, config, rate, shared, ring, on_error),
             SampleFormat::I16 => build::<i16>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::I24 => build::<cpal::I24>(dev, config, rate, shared, ring, on_error),
             SampleFormat::I32 => build::<i32>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::I64 => build::<i64>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::U8 => build::<u8>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::U16 => build::<u16>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::U24 => build::<cpal::U24>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::U32 => build::<u32>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::U64 => build::<u64>(dev, config, rate, shared, ring, on_error),
             f => return Err(Error::Device(format!("unsupported sample format {f}"))),
         }?;
         Ok(Output {
@@ -718,6 +781,34 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn a_dsd_default_falls_back_to_pcm_at_its_rate() {
+        use cpal::{SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange};
+        let any = SupportedBufferSize::Unknown;
+        let range = |f, lo, hi| SupportedStreamConfigRange::new(2, lo, hi, any, f);
+        let default = SupportedStreamConfig::new(2, 88200, any, SampleFormat::DsdU8);
+        // Prefers the same rate over a better format at another one.
+        let got = pick(
+            &default,
+            vec![
+                range(SampleFormat::DsdU8, 88200, 88200),
+                range(SampleFormat::F32, 48000, 48000),
+                range(SampleFormat::I24, 44100, 192000),
+            ],
+        )
+        .unwrap();
+        assert_eq!(got.sample_format(), SampleFormat::I24);
+        assert_eq!(got.sample_rate(), 88200);
+        // No range at that rate: the best one.
+        let got = pick(&default, vec![range(SampleFormat::U8, 8000, 8000)]).unwrap();
+        assert_eq!(
+            (got.sample_format(), got.sample_rate()),
+            (SampleFormat::U8, 8000)
+        );
+        // Nothing PCM at all.
+        assert!(pick(&default, vec![range(SampleFormat::DsdU16, 88200, 88200)]).is_none());
     }
 
     #[test]

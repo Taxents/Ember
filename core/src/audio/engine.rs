@@ -11,7 +11,7 @@
 //! says when. Nothing is corrected while a song plays.
 
 use super::clock;
-use super::output::{self, HOLD, Output, Shared, SharedConsumer};
+use super::output::{self, Format, HOLD, Output, Shared, SharedConsumer};
 use super::resample::Resampler;
 use super::source::{self, Source};
 use super::stream::{Cancel, HttpStream};
@@ -71,6 +71,9 @@ pub enum Event {
     },
     /// The output device changed or failed.
     Device(String),
+    /// The output device can't play anything we can render (only DSD, say). Said once; the next
+    /// play tries again.
+    DeviceUnsupported(String),
     /// A bug in the engine: what was playing is dropped, and the engine carries on (the next
     /// `play` works as usual).
     EngineError(String),
@@ -528,6 +531,8 @@ struct Worker {
     load_serial: u64,
     /// Outputs opened so far; the current one is number `outputs`.
     outputs: u64,
+    /// The device takes no format we render: why. Reopening waits for a play until it's gone.
+    unsupported: Option<String>,
     finished_sent: bool,
     idle_since: Option<Instant>,
     /// The output must be (re)opened at this time (device changed or lost, or none yet).
@@ -579,6 +584,7 @@ impl Worker {
             play_load: None,
             load_serial: 0,
             outputs: 0,
+            unsupported: None,
             finished_sent: true,
             idle_since: Some(Instant::now()),
             reopen_at: None,
@@ -603,9 +609,16 @@ impl Worker {
     /// old stream is gone: ring, timeline and position stay as they were.
     fn open_output(&mut self) -> Result<bool> {
         self.output = None;
+        self.unsupported = None;
         let dev = match self.null_output {
             true => None,
-            false => Some(output::device_format()?),
+            false => match output::device_format()? {
+                Format::Usable(dev, cfg) => Some((dev, cfg)),
+                Format::Unsupported(why) => {
+                    self.unsupported = Some(why.clone());
+                    return Err(Error::Device(why));
+                }
+            },
         };
         let rate = dev.as_ref().map_or(NULL_RATE, |(_, cfg)| cfg.sample_rate());
         let cap = ((rate as f64 * RING_SECONDS) as usize) * CH;
@@ -687,9 +700,11 @@ impl Worker {
             Cmd::Quit => return false,
             Cmd::Play(id) => {
                 self.pending = None;
+                self.retry_unsupported();
                 self.play(id);
             }
             Cmd::Cue { id, ms, when } => {
+                self.retry_unsupported();
                 self.shared.paused.store(false, Ordering::Relaxed);
                 self.pending = Some((ms, when));
                 self.play(id);
@@ -1242,9 +1257,24 @@ impl Worker {
     }
 
     fn reopen_failed(&mut self) {
+        if let Some(why) = &self.unsupported {
+            // Trying again won't help: say so once, and wait for a play (the default device
+            // may have changed by then).
+            self.reopen_at = None;
+            let _ = self.events.send(Event::DeviceUnsupported(why.clone()));
+            return;
+        }
         self.reopen_failures += 1;
         let wait = (REOPEN_RETRY * self.reopen_failures).min(REOPEN_RETRY_MAX);
         self.reopen_at = Some(Instant::now() + wait);
+    }
+
+    /// A play after [`Event::DeviceUnsupported`]: try the (perhaps different) device again.
+    fn retry_unsupported(&mut self) {
+        if self.unsupported.take().is_some() {
+            self.reopen_failures = 0;
+            self.reopen_at = Some(Instant::now());
+        }
     }
 
     /// Reopens on the current default device and carries on where we were: same track and
@@ -1754,6 +1784,21 @@ mod tests {
         assert_eq!(r.events(), ["started a", "started b"]);
         assert_eq!(r.loads(), ["a", "b"]);
         assert!(r.cancelled.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unsupported_device_is_reported_once_and_retried_on_play() {
+        let mut r = Rig::new();
+        r.w.unsupported = Some("DSD only".into());
+        r.w.reopen_failed();
+        assert!(r.w.reopen_at.is_none());
+        assert_eq!(
+            r.events(),
+            [format!("{:?}", Event::DeviceUnsupported("DSD only".into()))]
+        );
+        assert!(r.w.handle(Cmd::Play("a".into())));
+        assert!(r.w.unsupported.is_none());
+        assert!(r.w.reopen_at.is_some());
     }
 
     #[test]
