@@ -16,6 +16,10 @@ struct Jobs {
 struct Pool {
     jobs: Mutex<Jobs>,
     ready: Condvar,
+    /// Jobs asked for and not yet done, and the signal when one ends (see [`finish_ordered`]).
+    /// Never locked together with `jobs`.
+    pending: Mutex<usize>,
+    ended: Condvar,
     /// First in, first out (changes to your account, which must land in the order made).
     fifo: bool,
 }
@@ -25,6 +29,8 @@ impl Pool {
         let q = Arc::new(Pool {
             jobs: Mutex::new(Jobs::default()),
             ready: Condvar::new(),
+            pending: Mutex::new(0),
+            ended: Condvar::new(),
             fifo,
         });
         for i in 0..threads {
@@ -49,6 +55,8 @@ impl Pool {
                             }
                         };
                         job();
+                        *q.pending.lock().unwrap() -= 1;
+                        q.ended.notify_all();
                     }
                 })
                 .expect("spawn worker");
@@ -57,6 +65,7 @@ impl Pool {
     }
 
     fn push(&self, job: Job, urgent: bool) {
+        *self.pending.lock().unwrap() += 1;
         let mut jobs = self.jobs.lock().unwrap();
         if urgent {
             jobs.urgent.push(job);
@@ -104,6 +113,21 @@ pub fn run_ordered<T: Send + 'static>(
         }),
         false,
     );
+}
+
+/// Waits (up to `limit`) for the account changes asked for to be sent: quitting mustn't lose one.
+pub fn finish_ordered(limit: std::time::Duration) {
+    let q = ordered();
+    let until = std::time::Instant::now() + limit;
+    let mut pending = q.pending.lock().unwrap();
+    while *pending > 0 {
+        let now = std::time::Instant::now();
+        if now >= until {
+            log::warn!("quitting with account changes unsent");
+            return;
+        }
+        pending = q.ended.wait_timeout(pending, until - now).unwrap().0;
+    }
 }
 
 /// [`spawn`], in order with [`run_ordered`].

@@ -203,6 +203,15 @@ export global Ui {
     callback forward();
     callback search(string);
 
+    // The toast above the player bar: its message ("" when none), its action's label ("" for
+    // none), and a count that changes with each new one.
+    in property <string> toast-text;
+    in property <string> toast-action;
+    in property <int> toast-serial;
+    callback toast-act();
+    callback toast-dismiss();
+    callback toast-hover(bool);
+
     // Account
     in property <bool> signed-in;
     in property <bool> signing-in;
@@ -3790,6 +3799,72 @@ component NowPlayingBar inherits Rectangle {
 
 // ---- window ---------------------------------------------------------------------------------
 
+// A short message over the bottom of the page, with maybe one action and a close button.
+component ToastView inherits Rectangle {
+    height: 44px;
+    width: min(row.preferred-width + 24px, 560px);
+    border-radius: 10px;
+    background: #2A1E1AF2;
+    border-width: 1px;
+    border-color: #F1E5D21A;
+    drop-shadow-blur: 18px;
+    drop-shadow-color: #00000080;
+    accessible-role: text;
+    accessible-label: Ui.toast-text;
+    hover := TouchArea {
+        changed has-hover => {
+            Ui.toast-hover(self.has-hover);
+        }
+    }
+    row := HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 6px;
+        spacing: 8px;
+        alignment: start;
+        Text {
+            text: Ui.toast-text;
+            color: Theme.ivory;
+            font-size: 13px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if Ui.toast-action != "": Rectangle {
+            width: action.preferred-width + 16px;
+            accessible-role: button;
+            accessible-label: Ui.toast-action;
+            accessible-action-default => {
+                Ui.toast-act();
+            }
+            act-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    Ui.toast-act();
+                }
+            }
+            action := Text {
+                text: Ui.toast-action;
+                color: act-ta.has-hover ? Theme.ivory : Theme.amber;
+                font-size: 13px;
+                font-weight: 600;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            IconButton {
+                icon: "close";
+                size: 28px;
+                icon-size: 14px;
+                tooltip: "Dismiss";
+                clicked => {
+                    Ui.toast-dismiss();
+                }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Ember";
     icon: @image-url("../icons/ember-256.png");
@@ -3825,6 +3900,10 @@ export component AppWindow inherits Window {
                 return accept;
             }
             if (e.text == Key.Escape) {
+                if (Ui.toast-text != "" && !Ui.menu-open) {
+                    Ui.toast-dismiss();
+                    return accept;
+                }
                 if (Ui.menu-open) {
                     Ui.menu-open = false;
                     return accept;
@@ -3918,6 +3997,11 @@ export component AppWindow inherits Window {
 
         bar := NowPlayingBar {
             y: parent.height - self.height;
+        }
+
+        if Ui.toast-text != "": ToastView {
+            x: sidebar-w + (parent.width - sidebar-w - panel-w - self.width) / 2;
+            y: parent.height - bar.height - self.height - 16px;
         }
 
         if Ui.eq-open: TouchArea {

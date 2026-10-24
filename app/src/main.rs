@@ -10,6 +10,7 @@ mod pages;
 mod radio;
 mod rows;
 mod settings;
+mod toast;
 mod update;
 mod video;
 mod win;
@@ -223,6 +224,7 @@ struct App {
     /// Listen Along, while in a session.
     together: Option<listen::Session>,
     together_timer: Timer,
+    toast: toast::Toast,
 }
 
 thread_local! {
@@ -321,6 +323,7 @@ fn main() {
         plays_timer: Timer::default(),
         metrics: None,
         metrics_timer: Timer::default(),
+        toast: Default::default(),
     };
     APP.with(|a| *a.borrow_mut() = Some(app));
 
@@ -362,6 +365,7 @@ fn forward_engine_events() {
 /// Connects every UI callback to the app.
 fn wire(ui: &AppWindow) {
     let g = ui.global::<Ui>();
+    toast::wire(&g);
     g.on_navigate(|kind, id, title| {
         with(|a| {
             a.navigate(Route {
@@ -745,6 +749,9 @@ impl App {
     }
 
     fn shutdown(&mut self) {
+        // A change waiting on its toast's Undo goes through.
+        self.close_toast();
+        workers::finish_ordered(Duration::from_secs(3));
         let size = self.ui().window().size().to_logical(self.scale());
         self.settings.window = (size.width, size.height);
         self.settings.save();
@@ -2339,6 +2346,9 @@ impl App {
     }
 
     fn on_engine(&mut self, e: Event) {
+        // A failure is shown only for the song meant to be heard, not a preload.
+        let failed_now =
+            matches!(&e, Event::Failed { id, .. } if self.player.current() == Some(id.as_str()));
         self.player.on_event(&e);
         self.together_engine(&e);
         match &e {
@@ -2376,7 +2386,22 @@ impl App {
                 }
             }
             Event::Finished => self.tick(),
-            Event::Failed { id, error } => log::warn!("{id}: {error}"),
+            Event::Failed { id, error, .. } => {
+                log::warn!("{id}: {error}");
+                if failed_now && !matches!(error, music_core::Error::Cancelled) {
+                    let title = self.known.get(id).map_or("this song", |t| t.title.as_str());
+                    let msg = match error {
+                        music_core::Error::Unavailable(_) => {
+                            format!("'{title}' isn't available to play")
+                        }
+                        music_core::Error::Net(_) => {
+                            format!("Couldn't play '{title}': check your connection")
+                        }
+                        _ => format!("Couldn't play '{title}'"),
+                    };
+                    self.notify(msg);
+                }
+            }
             Event::Device(d) => log::info!("device: {d}"),
             Event::Title { id, title } => {
                 self.together_title(id, title);
