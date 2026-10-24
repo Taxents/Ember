@@ -1,10 +1,13 @@
 //! What Radio remembers between runs (`radio.json` in the config folder): favourite stations,
 //! recently played ones, recent searches and places visited. Kept locally, never on YouTube.
+//!
+//! A file that can't be read is set aside as `radio.json.bad-<unix time>` rather than written
+//! over, and [`Store::damaged`] says so, for the app to tell the user.
 
 use super::{PlaceRef, Station};
 use crate::paths::{config_dir, write_atomic};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const FILE: &str = "radio.json";
 const RECENT: usize = 30;
@@ -27,6 +30,22 @@ pub struct RadioData {
 pub struct Store {
     path: PathBuf,
     pub data: RadioData,
+    /// The file couldn't be read when loading (it was set aside).
+    pub damaged: bool,
+}
+
+/// Moves an unreadable file out of the way, to `<name>.bad-<unix time>` next to it.
+fn set_aside(path: &Path) -> Option<PathBuf> {
+    let mut name = path.file_name()?.to_os_string();
+    name.push(format!(".bad-{}", crate::paths::unix_now()));
+    let to = path.with_file_name(name);
+    match std::fs::rename(path, &to) {
+        Ok(()) => Some(to),
+        Err(e) => {
+            log::warn!("setting {} aside: {e}", path.display());
+            None
+        }
+    }
 }
 
 impl Store {
@@ -35,15 +54,25 @@ impl Store {
     }
 
     pub fn load_at(path: PathBuf) -> Self {
-        let mut data: RadioData = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let mut damaged = false;
+        let mut data: RadioData = match std::fs::read(&path) {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
+                log::warn!("{FILE} can't be read ({e}); setting it aside");
+                set_aside(&path);
+                damaged = true;
+                RadioData::default()
+            }),
+            Err(_) => RadioData::default(),
+        };
         let ok = |s: &Station| super::valid_id(&s.id) && !s.title.is_empty();
         data.favourites.retain(ok);
         data.recent.retain(ok);
         data.visited.retain(|p| super::valid_id(&p.id));
-        Store { path, data }
+        Store {
+            path,
+            data,
+            damaged,
+        }
     }
 
     fn save(&self) {
@@ -192,6 +221,33 @@ mod tests {
         assert_eq!(s.data.recent.len(), 1);
         assert_eq!(s.data.searches, ["Jazz"]);
         assert!(s.data.visited.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sets_an_unreadable_file_aside() {
+        let dir = std::env::temp_dir().join(format!("ember-radio-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        let junk = b"{\"favourites\": [ oops";
+        std::fs::write(&path, junk).unwrap();
+        let mut s = Store::load_at(path.clone());
+        assert!(s.damaged);
+        assert!(s.data.favourites.is_empty());
+        assert!(!path.exists());
+        let aside: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(aside.len(), 1);
+        let name = aside[0].file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("radio.json.bad-"), "{name}");
+        assert_eq!(std::fs::read(&aside[0]).unwrap(), junk);
+        // Saving afterwards leaves it alone, and the new file reads fine.
+        s.searched("jazz");
+        assert_eq!(std::fs::read(&aside[0]).unwrap(), junk);
+        assert!(!Store::load_at(path).damaged);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

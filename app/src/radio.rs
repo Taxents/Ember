@@ -35,9 +35,18 @@ const TILES: [u32; 10] = [
 
 fn store() -> MutexGuard<'static, Store> {
     static S: OnceLock<Mutex<Store>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(Store::load()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    S.get_or_init(|| {
+        let s = Store::load();
+        if s.damaged {
+            // Said once the UI gets to it (this may run on any thread, inside anything).
+            let _ = slint::invoke_from_event_loop(|| {
+                crate::with(|a| a.notify("Your radio favourites couldn't be read"));
+            });
+        }
+        Mutex::new(s)
+    })
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Stations seen in lists, by channel id: what a station in the queue is.
@@ -889,6 +898,28 @@ impl App {
     }
 
     /// A station became audible: it goes to the front of the recents.
+    /// The station meant to be heard couldn't be played (or stopped answering): say so, with
+    /// a retry.
+    pub(crate) fn station_failed(&mut self, id: &str, error: &Error) {
+        let msg = match error {
+            Error::Cancelled => return,
+            Error::Net(_) => "Station isn't responding",
+            _ => "This station can't be played right now",
+        };
+        let id = id.to_string();
+        self.notify_with(msg, "Retry", move |a| a.retry_station(&id));
+    }
+
+    fn retry_station(&mut self, id: &str) {
+        let (order, _) = self.player.up_next();
+        let Some(pos) = order.iter().position(|q| *q == id) else {
+            return;
+        };
+        if !self.ask_host(crate::listen::Req::Jump(pos)) {
+            self.player.jump(pos);
+        }
+    }
+
     pub(crate) fn station_started(&mut self, id: &str) {
         if let Some(st) = self.known.get(id).and_then(station_of) {
             store().played(&st);

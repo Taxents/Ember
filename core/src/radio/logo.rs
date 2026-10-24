@@ -2,7 +2,8 @@
 //! community-kept station list), matched by name and country.
 //!
 //! What a lookup found is kept on disk: the logo's bytes as `<channel>.img`, or an empty
-//! `<channel>.none` when there's none, tried again after a fortnight.
+//! `<channel>.none` when the list answered and has none, tried again after a fortnight. A
+//! lookup that couldn't ask (offline, the list down) remembers nothing and is tried next time.
 
 use super::Station;
 use std::path::PathBuf;
@@ -36,25 +37,57 @@ pub fn logo(st: &Station) -> Option<Vec<u8>> {
         return None;
     }
     match find(st) {
-        Some(b) => {
+        Found::Logo(b) => {
             let _ = crate::paths::write_atomic(&img, &b);
             let _ = std::fs::remove_file(&none);
             Some(b)
         }
-        None => {
+        Found::None => {
             let _ = std::fs::write(&none, b"");
             None
         }
+        Found::Unknown => None,
     }
 }
 
-fn find(st: &Station) -> Option<Vec<u8>> {
+/// What a lookup learned.
+#[derive(Debug, PartialEq)]
+enum Found {
+    Logo(Vec<u8>),
+    /// The list answered: it has no logo we can use.
+    None,
+    /// It couldn't be asked (or a logo couldn't be fetched): try again another time.
+    Unknown,
+}
+
+/// What one answer of the list (or its failure) and the fetched favicons add up to.
+fn outcome(answers: &[Option<Vec<Fetched>>]) -> Found {
+    let mut unsure = false;
+    for a in answers {
+        match a {
+            None => unsure = true,
+            Some(fetched) => {
+                for f in fetched {
+                    match f {
+                        Fetched::Image(b) => return Found::Logo(b.clone()),
+                        Fetched::Failed => unsure = true,
+                        Fetched::Unusable => {}
+                    }
+                }
+            }
+        }
+    }
+    if unsure { Found::Unknown } else { Found::None }
+}
+
+fn find(st: &Station) -> Found {
     // Its full name first, then without the frequency ("Urgent FM 105.3" is "Urgent" there).
     let mut names = vec![st.title.clone()];
     let bare = bare(&st.title);
     if !bare.is_empty() && bare != st.title {
         names.push(bare);
     }
+    let mut answers = Vec::new();
     for name in &names {
         let url = format!(
             "{API}?name={}&country={}&order=votes&reverse=true&hidebroken=true&limit=20",
@@ -68,6 +101,7 @@ fn find(st: &Station) -> Option<Vec<u8>> {
             .ok()
             .and_then(|mut r| r.body_mut().read_json::<serde_json::Value>().ok())
         else {
+            answers.push(None);
             continue;
         };
         let want = squash(name);
@@ -87,11 +121,31 @@ fn find(st: &Station) -> Option<Vec<u8>> {
                 }
             }
         }
-        if let Some(b) = favicons.iter().take(3).find_map(|f| fetch(f)) {
-            return Some(b);
+        let mut fetched = Vec::new();
+        for f in favicons.iter().take(3) {
+            let got = fetch(f);
+            let done = matches!(got, Fetched::Image(_));
+            fetched.push(got);
+            if done {
+                break;
+            }
+        }
+        answers.push(Some(fetched));
+        if let Found::Logo(b) = outcome(&answers) {
+            return Found::Logo(b);
         }
     }
-    None
+    outcome(&answers)
+}
+
+/// One favicon fetch.
+#[derive(Debug, PartialEq)]
+enum Fetched {
+    Image(Vec<u8>),
+    /// Answered, but not with an image we can draw (or not at all: 404 and the like).
+    Unusable,
+    /// Couldn't be fetched (network).
+    Failed,
 }
 
 /// A station's name without its frequency and band: "Radio Plus Gent 107.7 FM" → "Radio Plus Gent".
@@ -106,26 +160,36 @@ fn bare(name: &str) -> String {
 }
 
 /// The image at `url`, if it's one we can draw (Wikimedia SVGs come as PNG thumbnails).
-fn fetch(url: &str) -> Option<Vec<u8>> {
+fn fetch(url: &str) -> Fetched {
     let url = wikimedia_png(url).unwrap_or_else(|| url.to_string());
-    let mut r = crate::net::agent()
+    let mut r = match crate::net::agent()
         .get(&url)
         .header("User-Agent", "Ember/1.0")
         .call()
-        .ok()?;
+    {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(_)) => return Fetched::Unusable,
+        Err(_) => return Fetched::Failed,
+    };
     if r.status().as_u16() != 200 {
-        return None;
+        return Fetched::Unusable;
     }
-    let b = r
+    let Ok(b) = r
         .body_mut()
         .with_config()
         .limit(4 * 1024 * 1024)
         .read_to_vec()
-        .ok()?;
+    else {
+        return Fetched::Failed;
+    };
     let png = b.starts_with(b"\x89PNG");
     let jpeg = b.starts_with(b"\xFF\xD8");
     let webp = b.len() > 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP";
-    (png || jpeg || webp).then_some(b)
+    if png || jpeg || webp {
+        Fetched::Image(b)
+    } else {
+        Fetched::Unusable
+    }
 }
 
 /// upload.wikimedia.org/…/commons/0/08/X.svg → the 512px PNG Wikimedia renders of it.
@@ -177,5 +241,28 @@ mod tests {
             )
         );
         assert_eq!(wikimedia_png("https://example.com/a.png"), None);
+    }
+
+    #[test]
+    fn none_is_remembered_only_when_the_list_answered() {
+        use Fetched::*;
+        let logo = || Image(b"\x89PNG".to_vec());
+        assert_eq!(outcome(&[Some(vec![])]), Found::None, "no match");
+        assert_eq!(
+            outcome(&[Some(vec![Unusable])]),
+            Found::None,
+            "a broken favicon"
+        );
+        assert_eq!(outcome(&[None]), Found::Unknown, "couldn't ask");
+        assert_eq!(outcome(&[Some(vec![]), None]), Found::Unknown);
+        assert_eq!(
+            outcome(&[Some(vec![Failed])]),
+            Found::Unknown,
+            "offline mid-way"
+        );
+        assert_eq!(
+            outcome(&[None, Some(vec![Failed, logo()])]),
+            Found::Logo(b"\x89PNG".to_vec())
+        );
     }
 }
