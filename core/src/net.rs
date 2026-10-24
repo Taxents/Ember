@@ -71,3 +71,18 @@ pub fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<Value> {
 pub fn short(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "M12"]
+    fn bodies_have_no_total_time_limit_but_each_read_does() {
+        let c = agent().config();
+        assert_eq!(c.timeouts().recv_body, None);
+        assert_eq!(c.timeout_per_read(), Some(Duration::from_secs(15)));
+        assert_eq!(c.timeouts().connect, Some(Duration::from_secs(10)));
+        assert_eq!(c.timeouts().recv_response, Some(Duration::from_secs(15)));
+    }
+}

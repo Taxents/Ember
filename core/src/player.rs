@@ -1,7 +1,30 @@
 //! The queue on top of the engine: what plays now, what plays next.
 
-use crate::audio::{Engine, Event};
+use crate::audio::{Engine, Event, Position};
 use std::collections::HashSet;
+
+/// What the queue needs from the engine (a recording fake in tests).
+pub trait Playback {
+    fn play(&self, id: &str);
+    fn set_next(&self, id: Option<&str>);
+    fn seek(&self, ms: u64);
+    fn position(&self) -> Option<Position>;
+}
+
+impl Playback for Engine {
+    fn play(&self, id: &str) {
+        Engine::play(self, id)
+    }
+    fn set_next(&self, id: Option<&str>) {
+        Engine::set_next(self, id)
+    }
+    fn seek(&self, ms: u64) {
+        Engine::seek(self, ms)
+    }
+    fn position(&self) -> Option<Position> {
+        Engine::position(self)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Repeat {
@@ -11,8 +34,8 @@ pub enum Repeat {
     One,
 }
 
-pub struct Player {
-    pub engine: Engine,
+pub struct Player<E = Engine> {
+    pub engine: E,
     queue: Vec<String>,
     /// Play order: indices into `queue` (shuffled or not).
     order: Vec<usize>,
@@ -29,8 +52,8 @@ pub struct Player {
     pub follower: bool,
 }
 
-impl Player {
-    pub fn new(engine: Engine) -> Self {
+impl<E: Playback> Player<E> {
+    pub fn new(engine: E) -> Self {
         Player {
             engine,
             queue: Vec::new(),
@@ -314,5 +337,297 @@ impl Player {
         }
         self.order = cur.into_iter().chain(rest).collect();
         self.at = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Error;
+    use std::cell::RefCell;
+
+    /// Records what the queue asks of the engine.
+    #[derive(Default)]
+    struct Fake {
+        played: RefCell<Vec<String>>,
+        next: RefCell<Option<String>>,
+        seeks: RefCell<Vec<u64>>,
+        pos: RefCell<Option<Position>>,
+    }
+
+    impl Playback for Fake {
+        fn play(&self, id: &str) {
+            self.played.borrow_mut().push(id.into());
+        }
+        fn set_next(&self, id: Option<&str>) {
+            *self.next.borrow_mut() = id.map(Into::into);
+        }
+        fn seek(&self, ms: u64) {
+            self.seeks.borrow_mut().push(ms);
+        }
+        fn position(&self) -> Option<Position> {
+            self.pos.borrow().clone()
+        }
+    }
+
+    fn ids(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    fn player(list: &str, start: usize) -> Player<Fake> {
+        let mut p = Player::new(Fake::default());
+        p.play_queue(ids(list), start);
+        p
+    }
+
+    /// The queue as shown: play order, the current one in brackets.
+    fn shown(p: &Player<Fake>) -> String {
+        let (order, at) = p.up_next();
+        order
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                if i == at {
+                    format!("[{id}]")
+                } else {
+                    id.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn played(p: &Player<Fake>) -> String {
+        p.engine.played.borrow().join(" ")
+    }
+
+    fn next(p: &Player<Fake>) -> Option<String> {
+        p.engine.next.borrow().clone()
+    }
+
+    fn at_ms(p: &Player<Fake>, ms: u64) {
+        *p.engine.pos.borrow_mut() = p.current().map(|id| Position {
+            id: id.into(),
+            ms,
+            duration_ms: None,
+            paused: false,
+        });
+    }
+
+    fn started(p: &mut Player<Fake>, id: &str) {
+        p.on_event(&Event::Started {
+            id: id.into(),
+            duration_ms: None,
+        });
+    }
+
+    fn failed(p: &mut Player<Fake>, id: &str) {
+        p.on_event(&Event::Failed {
+            id: id.into(),
+            error: Error::Media("test".into()),
+        });
+    }
+
+    #[test]
+    fn plays_the_chosen_item_and_preloads_the_next() {
+        let mut p = player("a b c", 1);
+        assert_eq!(played(&p), "b");
+        assert_eq!(shown(&p), "a [b] c");
+        // What follows is opened ahead once the track is heard.
+        assert_eq!(next(&p), None);
+        started(&mut p, "b");
+        assert_eq!(next(&p).as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn next_and_previous_walk_the_queue() {
+        let mut p = player("a b c", 0);
+        p.next();
+        p.next();
+        assert_eq!(played(&p), "a b c");
+        assert_eq!(next(&p), None);
+        // The end with repeat off: nothing more.
+        p.next();
+        assert_eq!(played(&p), "a b c");
+        p.previous();
+        assert_eq!(shown(&p), "a [b] c");
+        // More than 3 s in: back to the start of this one.
+        at_ms(&p, 5000);
+        p.previous();
+        assert_eq!(shown(&p), "a [b] c");
+        assert_eq!(*p.engine.seeks.borrow(), [0]);
+    }
+
+    #[test]
+    fn previous_on_the_first_item_restarts_it() {
+        let mut p = player("a b", 0);
+        at_ms(&p, 1000);
+        p.previous();
+        assert_eq!(*p.engine.seeks.borrow(), [0]);
+        assert_eq!(played(&p), "a");
+    }
+
+    #[test]
+    fn repeat_all_wraps_and_repeat_one_preloads_itself() {
+        let mut p = player("a b", 1);
+        assert_eq!(next(&p), None);
+        p.set_repeat(Repeat::All);
+        assert_eq!(next(&p).as_deref(), Some("a"));
+        p.next();
+        assert_eq!(shown(&p), "[a] b");
+        p.previous();
+        assert_eq!(shown(&p), "a [b]");
+        p.set_repeat(Repeat::One);
+        assert_eq!(next(&p).as_deref(), Some("b"));
+        // A skip still moves on.
+        p.next();
+        assert_eq!(shown(&p), "[a] b");
+    }
+
+    #[test]
+    fn shuffle_keeps_the_current_track_and_off_restores_the_order() {
+        let mut p = player("a b c d e f g h", 2);
+        p.set_shuffle(true);
+        let (order, at) = p.up_next();
+        assert_eq!((order[0], at), ("c", 0));
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted.join(" "), "a b c d e f g h");
+        p.next();
+        let cur = p.current().unwrap().to_string();
+        p.set_shuffle(false);
+        assert_eq!(p.current(), Some(cur.as_str()));
+        assert_eq!(p.up_next().0.join(" "), "a b c d e f g h");
+    }
+
+    #[test]
+    fn remove_and_move_keep_the_current_track() {
+        let mut p = player("a b c d", 2);
+        p.remove(0);
+        assert_eq!(shown(&p), "b [c] d");
+        // The current one can't be removed.
+        p.remove(1);
+        assert_eq!(shown(&p), "b [c] d");
+        p.remove(2);
+        assert_eq!(shown(&p), "b [c]");
+        assert_eq!(next(&p), None);
+        p.move_item(1, 0);
+        assert_eq!(shown(&p), "[c] b");
+        assert_eq!(next(&p).as_deref(), Some("b"));
+        assert_eq!(played(&p), "c");
+    }
+
+    #[test]
+    fn insert_next_goes_right_after_the_current_track() {
+        let mut p = player("a b c", 0);
+        p.insert_next(ids("x y"));
+        assert_eq!(shown(&p), "[a] x y b c");
+        assert_eq!(next(&p).as_deref(), Some("x"));
+        p.append(ids("z"));
+        assert_eq!(shown(&p), "[a] x y b c z");
+    }
+
+    #[test]
+    fn a_gapless_hand_over_moves_the_queue_on() {
+        let mut p = player("a b c", 0);
+        started(&mut p, "a");
+        started(&mut p, "b");
+        assert_eq!(shown(&p), "a [b] c");
+        assert_eq!(next(&p).as_deref(), Some("c"));
+        // Nothing new was asked to play: the engine moved on by itself.
+        assert_eq!(played(&p), "a");
+    }
+
+    #[test]
+    fn a_failed_track_is_skipped_and_a_failed_preload_passed_over() {
+        let mut p = player("a b c d", 0);
+        failed(&mut p, "b");
+        assert_eq!(next(&p).as_deref(), Some("c"));
+        failed(&mut p, "a");
+        assert_eq!(shown(&p), "a [b] c d");
+        assert_eq!(played(&p), "a b");
+    }
+
+    #[test]
+    fn a_queue_where_nothing_plays_stops() {
+        let mut p = player("a b", 0);
+        p.set_repeat(Repeat::All);
+        failed(&mut p, "a");
+        failed(&mut p, "b");
+        // Two failures in a queue of two: no endless loop.
+        assert_eq!(played(&p), "a b");
+    }
+
+    #[test]
+    fn the_end_of_the_queue_stays_on_the_last_track() {
+        let mut p = player("a b", 1);
+        failed(&mut p, "b");
+        assert_eq!(shown(&p), "a [b]");
+        assert_eq!(played(&p), "b");
+    }
+
+    #[test]
+    fn nothing_left_after_the_current_track_clears_the_preload() {
+        let mut p = player("a b", 0);
+        started(&mut p, "a");
+        assert_eq!(next(&p).as_deref(), Some("b"));
+        p.remove(1);
+        assert_eq!(next(&p), None);
+    }
+
+    #[test]
+    #[ignore = "M1"]
+    fn edits_survive_shuffle_on_and_off() {
+        let mut p = player("a b c d e", 0);
+        p.remove(2);
+        p.move_item(3, 1);
+        p.insert_next(ids("x"));
+        assert_eq!(shown(&p), "[a] x e b d");
+        p.set_shuffle(true);
+        p.set_shuffle(false);
+        assert_eq!(shown(&p), "[a] x e b d");
+        assert_eq!(p.queue().join(" "), "a x e b d");
+    }
+
+    #[test]
+    #[ignore = "M1"]
+    fn edits_while_shuffled_stay_after_shuffle_off() {
+        let mut p = player("a b c d e f", 0);
+        p.set_shuffle(true);
+        let gone = p.up_next().0[3].to_string();
+        p.remove(3);
+        p.insert_next(ids("x"));
+        assert_eq!(p.up_next().0[1], "x");
+        p.set_shuffle(false);
+        let want: Vec<&str> = ["a", "x", "b", "c", "d", "e", "f"]
+            .into_iter()
+            .filter(|id| *id != gone)
+            .collect();
+        assert_eq!(p.up_next().0, want);
+        assert_eq!(p.queue().len(), 6);
+    }
+
+    #[test]
+    #[ignore = "L1"]
+    fn each_player_shuffles_differently() {
+        let list = "a b c d e f g h i j k l m n o p q r s t";
+        let order = || {
+            let mut p = player(list, 0);
+            p.set_shuffle(true);
+            p.up_next().0.join(" ")
+        };
+        assert_ne!(order(), order());
+    }
+
+    #[test]
+    #[ignore = "L2"]
+    fn previous_after_the_queue_ended_replays_the_last_track() {
+        let mut p = player("a b", 1);
+        started(&mut p, "b");
+        p.on_event(&Event::Finished);
+        // The engine has nothing audible any more.
+        *p.engine.pos.borrow_mut() = None;
+        p.previous();
+        assert_eq!(played(&p), "b b");
     }
 }

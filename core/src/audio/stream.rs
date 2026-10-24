@@ -334,3 +334,74 @@ impl Fetcher {
         Fetch::Done
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::testserver::{self, Behaviour};
+
+    fn open(s: &testserver::Server) -> Result<HttpStream> {
+        HttpStream::open(
+            s.url.clone(),
+            None,
+            Box::new(|| Err(Error::Net("no new URL".into()))),
+        )
+    }
+
+    #[test]
+    fn reads_the_whole_file_while_it_downloads() {
+        let s = testserver::serve(testserver::file(3 << 20), Behaviour::default());
+        let mut st = open(&s).unwrap();
+        assert_eq!(st.len(), 3 << 20);
+        let mut got = Vec::new();
+        st.read_to_end(&mut got).unwrap();
+        assert!(got == *s.data);
+    }
+
+    #[test]
+    fn a_read_far_ahead_moves_the_download_there() {
+        let s = testserver::serve(
+            testserver::file(8 << 20),
+            Behaviour {
+                rate: Some(4 << 20),
+                ..Default::default()
+            },
+        );
+        let mut st = open(&s).unwrap();
+        st.seek(SeekFrom::End(-100)).unwrap();
+        let mut got = vec![0; 100];
+        st.read_exact(&mut got).unwrap();
+        assert_eq!(got, s.data[s.data.len() - 100..]);
+        // Far less than the whole file came down first.
+        assert!(s.sent.load(Ordering::Relaxed) < 4 << 20);
+    }
+
+    #[test]
+    fn a_refused_first_request_fails_the_open() {
+        let s = testserver::serve(
+            testserver::file(1 << 20),
+            Behaviour {
+                drop_after: Some(0),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(open(&s), Err(Error::Net(_))));
+    }
+
+    #[test]
+    #[ignore = "M12"]
+    fn connections_that_drop_but_make_progress_never_give_up() {
+        // Every request after the first ends early, but each one brings two more units.
+        let s = testserver::serve(
+            testserver::file(3 << 20),
+            Behaviour {
+                drop_after: Some(600_000),
+                ..Default::default()
+            },
+        );
+        let mut st = open(&s).unwrap();
+        let mut got = Vec::new();
+        st.read_to_end(&mut got).unwrap();
+        assert!(got == *s.data);
+    }
+}

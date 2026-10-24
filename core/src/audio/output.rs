@@ -114,7 +114,8 @@ impl Shared {
 pub type SharedConsumer = Arc<Mutex<Consumer<f32>>>;
 
 pub struct Output {
-    stream: cpal::Stream,
+    /// `None`: a null output that plays nothing (tests drive the ring themselves).
+    stream: Option<cpal::Stream>,
     pub rate: u32,
     pub channels: usize,
     running: bool,
@@ -152,16 +153,26 @@ impl Output {
             f => return Err(Error::Device(format!("unsupported sample format {f}"))),
         }?;
         Ok(Output {
-            stream,
+            stream: Some(stream),
             rate,
             channels,
             running: false,
         })
     }
 
+    /// An output without a device: nothing reads the ring.
+    pub fn null(rate: u32) -> Self {
+        Output {
+            stream: None,
+            rate,
+            channels: CH,
+            running: false,
+        }
+    }
+
     pub fn start(&mut self) {
         if !self.running {
-            if let Err(e) = self.stream.play() {
+            if let Some(Err(e)) = self.stream.as_ref().map(|s| s.play()) {
                 log::error!("output start failed: {e}");
             }
             self.running = true;
@@ -171,7 +182,9 @@ impl Output {
     /// Stops the device stream entirely (0% CPU while idle or paused).
     pub fn stop(&mut self) {
         if self.running {
-            let _ = self.stream.pause();
+            if let Some(s) = &self.stream {
+                let _ = s.pause();
+            }
             self.running = false;
         }
     }

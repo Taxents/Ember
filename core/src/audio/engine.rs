@@ -42,6 +42,11 @@ const REOPEN_SETTLE: Duration = Duration::from_millis(150);
 /// Retry a failed reopen after this long, times the attempts so far (capped).
 const REOPEN_RETRY: Duration = Duration::from_millis(500);
 const REOPEN_RETRY_MAX: Duration = Duration::from_secs(5);
+/// The rate of an output without a device (tests).
+const NULL_RATE: u32 = 48000;
+
+/// Opens a track: resolve, connect, parse headers ([`load`]; a fake one in tests).
+type Loader = Arc<dyn Fn(&str, Sender<Event>) -> Result<Loaded> + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -146,12 +151,21 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(resolver: Arc<Resolver>) -> Result<Self> {
+        Self::with_loader(
+            Arc::new(move |id, events| load(&resolver, id, events)),
+            false,
+        )
+    }
+
+    /// An engine opening tracks with `loader`; `null_output`: no device at all.
+    fn with_loader(loader: Loader, null_output: bool) -> Result<Self> {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
         let shared = Shared::new();
         let timeline = Arc::new(Mutex::new(Timeline::default()));
         let mut w = Worker::new(
-            resolver,
+            loader,
+            null_output,
             shared.clone(),
             timeline.clone(),
             cmd_tx.clone(),
@@ -401,7 +415,9 @@ impl Track {
 }
 
 struct Worker {
-    resolver: Arc<Resolver>,
+    loader: Loader,
+    /// No device: the ring is read by whoever drives the worker (tests).
+    null_output: bool,
     shared: Arc<Shared>,
     timeline: Arc<Mutex<Timeline>>,
     cmd_tx: Sender<Cmd>,
@@ -445,7 +461,8 @@ struct Worker {
 
 impl Worker {
     fn new(
-        resolver: Arc<Resolver>,
+        loader: Loader,
+        null_output: bool,
         shared: Arc<Shared>,
         timeline: Arc<Mutex<Timeline>>,
         cmd_tx: Sender<Cmd>,
@@ -453,7 +470,8 @@ impl Worker {
     ) -> Result<Self> {
         let (p, c) = RingBuffer::new(2);
         let mut w = Worker {
-            resolver,
+            loader,
+            null_output,
             shared,
             timeline,
             cmd_tx,
@@ -496,8 +514,11 @@ impl Worker {
     /// old stream is gone: ring, timeline and position stay as they were.
     fn open_output(&mut self) -> Result<bool> {
         self.output = None;
-        let (dev, cfg) = output::device_format()?;
-        let rate = cfg.sample_rate();
+        let dev = match self.null_output {
+            true => None,
+            false => Some(output::device_format()?),
+        };
+        let rate = dev.as_ref().map_or(NULL_RATE, |(_, cfg)| cfg.sample_rate());
         let cap = ((rate as f64 * RING_SECONDS) as usize) * CH;
         // Same rate: the queued audio is still right for the new device, so keep it (seamless).
         let keep = rate == self.dev_rate && self.producer.buffer().capacity() == cap;
@@ -508,15 +529,14 @@ impl Worker {
             (Some(p), Arc::new(Mutex::new(c)))
         };
         let tx = self.cmd_tx.clone();
-        let out = Output::open(
-            &dev,
-            &cfg,
-            self.shared.clone(),
-            consumer.clone(),
-            move |e| {
-                let _ = tx.send(Cmd::DeviceError(e.to_string()));
-            },
-        )?;
+        let out = match &dev {
+            Some((dev, cfg)) => {
+                Output::open(dev, cfg, self.shared.clone(), consumer.clone(), move |e| {
+                    let _ = tx.send(Cmd::DeviceError(e.to_string()));
+                })?
+            }
+            None => Output::null(rate),
+        };
         if let Some(p) = producer {
             self.producer = p;
             self.consumer = consumer;
@@ -531,7 +551,7 @@ impl Worker {
             "output: {} Hz, {} ch, format {}{}",
             rate,
             out.channels,
-            cfg.sample_format(),
+            dev.map_or("none".into(), |(_, cfg)| cfg.sample_format().to_string()),
             if keep { "" } else { " (ring rebuilt)" }
         );
         self.output = Some(out);
@@ -790,12 +810,12 @@ impl Worker {
     fn spawn_load(&mut self, id: String, next: bool) {
         let generation = self.generation;
         let tx = self.cmd_tx.clone();
-        let resolver = self.resolver.clone();
+        let loader = self.loader.clone();
         let events = self.events.clone();
         std::thread::Builder::new()
             .name("track-load".into())
             .spawn(move || {
-                let result = load(&resolver, &id, events);
+                let result = loader(&id, events);
                 let _ = tx.send(Cmd::Loaded {
                     generation,
                     next,
@@ -1172,4 +1192,364 @@ fn load(resolver: &Arc<Resolver>, id: &str, events: Sender<Event>) -> Result<Loa
         duration_ms: info.duration_ms,
         src,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    const RATE: u64 = NULL_RATE as u64;
+
+    /// A test track at the null output's rate: `frames` of `level`, breaking where asked.
+    #[derive(Clone)]
+    struct Spec {
+        frames: u64,
+        level: f32,
+        fail_at: Option<u64>,
+        load_error: bool,
+        load_delay: Duration,
+    }
+
+    impl Default for Spec {
+        fn default() -> Self {
+            Spec {
+                frames: 2 * RATE,
+                level: 0.5,
+                fail_at: None,
+                load_error: false,
+                load_delay: Duration::ZERO,
+            }
+        }
+    }
+
+    struct Tone {
+        spec: Spec,
+        pos: u64,
+    }
+
+    impl Source for Tone {
+        fn rate(&self) -> u32 {
+            NULL_RATE
+        }
+        fn total_frames(&self) -> Option<u64> {
+            Some(self.spec.frames)
+        }
+        fn read(&mut self, out: &mut Vec<f32>) -> Result<bool> {
+            if self.spec.fail_at.is_some_and(|f| self.pos >= f) {
+                return Err(Error::Media("broken packet".into()));
+            }
+            let n = 960.min(self.spec.frames - self.pos);
+            out.extend(std::iter::repeat_n(self.spec.level, n as usize * CH));
+            self.pos += n;
+            Ok(self.pos < self.spec.frames)
+        }
+        fn seek(&mut self, frame: u64) -> Result<()> {
+            self.pos = frame;
+            Ok(())
+        }
+    }
+
+    /// A worker without a device or a thread: each step is driven by the test.
+    struct Rig {
+        w: Worker,
+        rx: Receiver<Cmd>,
+        events: Receiver<Event>,
+        specs: Arc<Mutex<HashMap<String, Spec>>>,
+        loads: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Rig {
+        fn new() -> Rig {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let (etx, events) = crossbeam_channel::unbounded();
+            let specs: Arc<Mutex<HashMap<String, Spec>>> = Arc::default();
+            let loads: Arc<Mutex<Vec<String>>> = Arc::default();
+            let loader: Loader = {
+                let (specs, loads) = (specs.clone(), loads.clone());
+                Arc::new(move |id, _| {
+                    loads.lock().unwrap().push(id.into());
+                    let spec = specs.lock().unwrap().get(id).cloned().unwrap_or_default();
+                    std::thread::sleep(spec.load_delay);
+                    if spec.load_error {
+                        return Err(Error::Unavailable("test".into()));
+                    }
+                    Ok(Loaded {
+                        duration_ms: None,
+                        src: Box::new(Tone { spec, pos: 0 }),
+                    })
+                })
+            };
+            let timeline = Arc::new(Mutex::new(Timeline::default()));
+            let w = Worker::new(loader, true, Shared::new(), timeline, tx, etx).unwrap();
+            Rig {
+                w,
+                rx,
+                events,
+                specs,
+                loads,
+            }
+        }
+
+        fn track(&self, id: &str, f: impl FnOnce(&mut Spec)) {
+            f(self.specs.lock().unwrap().entry(id.into()).or_default());
+        }
+
+        fn cmd(&mut self, c: Cmd) {
+            assert!(self.w.handle(c));
+            self.settle();
+        }
+
+        fn loading(&self) -> bool {
+            self.w.loading_play || self.w.loading_next
+        }
+
+        /// Lets the worker catch up: loads in, decoded as far as the ring allows.
+        fn settle(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                while let Ok(c) = self.rx.try_recv() {
+                    self.w.handle(c);
+                }
+                self.w.pump();
+                self.w.announce();
+                if !self.loading() || Instant::now() > deadline {
+                    return;
+                }
+                if let Ok(c) = self.rx.recv_timeout(Duration::from_millis(500)) {
+                    self.w.handle(c);
+                }
+            }
+        }
+
+        /// The device plays `ms` of audio, 10 ms per callback (silence once the ring is dry).
+        fn play_out(&mut self, ms: u64) {
+            for _ in 0..ms / 10 {
+                if !self.w.shared.paused.load(Ordering::Relaxed) {
+                    let mut c = self.w.consumer.lock().unwrap();
+                    let n = (c.slots() / CH).min(RATE as usize / 100);
+                    if let Ok(chunk) = c.read_chunk(n * CH) {
+                        chunk.commit_all();
+                    }
+                    self.w.shared.played.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                self.settle();
+            }
+        }
+
+        fn position(&self) -> Option<Position> {
+            position(&self.w.shared, &self.w.timeline)
+        }
+
+        /// Events since the last call, as short strings.
+        fn events(&self) -> Vec<String> {
+            self.events
+                .try_iter()
+                .map(|e| match e {
+                    Event::Started { id, .. } => format!("started {id}"),
+                    Event::Finished => "finished".into(),
+                    Event::Failed { id, .. } => format!("failed {id}"),
+                    e => format!("{e:?}"),
+                })
+                .collect()
+        }
+
+        fn loads(&self) -> Vec<String> {
+            self.loads.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn a_track_starts_and_finishes() {
+        let mut r = Rig::new();
+        r.cmd(Cmd::Play("a".into()));
+        r.play_out(100);
+        assert_eq!(r.events(), ["started a"]);
+        assert_eq!(r.position().map(|p| p.id), Some("a".into()));
+        r.play_out(2500);
+        assert_eq!(r.events(), ["finished"]);
+    }
+
+    #[test]
+    fn the_next_track_follows_gaplessly() {
+        let mut r = Rig::new();
+        r.track("a", |s| s.frames = RATE + 123);
+        r.cmd(Cmd::Play("a".into()));
+        r.cmd(Cmd::SetNext(Some("b".into())));
+        r.play_out(4000);
+        assert_eq!(r.events(), ["started a", "started b", "finished"]);
+        assert_eq!(r.w.shared.played.load(Ordering::Relaxed), 3 * RATE + 123);
+        assert_eq!(r.loads(), ["a", "b"]);
+    }
+
+    #[test]
+    fn playing_the_preloaded_track_reuses_it() {
+        let mut r = Rig::new();
+        r.cmd(Cmd::Play("a".into()));
+        r.cmd(Cmd::SetNext(Some("b".into())));
+        r.play_out(100);
+        r.cmd(Cmd::Play("b".into()));
+        r.play_out(100);
+        assert_eq!(r.events(), ["started a", "started b"]);
+        assert_eq!(r.loads(), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_track_that_cannot_open_fails() {
+        let mut r = Rig::new();
+        r.track("a", |s| s.load_error = true);
+        r.cmd(Cmd::Play("a".into()));
+        r.play_out(100);
+        assert_eq!(r.events(), ["failed a"]);
+        assert_eq!(r.position(), None);
+    }
+
+    #[test]
+    fn seek_moves_the_position() {
+        let mut r = Rig::new();
+        r.cmd(Cmd::Play("a".into()));
+        r.play_out(100);
+        r.cmd(Cmd::Seek(1500));
+        assert_eq!(r.position().map(|p| p.ms), Some(1500));
+        r.play_out(100);
+        assert_eq!(r.position().map(|p| p.ms), Some(1600));
+    }
+
+    #[test]
+    fn pause_holds_the_position() {
+        let mut r = Rig::new();
+        r.cmd(Cmd::Play("a".into()));
+        r.play_out(200);
+        r.cmd(Cmd::Pause);
+        r.play_out(200);
+        let p = r.position().unwrap();
+        assert_eq!((p.ms, p.paused), (200, true));
+        r.cmd(Cmd::Resume);
+        r.play_out(100);
+        assert_eq!(r.position().map(|p| p.ms), Some(300));
+    }
+
+    /// Raw f32 stereo over an `HttpStream`: reads wait on the download as a decoder's do.
+    struct Raw {
+        s: HttpStream,
+        buf: Vec<u8>,
+    }
+
+    impl Source for Raw {
+        fn rate(&self) -> u32 {
+            NULL_RATE
+        }
+        fn total_frames(&self) -> Option<u64> {
+            Some(self.s.len() / 8)
+        }
+        fn read(&mut self, out: &mut Vec<f32>) -> Result<bool> {
+            use std::io::{Read, Seek};
+            let pos = self.s.stream_position().unwrap();
+            let n = (960 * 8).min(self.s.len() - pos) as usize;
+            self.buf.resize(n, 0);
+            self.s
+                .read_exact(&mut self.buf)
+                .map_err(|e| Error::Net(e.to_string()))?;
+            out.extend(
+                self.buf
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| b[0] as f32 / 1000.0),
+            );
+            Ok(pos + (n as u64) < self.s.len())
+        }
+        fn seek(&mut self, frame: u64) -> Result<()> {
+            use std::io::Seek;
+            self.s.seek(std::io::SeekFrom::Start(frame * 8)).unwrap();
+            Ok(())
+        }
+    }
+
+    /// An engine on its own thread, without a device, playing raw audio from `url`.
+    fn raw_engine(url: String) -> Engine {
+        let loader: Loader = Arc::new(move |_, _| {
+            let s = HttpStream::open(url.clone(), None, Box::new(|| Err(Error::Cancelled)))?;
+            Ok(Loaded {
+                duration_ms: None,
+                src: Box::new(Raw { s, buf: Vec::new() }),
+            })
+        });
+        Engine::with_loader(loader, true).unwrap()
+    }
+
+    /// Waits up to `limit` for `f`.
+    fn within(limit: Duration, f: impl Fn() -> bool) -> bool {
+        let t = Instant::now();
+        while t.elapsed() < limit {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        f()
+    }
+
+    #[test]
+    #[ignore = "H3"]
+    fn a_stalled_download_never_holds_up_commands() {
+        use crate::audio::testserver::{self, Behaviour};
+        // The first unit comes, then nothing: the decoder runs into the stall at once.
+        let server = testserver::serve(
+            testserver::file(4 << 20),
+            Behaviour {
+                stall_after: Some(300_000),
+                ..Default::default()
+            },
+        );
+        let e = raw_engine(server.url.clone());
+        e.play("a");
+        std::thread::sleep(Duration::from_millis(500));
+        e.pause();
+        assert!(within(Duration::from_millis(100), || e
+            .shared
+            .paused
+            .load(Ordering::Relaxed)));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            drop(e);
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    #[ignore = "M2"]
+    fn clearing_the_next_track_drops_a_preloaded_one() {
+        let mut r = Rig::new();
+        r.cmd(Cmd::Play("a".into()));
+        r.cmd(Cmd::SetNext(Some("b".into())));
+        r.play_out(100);
+        assert!(r.w.next.is_some());
+        r.cmd(Cmd::SetNext(None));
+        r.play_out(2500);
+        assert_eq!(r.events(), ["started a", "finished"]);
+    }
+
+    #[test]
+    #[ignore = "L2"]
+    fn nothing_is_audible_after_the_end() {
+        let mut r = Rig::new();
+        r.cmd(Cmd::Play("a".into()));
+        r.play_out(2500);
+        assert_eq!(r.events(), ["started a", "finished"]);
+        assert_eq!(r.position(), None);
+    }
+
+    #[test]
+    #[ignore = "L2"]
+    fn a_seek_while_loading_is_where_it_starts() {
+        let mut r = Rig::new();
+        r.track("a", |s| s.load_delay = Duration::from_millis(100));
+        assert!(r.w.handle(Cmd::Play("a".into())));
+        assert!(r.w.handle(Cmd::Seek(1000)));
+        r.settle();
+        r.play_out(100);
+        assert_eq!(r.position().map(|p| p.ms), Some(1100));
+    }
 }
