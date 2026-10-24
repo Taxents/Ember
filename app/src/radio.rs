@@ -12,7 +12,8 @@
 
 use crate::pages::{Block, Loaded};
 use crate::{App, Card, MenuEntry, MenuTarget, PageKind, Route, RowRef, Ui};
-use music_core::radio::{self, PlaceRef, Section, Station, store::Store};
+use music_core::radio::store::{Damaged, Store};
+use music_core::radio::{self, PlaceRef, Section, Station};
 use music_core::yt::model::{BrowseRef, Item, Link, Named, Shelf, Track};
 use music_core::{Error, Result};
 use slint::{ComponentHandle, Image, Model, Rgba8Pixel, SharedPixelBuffer, VecModel};
@@ -35,9 +36,22 @@ const TILES: [u32; 10] = [
 
 fn store() -> MutexGuard<'static, Store> {
     static S: OnceLock<Mutex<Store>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(Store::load()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    S.get_or_init(|| {
+        let s = Store::load();
+        let said = s.damaged.map(|d| match d {
+            Damaged::SetAside => "Your radio favourites couldn't be read",
+            Damaged::Kept => "Your radio favourites couldn't be read, so changes won't be saved",
+        });
+        if let Some(said) = said {
+            // Said once the UI gets to it (this may run on any thread, inside anything).
+            let _ = slint::invoke_from_event_loop(move || {
+                crate::with(|a| a.notify(said));
+            });
+        }
+        Mutex::new(s)
+    })
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Stations seen in lists, by channel id: what a station in the queue is.
@@ -85,6 +99,14 @@ pub fn track(st: &Station) -> Track {
         }],
         ..Default::default()
     }
+}
+
+/// A station's track from what's known of it here (lists seen, favourites, recents).
+pub fn known_station(id: &str) -> Option<Track> {
+    let c = radio::channel_of(id)?;
+    let st = seen().get(c).cloned();
+    let st = st.or_else(|| store().station(c).cloned())?;
+    Some(track(&st))
 }
 
 /// The station behind a track (from the lists seen, else from the track itself).
@@ -881,6 +903,28 @@ impl App {
     }
 
     /// A station became audible: it goes to the front of the recents.
+    /// The station meant to be heard couldn't be played (or stopped answering): say so, with
+    /// a retry.
+    pub(crate) fn station_failed(&mut self, id: &str, error: &Error) {
+        let msg = match error {
+            Error::Cancelled => return,
+            Error::Net(_) => "Station isn't responding",
+            _ => "This station can't be played right now",
+        };
+        let id = id.to_string();
+        self.notify_with(msg, "Retry", move |a| a.retry_station(&id));
+    }
+
+    fn retry_station(&mut self, id: &str) {
+        let (order, _) = self.player.up_next();
+        let Some(pos) = order.iter().position(|q| *q == id) else {
+            return;
+        };
+        if !self.ask_host(crate::listen::Req::Jump(pos)) {
+            self.player.jump(pos);
+        }
+    }
+
     pub(crate) fn station_started(&mut self, id: &str) {
         if let Some(st) = self.known.get(id).and_then(station_of) {
             store().played(&st);

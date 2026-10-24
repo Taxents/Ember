@@ -12,7 +12,9 @@
 //!
 //! One thread per shown video. It exists only while the picture is on screen: stopping it frees
 //! the decoder, the D3D device and the network source. Frames are read back one at a time,
-//! only when due, so at most one decoded frame waits here.
+//! only when due, so at most one decoded frame waits here. Stopping also cancels the stream
+//! (Media Foundation's reads fail at once); a helper thread waits for the thread to end, so
+//! whoever stops it never does.
 
 use crate::audio::Clock;
 use crate::audio::stream::HttpStream;
@@ -21,6 +23,7 @@ use crate::{Error, Result};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use windows::Win32::Foundation::{E_NOTIMPL, HMODULE, S_FALSE, S_OK, STG_E_INVALIDFUNCTION};
 use windows::Win32::Graphics::Direct3D::*;
@@ -62,10 +65,12 @@ pub enum Note<'a> {
     Failed(Error),
 }
 
-/// Shows one music video's picture while it lives. Dropping it stops the thread, which may
-/// still finish a blocking network read, or hand over one last frame the owner should ignore.
+/// Shows one music video's picture while it lives. Dropping it stops the thread without
+/// waiting for it (it is joined on a helper thread); one still finishing a network read may
+/// hand over one last frame the owner should ignore.
 pub struct VideoPlayer {
     stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl VideoPlayer {
@@ -94,16 +99,29 @@ impl VideoPlayer {
                     sink(Note::Failed(e));
                 }
             });
-        if let Err(e) = spawned {
-            log::warn!("video thread: {e}");
-        }
-        VideoPlayer { stop }
+        let thread = match spawned {
+            Ok(h) => Some(h),
+            Err(e) => {
+                log::warn!("video thread: {e}");
+                None
+            }
+        };
+        VideoPlayer { stop, thread }
     }
 }
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
+        // Also makes the stream's reads fail, so a waiting `ReadSample` returns.
         self.stop.store(true, Ordering::Relaxed);
+        // Dropped on the UI thread: the wait for the thread to end happens elsewhere.
+        if let Some(h) = self.thread.take() {
+            let _ = std::thread::Builder::new()
+                .name("video-join".into())
+                .spawn(move || {
+                    let _ = h.join();
+                });
+        }
     }
 }
 
@@ -138,23 +156,35 @@ fn media(e: windows::core::Error) -> Error {
     Error::Media(format!("{} ({:#010x})", e.message(), e.code().0))
 }
 
+/// Whether opening failed on the stream itself (refused, expired, network), which a fresh URL
+/// may fix, rather than on what it holds (format, decoder), which it won't.
+fn stream_error(e: &Error) -> bool {
+    matches!(e, Error::Net(_) | Error::Unavailable(_))
+}
+
 /// The stream and its decoder: from cache, else after resolving again (an expired URL).
-fn open(id: &str, height: u32, resolver: &Arc<Resolver>) -> Result<(VideoInfo, Decoder)> {
+fn open(
+    id: &str,
+    height: u32,
+    resolver: &Arc<Resolver>,
+    cancel: &Arc<AtomicBool>,
+) -> Result<(VideoInfo, Decoder)> {
     let resolve = || {
         resolver
             .resolve_video(id, height)?
             .ok_or_else(|| Error::Unavailable(format!("{id}: no video format")))
     };
     let info = resolve()?;
-    match Decoder::open(&info, resolver) {
+    match Decoder::open(&info, resolver, cancel) {
         Ok(d) => Ok((info, d)),
-        Err(e) => {
+        Err(e) if stream_error(&e) && !cancel.load(Ordering::Relaxed) => {
             log::info!("video {id}: {e}; resolving again");
             resolver.invalidate_video(id);
             let info = resolve()?;
-            let d = Decoder::open(&info, resolver)?;
+            let d = Decoder::open(&info, resolver, cancel)?;
             Ok((info, d))
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -163,11 +193,11 @@ fn run(
     height: u32,
     resolver: &Arc<Resolver>,
     clock: &Clock,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
     sink: &mut dyn FnMut(Note),
 ) -> Result<()> {
     let _mf = Mf::start()?;
-    let (info, mut dec) = open(id, height, resolver)?;
+    let (info, mut dec) = open(id, height, resolver, stop)?;
     log::info!(
         "video {id}: itag {} {}x{} @{} ({}), starts {} ms in",
         info.itag,
@@ -282,7 +312,7 @@ const STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 const MF_VIDEO_FORMAT_ABGR32: GUID = GUID::from_u128(0x00000020_0000_0010_8000_00aa00389b71);
 
 impl Decoder {
-    fn open(info: &VideoInfo, resolver: &Arc<Resolver>) -> Result<Self> {
+    fn open(info: &VideoInfo, resolver: &Arc<Resolver>, cancel: &Arc<AtomicBool>) -> Result<Self> {
         let r = resolver.clone();
         let (vid, height) = (info.video_id.clone(), info.height);
         let refresh = Box::new(move || {
@@ -298,6 +328,7 @@ impl Decoder {
             inner: Mutex::new(stream),
             len,
             hide: head.edts,
+            cancel: cancel.clone(),
         }
         .into();
         unsafe {
@@ -557,10 +588,15 @@ struct Source {
     len: u64,
     /// Where the edit list's box type is, to read as `free`.
     hide: Option<u64>,
+    /// The player is stopping: reads fail from now on.
+    cancel: Arc<AtomicBool>,
 }
 
 impl ISequentialStream_Impl for Source_Impl {
     fn Read(&self, pv: *mut core::ffi::c_void, cb: u32, pcbread: *mut u32) -> HRESULT {
+        if self.cancel.load(Ordering::Relaxed) {
+            return STG_E_INVALIDFUNCTION;
+        }
         let mut s = self.inner.lock().unwrap();
         let Ok(at) = s.stream_position() else {
             return STG_E_INVALIDFUNCTION;
@@ -569,6 +605,9 @@ impl ISequentialStream_Impl for Source_Impl {
         let out = unsafe { std::slice::from_raw_parts_mut(pv as *mut u8, cb as usize) };
         let mut n = 0;
         while n < out.len() {
+            if self.cancel.load(Ordering::Relaxed) {
+                return STG_E_INVALIDFUNCTION;
+            }
             match s.read(&mut out[n..]) {
                 Ok(0) => break,
                 Ok(k) => n += k,
@@ -580,9 +619,12 @@ impl ISequentialStream_Impl for Source_Impl {
         }
         if let Some(h) = self.hide {
             for (i, b) in b"free".iter().enumerate() {
-                let p = h + i as u64;
-                if p >= at && p < at + n as u64 {
-                    out[(p - at) as usize] = *b;
+                if let Some(k) = h
+                    .checked_add(i as u64)
+                    .and_then(|p| p.checked_sub(at))
+                    .filter(|&k| k < n as u64)
+                {
+                    out[k as usize] = *b;
                 }
             }
         }
@@ -683,20 +725,24 @@ struct Head {
 impl Head {
     fn offset_ms(&self) -> i64 {
         if self.timescale > 0 && self.media_time > 0 {
-            self.media_time * 1000 / self.timescale as i64
+            let ms = i128::from(self.media_time) * 1000 / i128::from(self.timescale);
+            i64::try_from(ms).unwrap_or(0)
         } else {
             0
         }
     }
 }
 
-/// Reads an MP4's `moov` for its first track's edit list and media timescale.
+/// Reads an MP4's `moov` for its first track's edit list and media timescale. A failure to
+/// read the stream comes back as the stream's own error; anything else is a format error.
 fn mp4_head(r: &mut (impl Read + Seek)) -> Result<Head> {
-    let end = r
-        .seek(SeekFrom::End(0))
-        .map_err(|e| Error::Media(format!("mp4: {e}")))?;
+    let err = |e: std::io::Error| match e.get_ref().and_then(|i| i.downcast_ref::<Error>()) {
+        Some(inner) => inner.clone(),
+        None => Error::Media(format!("mp4: {e}")),
+    };
+    let end = r.seek(SeekFrom::End(0)).map_err(err)?;
     let mut head = Head::default();
-    walk(r, 0, end, 0, &mut head).map_err(|e| Error::Media(format!("mp4: {e}")))?;
+    walk(r, 0, end, 0, &mut head).map_err(err)?;
     Ok(head)
 }
 
@@ -709,8 +755,9 @@ fn walk(
     depth: u32,
     h: &mut Head,
 ) -> std::io::Result<()> {
+    let bad = || std::io::Error::other("bad box size");
     let mut at = start;
-    while at + 8 <= end {
+    while at.checked_add(8).is_some_and(|h| h <= end) {
         r.seek(SeekFrom::Start(at))?;
         let mut b = [0u8; 8];
         r.read_exact(&mut b)?;
@@ -720,13 +767,16 @@ fn walk(
             1 => {
                 let mut l = [0u8; 8];
                 r.read_exact(&mut l)?;
-                (at + 16, at + u64::from_be_bytes(l))
+                (
+                    at + 16,
+                    at.checked_add(u64::from_be_bytes(l)).ok_or_else(bad)?,
+                )
             }
             0 => (at + 8, end),
             s => (at + 8, at + s),
         };
-        if box_end <= at || box_end > end {
-            return Err(std::io::Error::other("bad box size"));
+        if box_end <= at || box_end > end || body > box_end {
+            return Err(bad());
         }
         match (&kind, depth) {
             (b"moov", 0) => return walk(r, body, box_end, 1, h),
@@ -835,5 +885,57 @@ mod tests {
         let h = mp4_head(&mut std::io::Cursor::new(&plain)).unwrap();
         assert!(h.edts.is_none());
         assert_eq!(h.offset_ms(), 0);
+    }
+
+    #[test]
+    fn hostile_box_sizes_fail_cleanly() {
+        let ftyp = mp4_box(b"ftyp", b"dash0000");
+        // A 64-bit size that would wrap around.
+        let mut huge = vec![0, 0, 0, 1];
+        huge.extend_from_slice(b"moov");
+        huge.extend_from_slice(&u64::MAX.to_be_bytes());
+        let file = [ftyp.clone(), huge].concat();
+        assert!(matches!(
+            mp4_head(&mut std::io::Cursor::new(&file)),
+            Err(Error::Media(_))
+        ));
+        // A 64-bit size smaller than its own header.
+        let mut tiny = vec![0, 0, 0, 1];
+        tiny.extend_from_slice(b"moov");
+        tiny.extend_from_slice(&9u64.to_be_bytes());
+        let file = [ftyp, tiny, vec![0; 16]].concat();
+        assert!(mp4_head(&mut std::io::Cursor::new(&file)).is_err());
+        // Edit-list and timescale values at their extremes.
+        let h = Head {
+            media_time: i64::MAX,
+            timescale: 1,
+            ..Default::default()
+        };
+        assert_eq!(h.offset_ms(), 0);
+        let h = Head {
+            media_time: i64::MAX,
+            timescale: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(h.offset_ms(), 499);
+    }
+
+    #[test]
+    fn stream_failures_are_told_apart_from_format_ones() {
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(Error::Net("connection reset".into()).into())
+            }
+        }
+        impl Seek for Failing {
+            fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+                Ok(64)
+            }
+        }
+        let e = mp4_head(&mut Failing).unwrap_err();
+        assert!(matches!(e, Error::Net(_)), "{e}");
+        assert!(stream_error(&e));
+        assert!(!stream_error(&Error::Media("no decoder".into())));
     }
 }

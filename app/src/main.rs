@@ -2712,7 +2712,9 @@ impl App {
             Event::Finished => self.tick(),
             Event::Failed { id, error, .. } => {
                 log::warn!("{id}: {error}");
-                if failed_now && !matches!(error, music_core::Error::Cancelled) {
+                if failed_now && radio::is_station(id) {
+                    self.station_failed(id, error);
+                } else if failed_now && !matches!(error, music_core::Error::Cancelled) {
                     let title = self
                         .known
                         .get(id)

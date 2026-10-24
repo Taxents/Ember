@@ -69,6 +69,7 @@ pub(crate) fn guest_close_reason(e: &ConnectionError) -> String {
                 close::FULL => "The session is full",
                 close::TOO_SLOW => "Your connection couldn't keep up with the host",
                 close::PROTOCOL => "The host is using a different version of Ember",
+                close::LINK_LOST => "Lost connection",
                 _ => "The host ended the session",
             }
         }
@@ -77,6 +78,21 @@ pub(crate) fn guest_close_reason(e: &ConnectionError) -> String {
         _ => "Lost connection",
     }
     .to_string()
+}
+
+/// Whether a connection that ended like this is worth dialing again: the link dropped (time
+/// out, reset, network error), not the host ending the session, removing you or refusing you.
+pub(crate) fn rejoinable(e: &ConnectionError) -> bool {
+    match e {
+        ConnectionError::ApplicationClosed(c) => {
+            u32::try_from(c.error_code.into_inner()) == Ok(close::LINK_LOST)
+        }
+        ConnectionError::TimedOut
+        | ConnectionError::Reset
+        | ConnectionError::TransportError(_)
+        | ConnectionError::CidsExhausted => true,
+        _ => false,
+    }
 }
 
 /// Owns the session's runtime and its main task; stopping it signals the task,

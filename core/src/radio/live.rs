@@ -8,7 +8,9 @@
 //! * Drops: the network thread reconnects by itself (same URL first, then a fresh one from
 //!   Radio Garden), with backoff, and gives up after a few failures in a row. Both demuxers
 //!   resync on frame headers, so the decoder just carries on. A connection that goes silent
-//!   without closing is replaced by a watchdog after [`STALL`].
+//!   without closing is replaced by a watchdog after [`STALL`] (and its read gives up after
+//!   [`READ_TIMEOUT`], so its thread ends too). Failures count across all of these; after
+//!   [`RETRIES`] in a row the source ends with [`NOT_RESPONDING`].
 //! * Latency: about 0.75 s is buffered before playback starts, and the pipe holds at most
 //!   [`CAP`] bytes, so a paused station never falls far behind.
 //! * Listen Along: while hosting, every byte the pipe accepts is also tapped; a listener's
@@ -22,6 +24,7 @@ use crate::{Error, Result};
 use crossbeam_channel::Sender;
 use std::collections::VecDeque;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
@@ -40,6 +43,10 @@ pub const MIN_AHEAD: usize = 6 * 1024;
 const READ_MAX: usize = 4 * 1024;
 /// Starved this long: the connection is dead, start another.
 pub const STALL: Duration = Duration::from_secs(12);
+/// A read of the stream that waits this long gives up (the connection went quiet).
+pub const READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Why a station's source ended after it stopped answering.
+pub const NOT_RESPONDING: &str = "the station isn't responding";
 /// Longest wait for audio when opening.
 pub(super) const OPEN_WAIT: Duration = Duration::from_secs(8);
 /// Longest a playing decoder's read waits for the rest of a packet. Reads only start with
@@ -292,17 +299,21 @@ pub struct Conn {
     pub kbps: Option<u32>,
 }
 
-/// No overall or body timeout (the body never ends); connect and response timeouts only.
+/// No overall or body timeout (the body never ends); connect and response timeouts, and one
+/// on each read.
 fn stream_agent() -> &'static ureq::Agent {
     static A: OnceLock<ureq::Agent> = OnceLock::new();
-    A.get_or_init(|| {
-        ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(8)))
-            .timeout_recv_response(Some(Duration::from_secs(8)))
-            .max_idle_connections(0)
-            .build()
-            .into()
-    })
+    A.get_or_init(|| agent_reading_within(READ_TIMEOUT))
+}
+
+fn agent_reading_within(read: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(8)))
+        .timeout_recv_response(Some(Duration::from_secs(8)))
+        .timeout_per_read(Some(read))
+        .max_idle_connections(0)
+        .build()
+        .into()
 }
 
 /// `icy-br` ("128", sometimes "128,128"), sanity-checked.
@@ -351,9 +362,44 @@ struct Feed {
     url: Mutex<String>,
     events: Option<Sender<Event>>,
     title: Mutex<Option<String>>,
+    /// Failed connections in a row, the watchdog's replacements included.
+    fails: AtomicU32,
+    /// It stopped trying: the source ends with [`NOT_RESPONDING`].
+    gave_up: AtomicBool,
 }
 
 impl Feed {
+    fn new(
+        pipe: Arc<Pipe>,
+        play_id: &str,
+        channel: &str,
+        url: String,
+        events: Option<Sender<Event>>,
+    ) -> Arc<Self> {
+        Arc::new(Feed {
+            pipe,
+            play_id: play_id.to_string(),
+            channel: channel.to_string(),
+            url: Mutex::new(url),
+            events,
+            title: Mutex::new(None),
+            fails: AtomicU32::new(0),
+            gave_up: AtomicBool::new(false),
+        })
+    }
+
+    /// Counts a failure; returns how many in a row.
+    fn failed(&self) -> u32 {
+        self.fails.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Too many failures: the pipe ends, and with it the source.
+    fn give_up(&self, generation: u64) {
+        log::warn!("{}: not responding, giving up", self.play_id);
+        self.gave_up.store(true, Ordering::Relaxed);
+        self.pipe.finish(generation);
+    }
+
     fn title(&self, t: &str) {
         let mut last = self.title.lock().unwrap();
         if last.as_deref() == Some(t) {
@@ -382,11 +428,11 @@ impl Feed {
 
     /// One connection after another until the reader is gone or the station is unreachable.
     fn run(&self, generation: u64, mut conn: Option<Conn>) {
-        let mut fails = 0u32;
         loop {
             let c = match conn.take() {
                 Some(c) => c,
                 None => {
+                    let fails = self.fails.load(Ordering::Relaxed);
                     let backoff = Duration::from_millis(500 << fails.min(4));
                     if fails > 0 && !self.pipe.sleep(generation, backoff) {
                         return;
@@ -401,11 +447,10 @@ impl Feed {
                     match connect(&url) {
                         Ok(c) => c,
                         Err(e) => {
-                            fails += 1;
+                            let fails = self.failed();
                             log::warn!("{}: reconnect {fails} failed: {e}", self.play_id);
                             if fails > RETRIES {
-                                self.pipe.finish(generation);
-                                return;
+                                return self.give_up(generation);
                             }
                             continue;
                         }
@@ -421,13 +466,12 @@ impl Feed {
                 return;
             }
             if since.elapsed() >= HELD {
-                fails = 0;
+                self.fails.store(0, Ordering::Relaxed);
             }
-            fails += 1;
+            let fails = self.failed();
             log::info!("{}: {why}, reconnecting ({fails})", self.play_id);
             if fails > RETRIES {
-                self.pipe.finish(generation);
-                return;
+                return self.give_up(generation);
             }
         }
     }
@@ -501,8 +545,8 @@ impl Source for LiveSource {
         use symphonia::core::errors::Error as E;
         let p = match self.fmt.next_packet() {
             Ok(Some(p)) => p,
-            Ok(None) => return Ok(false),
-            Err(E::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            Ok(None) => return self.ended(),
+            Err(E::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return self.ended(),
             // The pipe ran dry mid-packet for PACKET_WAIT: skipping would lose bytes (see there).
             Err(E::IoError(e)) => return Err(Error::Net(format!("radio stream: {e}"))),
             Err(e) => return self.error(format!("demux: {e}")),
@@ -543,19 +587,37 @@ impl Source for LiveSource {
         if pipe.ready(MIN_AHEAD) {
             return false;
         }
-        // A connection that went quiet without closing: replace it. (A relay just waits.)
+        // A connection that went quiet without closing: replace it, unless that has failed
+        // too often already. (A relay just waits.)
         if let Some(feed) = &self.feed
             && pipe.starved_for().is_some_and(|d| d >= STALL)
         {
-            log::warn!("{}: stalled, reconnecting", self.play_id);
+            let fails = feed.failed();
             let generation = pipe.next_generation();
-            feed.spawn(generation, None);
+            if fails > RETRIES {
+                feed.give_up(generation);
+            } else {
+                log::warn!("{}: stalled, reconnecting ({fails})", self.play_id);
+                feed.spawn(generation, None);
+            }
         }
         true
     }
 }
 
 impl LiveSource {
+    /// The stream ended: as streams do (a relay's), or because the station stopped answering.
+    fn ended(&self) -> Result<bool> {
+        if self
+            .feed
+            .as_ref()
+            .is_some_and(|f| f.gave_up.load(Ordering::Relaxed))
+        {
+            return Err(Error::Net(NOT_RESPONDING.into()));
+        }
+        Ok(false)
+    }
+
     /// A bad packet: skip it, unless they keep coming.
     fn error(&mut self, e: String) -> Result<bool> {
         self.errors += 1;
@@ -639,14 +701,7 @@ pub fn open_conn(
     if let Some(t) = super::relay::capture(id, &ct, kbps) {
         pipe.set_tap(t);
     }
-    let feed = Arc::new(Feed {
-        pipe: pipe.clone(),
-        play_id: id.to_string(),
-        channel: channel.to_string(),
-        url: Mutex::new(url),
-        events,
-        title: Mutex::new(None),
-    });
+    let feed = Feed::new(pipe.clone(), id, channel, url, events);
     feed.spawn(0, Some(conn));
     from_pipe(feed.pipe.clone(), id, Some(feed), &ct, kbps)
 }
@@ -758,14 +813,7 @@ mod tests {
     }
 
     fn feed(events: Option<Sender<Event>>) -> Arc<Feed> {
-        Arc::new(Feed {
-            pipe: Pipe::new(),
-            play_id: "radio:test".into(),
-            channel: "test".into(),
-            url: Mutex::new(String::new()),
-            events,
-            title: Mutex::new(None),
-        })
+        Feed::new(Pipe::new(), "radio:test", "test", String::new(), events)
     }
 
     fn conn(body: Vec<u8>, metaint: usize) -> Conn {
@@ -1067,6 +1115,90 @@ mod tests {
                 "chunk {chunk}: PCM differs"
             );
         }
+    }
+
+    /// A station that sends its headers and some audio, then nothing (without closing): the
+    /// read gives up instead of blocking its thread forever.
+    #[test]
+    fn a_silent_connection_times_out() {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/stream", server.local_addr().unwrap());
+        let held = std::thread::spawn(move || {
+            let (mut s, _) = server.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let _ = s.read(&mut req);
+            s.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n",
+            )
+            .unwrap();
+            s.flush().unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+            drop(s);
+        });
+        let resp = agent_reading_within(Duration::from_millis(300))
+            .get(&url)
+            .call()
+            .unwrap();
+        let mut body = resp.into_body().into_reader();
+        let mut buf = [0u8; 64];
+        let t = Instant::now();
+        let mut got = 0;
+        let err = loop {
+            match body.read(&mut buf) {
+                Ok(0) => panic!("ended"),
+                Ok(n) => got += n,
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(got, 4);
+        assert!(
+            t.elapsed() < Duration::from_millis(1500),
+            "{:?}: {err}",
+            t.elapsed()
+        );
+        held.join().unwrap();
+    }
+
+    /// Failures count across the watchdog's replacements; once there were too many, the
+    /// source ends with an error the app can show, not as if the station had ended.
+    #[test]
+    fn the_watchdog_carries_failures_and_gives_up() {
+        let f = feed(None);
+        assert!(f.pipe.push(0, &silent_mp3(80)));
+        let mut src = from_pipe(
+            f.pipe.clone(),
+            "radio:test",
+            Some(f.clone()),
+            "audio/mpeg",
+            Some(128),
+        )
+        .unwrap();
+        let mut pcm = Vec::new();
+        while !src.stalled() {
+            assert!(src.read(&mut pcm).unwrap());
+        }
+        assert!(
+            !f.gave_up.load(Ordering::Relaxed),
+            "starved, not yet stalled"
+        );
+        // Earlier connections failed already; this stall is one too many.
+        f.fails.store(RETRIES, Ordering::Relaxed);
+        f.pipe.m.lock().unwrap().starved = Some(Instant::now() - STALL);
+        assert!(src.stalled());
+        assert!(f.gave_up.load(Ordering::Relaxed));
+        assert_eq!(f.fails.load(Ordering::Relaxed), RETRIES + 1);
+        let err = loop {
+            match src.read(&mut pcm) {
+                Ok(true) => {}
+                Ok(false) => panic!("ended quietly"),
+                Err(e) => break e,
+            }
+        };
+        assert!(
+            matches!(&err, Error::Net(m) if m == NOT_RESPONDING),
+            "{err}"
+        );
     }
 
     #[test]

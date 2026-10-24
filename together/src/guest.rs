@@ -1,4 +1,5 @@
-//! The joining side: dials the host, relays messages, keeps the clock estimate.
+//! The joining side: dials the host, relays messages, keeps the clock estimate, answers the
+//! host's pings, and rejoins by itself when the link drops.
 
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -20,21 +21,34 @@ use crate::{Error, now_us};
 
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const FAST_PING: Duration = Duration::from_millis(250);
-const FAST_PING_FOR: Duration = Duration::from_secs(3);
-const SLOW_PING: Duration = Duration::from_secs(1);
+/// A dropped link is dialed again for this long before the session is given up.
+const REJOIN_FOR: Duration = Duration::from_secs(120);
+/// One rejoin attempt's dial gives up after this.
+const REJOIN_DIAL: Duration = Duration::from_secs(8);
+const LOST: &str = "Lost connection";
+
+/// The wait before rejoin attempt `n` (from 0): 1, 2, 4, 8 s, then every 10 s.
+fn rejoin_wait(n: u32) -> Duration {
+    Duration::from_secs(if n < 4 { 1 << n } else { 10 })
+}
 
 /// Something that happened in a joined session.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GuestEvent<Down> {
-    /// The handshake finished; messages flow from now on.
+    /// The handshake finished; messages flow from now on. Comes again after
+    /// [`GuestEvent::Reconnecting`] once the session is rejoined.
     Connected { host_name: String },
     /// Enough clock samples are in: [`Guest::host_to_local_us`] works from now on.
+    /// Once per session (the estimate carries over a rejoin).
     ClockReady,
     /// A message from the host.
     Msg(Down),
     /// Raw bytes from the host, in order with [`GuestEvent::Msg`].
     Raw(Vec<u8>),
+    /// The link dropped (the host didn't end the session or remove you): it is being dialed
+    /// again, with backoff, for up to 2 minutes. [`GuestEvent::Connected`] follows when it's
+    /// back, else [`GuestEvent::Closed`]. Messages sent meanwhile are dropped.
+    Reconnecting,
     /// The session is over for this guest; the text is ready to show
     /// ("The host ended the session", "Lost connection", "Couldn't reach the host...").
     /// Always the last event.
@@ -114,7 +128,7 @@ where
     fn join_on(net: Net, target: Target, name: &str) -> Result<Self, Error> {
         now_us();
         let (session, stop) = Session::new().map_err(|e| Error::Network(e.to_string()))?;
-        let (ev_tx, ev_rx) = crossbeam_channel::unbounded();
+        let (ev_tx, ev_rx) = crossbeam_channel::bounded(crate::EVENTS);
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         let clock = Arc::new(Mutex::new(ClockState::default()));
         let handle = session
@@ -149,7 +163,7 @@ where
 
     /// Sends a message to the host. Messages sent before
     /// [`GuestEvent::Connected`] are queued and delivered after the handshake;
-    /// after [`GuestEvent::Closed`] they are dropped.
+    /// while rejoining and after [`GuestEvent::Closed`] they are dropped.
     pub fn send(&self, msg: &Up) {
         match serde_json::to_vec(msg) {
             Ok(v) => {
@@ -199,10 +213,17 @@ async fn guest_main<Down: DeserializeOwned + Send + 'static>(
     name: String,
     events: Sender<GuestEvent<Down>>,
     out_tx: mpsc::UnboundedSender<Bytes>,
-    out_rx: mpsc::UnboundedReceiver<Bytes>,
+    mut out_rx: mpsc::UnboundedReceiver<Bytes>,
     clock: Arc<Mutex<ClockState>>,
     mut stop: watch::Receiver<bool>,
 ) {
+    let stopping = stop.clone();
+    let ctx = Ctx {
+        events: &events,
+        clock: &clock,
+        out_tx: &out_tx,
+        stop: &stopping,
+    };
     let ep = tokio::select! {
         r = net::bind(net, false) => r,
         _ = stopped(&mut stop) => return,
@@ -211,22 +232,17 @@ async fn guest_main<Down: DeserializeOwned + Send + 'static>(
         Ok(ep) => ep,
         Err(e) => {
             log::error!("together: couldn't bind endpoint: {e}");
-            let _ = events.send(GuestEvent::Closed(format!(
+            ctx.emit(GuestEvent::Closed(format!(
                 "Couldn't start networking ({e})"
             )));
             return;
         }
     };
-    let ctx = Ctx {
-        events: &events,
-        clock: &clock,
-        out_tx: &out_tx,
-    };
-    let reason = run(&ep, &target, name, ctx, out_rx, &mut stop).await;
+    let reason = run(&ep, &target, &name, ctx, &mut out_rx, &mut stop).await;
     let _ = timeout(Duration::from_secs(1), ep.close()).await;
     if let Some(reason) = reason {
         log::info!("together: session closed: {reason}");
-        let _ = events.send(GuestEvent::Closed(reason));
+        ctx.emit(GuestEvent::Closed(reason));
     }
 }
 
@@ -234,6 +250,7 @@ struct Ctx<'a, Down> {
     events: &'a Sender<GuestEvent<Down>>,
     clock: &'a Mutex<ClockState>,
     out_tx: &'a mpsc::UnboundedSender<Bytes>,
+    stop: &'a watch::Receiver<bool>,
 }
 
 impl<Down> Clone for Ctx<'_, Down> {
@@ -244,6 +261,10 @@ impl<Down> Clone for Ctx<'_, Down> {
 impl<Down> Copy for Ctx<'_, Down> {}
 
 impl<Down> Ctx<'_, Down> {
+    fn emit(&self, e: GuestEvent<Down>) {
+        crate::deliver(self.events, e, self.stop);
+    }
+
     fn on_pong(&self, payload: &[u8], t4: u64) {
         let Some((t1, t2, t3)) = wire::parse_pong(payload) else {
             return;
@@ -258,81 +279,157 @@ impl<Down> Ctx<'_, Down> {
         if !was_ready && c.model.is_some() {
             drop(c);
             log::info!("together: clock ready");
-            let _ = self.events.send(GuestEvent::ClockReady);
+            self.emit(GuestEvent::ClockReady);
         }
     }
 }
 
-/// Dials, handshakes and runs the session. Returns the reason it ended,
-/// or None when the user left.
+/// How one connection ended.
+enum End {
+    /// The user left.
+    Left,
+    /// Over for good; the reason to show.
+    Over(String),
+    /// It was up, then the link dropped: worth rejoining.
+    Lost,
+    /// A rejoin attempt didn't get through.
+    Missed,
+}
+
+/// Joins, and rejoins whenever the link drops (for up to [`REJOIN_FOR`] each time). Returns
+/// the reason the session ended, or None when the user left.
 async fn run<Down: DeserializeOwned>(
     ep: &Endpoint,
     target: &Target,
-    name: String,
+    name: &str,
     ctx: Ctx<'_, Down>,
-    out_rx: mpsc::UnboundedReceiver<Bytes>,
+    out_rx: &mut mpsc::UnboundedReceiver<Bytes>,
     stop: &mut watch::Receiver<bool>,
 ) -> Option<String> {
+    let mut end = connect(ep, target, name, ctx, out_rx, stop, false).await;
+    loop {
+        match end {
+            End::Left => return None,
+            End::Over(reason) => return Some(reason),
+            End::Missed => return Some(UNREACHABLE.into()),
+            End::Lost => {}
+        }
+        log::info!("together: link lost, rejoining");
+        ctx.emit(GuestEvent::Reconnecting);
+        let since = Instant::now();
+        let mut n = 0;
+        end = loop {
+            let wait = rejoin_wait(n);
+            if since.elapsed() + wait > REJOIN_FOR {
+                log::info!("together: couldn't rejoin");
+                return Some(LOST.into());
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = stopped(stop) => return None,
+            }
+            n += 1;
+            match connect(ep, target, name, ctx, out_rx, stop, true).await {
+                End::Missed => log::info!("together: rejoin attempt {n} failed"),
+                e => break e,
+            }
+        };
+    }
+}
+
+/// Dials (`rejoin`: once), handshakes and runs one connection until it ends.
+async fn connect<Down: DeserializeOwned>(
+    ep: &Endpoint,
+    target: &Target,
+    name: &str,
+    ctx: Ctx<'_, Down>,
+    out_rx: &mut mpsc::UnboundedReceiver<Bytes>,
+    stop: &mut watch::Receiver<bool>,
+    rejoin: bool,
+) -> End {
     let started = Instant::now();
-    let dial = tokio::select! {
-        r = timeout(DIAL_TIMEOUT, dial(ep, target)) => r,
-        _ = stopped(stop) => return None,
-    };
-    let Ok(conn) = dial else {
-        log::warn!("together: dial timed out");
-        return Some(UNREACHABLE.into());
+    let conn = if rejoin {
+        let dial = tokio::select! {
+            r = timeout(REJOIN_DIAL, ep.connect(target.addr(), wire::ALPN)) => r,
+            _ = stopped(stop) => return End::Left,
+        };
+        match dial {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                log::debug!("together: rejoin dial failed: {e}");
+                return End::Missed;
+            }
+            Err(_) => return End::Missed,
+        }
+    } else {
+        let dial = tokio::select! {
+            r = timeout(DIAL_TIMEOUT, dial(ep, target)) => r,
+            _ = stopped(stop) => return End::Left,
+        };
+        let Ok(conn) = dial else {
+            log::warn!("together: dial timed out");
+            return End::Over(UNREACHABLE.into());
+        };
+        conn
     };
     log::info!(
         "together: connected in {} ms",
         started.elapsed().as_millis()
     );
+    if rejoin {
+        // What was said to the host before the link dropped is stale by now.
+        while out_rx.try_recv().is_ok() {}
+    }
 
     let hs = tokio::select! {
-        r = timeout(HANDSHAKE_TIMEOUT, handshake(&conn, name)) => r,
+        r = timeout(HANDSHAKE_TIMEOUT, handshake(&conn, name.to_string())) => r,
         _ = stopped(stop) => {
             conn.close(close::NORMAL.into(), b"bye");
-            return None;
+            return End::Left;
         }
     };
     let (send, mut recv, host_name) = match hs {
         Ok(Ok(v)) => v,
         Ok(Err(())) | Err(_) => {
-            let reason = conn
-                .close_reason()
-                .map(|e| net::guest_close_reason(&e))
-                .unwrap_or_else(|| "The host didn't answer".into());
+            let why = conn.close_reason();
             conn.close(close::PROTOCOL.into(), b"handshake");
-            return Some(reason);
+            return match why {
+                Some(e) if !rejoin || !net::rejoinable(&e) => {
+                    End::Over(net::guest_close_reason(&e))
+                }
+                _ if rejoin => End::Missed,
+                _ => End::Over("The host didn't answer".into()),
+            };
         }
     };
-    let _ = ctx.events.send(GuestEvent::Connected { host_name });
+    ctx.emit(GuestEvent::Connected { host_name });
 
-    let writer = tokio::spawn(write_frames(send, out_rx));
     let outcome = tokio::select! {
         r = read_host(&mut recv, ctx) => r,
         _ = read_datagrams(&conn, ctx) => Ok(()),
         _ = ping_loop(&conn, ctx) => Ok(()),
+        _ = write_frames(send, out_rx) => Ok(()),
         _ = stopped(stop) => {
             conn.close(close::NORMAL.into(), b"bye");
-            writer.abort();
-            return None;
+            return End::Left;
         }
     };
-    writer.abort();
-    let reason = match outcome {
+    match outcome {
         Err(()) => {
             conn.close(close::PROTOCOL.into(), b"bad data");
-            "Lost connection (the host sent data this version of Ember can't read)".to_string()
+            End::Over(
+                "Lost connection (the host sent data this version of Ember can't read)".into(),
+            )
         }
         Ok(()) => match conn.close_reason() {
-            Some(e) => net::guest_close_reason(&e),
+            Some(e) if net::rejoinable(&e) => End::Lost,
+            Some(e) => End::Over(net::guest_close_reason(&e)),
             None => {
                 conn.close(close::NORMAL.into(), b"bye");
-                "The host ended the session".to_string()
+                End::Over("The host ended the session".into())
             }
         },
-    };
-    Some(reason)
+    }
 }
 
 /// Dials until it works; the caller bounds it with [`DIAL_TIMEOUT`]. Retrying
@@ -365,7 +462,7 @@ async fn handshake(
         name,
     });
     send.write_chunk(hello).await.map_err(|_| ())?;
-    match wire::read_frame(&mut recv).await {
+    match wire::read_frame(&mut recv, |_| wire::MAX_CTRL).await {
         Ok(Some((F_CTRL, p))) => match serde_json::from_slice::<Control>(&p) {
             Ok(Control::Welcome { name }) => Ok((send, recv, wire::clean_name(&name))),
             _ => Err(()),
@@ -374,7 +471,8 @@ async fn handshake(
     }
 }
 
-async fn write_frames(mut send: SendStream, mut rx: mpsc::UnboundedReceiver<Bytes>) {
+/// Sends queued frames until writing fails (the connection is gone).
+async fn write_frames(mut send: SendStream, rx: &mut mpsc::UnboundedReceiver<Bytes>) {
     while let Some(f) = rx.recv().await {
         if send.write_chunk(f).await.is_err() {
             return;
@@ -388,25 +486,26 @@ async fn read_host<Down: DeserializeOwned>(
     ctx: Ctx<'_, Down>,
 ) -> Result<(), ()> {
     loop {
-        match wire::read_frame(recv).await {
+        match wire::read_frame(recv, |_| wire::MAX_FRAME).await {
             Ok(None) => return Ok(()),
             Err(e) => {
                 log::debug!("together: host stream ended: {e}");
                 return Ok(());
             }
             Ok(Some((F_MSG, p))) => match serde_json::from_slice::<Down>(&p) {
-                Ok(m) => {
-                    let _ = ctx.events.send(GuestEvent::Msg(m));
-                }
+                Ok(m) => ctx.emit(GuestEvent::Msg(m)),
                 Err(e) => {
                     log::warn!("together: unreadable message from host: {e}");
                     return Err(());
                 }
             },
-            Ok(Some((F_RAW, p))) => {
-                let _ = ctx.events.send(GuestEvent::Raw(p));
-            }
-            Ok(Some((F_CLOCK, p))) => ctx.on_pong(&p, now_us()),
+            Ok(Some((F_RAW, p))) => ctx.emit(GuestEvent::Raw(p)),
+            Ok(Some((F_CLOCK, p))) => match wire::parse_stamp(b'H', &p) {
+                Some(t) => {
+                    let _ = ctx.out_tx.send(wire::frame(F_CLOCK, &wire::echo(t)));
+                }
+                None => ctx.on_pong(&p, now_us()),
+            },
             Ok(Some((F_CTRL, _))) => {}
             Ok(Some((kind, _))) => {
                 log::warn!("together: unknown frame kind {kind} from host");
@@ -419,7 +518,16 @@ async fn read_host<Down: DeserializeOwned>(
 async fn read_datagrams<Down>(conn: &Connection, ctx: Ctx<'_, Down>) {
     loop {
         match conn.read_datagram().await {
-            Ok(d) => ctx.on_pong(&d, now_us()),
+            Ok(d) => match wire::parse_stamp(b'H', &d) {
+                // The host timing the round trip: straight back, the way it came.
+                Some(t) => {
+                    let e = wire::echo(t);
+                    if conn.send_datagram(e.clone()).is_err() {
+                        let _ = ctx.out_tx.send(wire::frame(F_CLOCK, &e));
+                    }
+                }
+                None => ctx.on_pong(&d, now_us()),
+            },
             Err(_) => {
                 if conn.close_reason().is_some() {
                     return;
@@ -445,11 +553,25 @@ async fn ping_loop<Down>(conn: &Connection, ctx: Ctx<'_, Down>) {
             }
             let _ = ctx.out_tx.send(wire::frame(F_CLOCK, &p));
         }
-        let wait = if start.elapsed() < FAST_PING_FOR {
-            FAST_PING
-        } else {
-            SLOW_PING
-        };
-        tokio::time::sleep(wait).await;
+        tokio::time::sleep(wire::ping_every(start.elapsed())).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejoin_backoff() {
+        let waits: Vec<u64> = (0..7).map(|n| rejoin_wait(n).as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 10, 10, 10]);
+        // Enough attempts fit in the window to ride out a two-minute drop... nearly.
+        let mut t = 0;
+        let mut n = 0;
+        while t + rejoin_wait(n).as_secs() <= REJOIN_FOR.as_secs() {
+            t += rejoin_wait(n).as_secs();
+            n += 1;
+        }
+        assert!(n >= 14, "{n} attempts");
     }
 }
