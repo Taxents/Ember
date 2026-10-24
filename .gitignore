@@ -8,6 +8,7 @@
 /.claude
 /PLAN.md
 /IMPLEMENTATION.md
+/FIXES.md
 # The audio test harness (cargo run --manifest-path cli/Cargo.toml).
 /cli
 # Dev scripts; cutting a release stays.

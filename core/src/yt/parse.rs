@@ -1059,42 +1059,6 @@ pub fn playback_url(v: &Value) -> Option<String> {
     str_of(&v["playbackTracking"]["videostatsPlaybackUrl"]["baseUrl"])
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn counts() {
-        assert_eq!(parse_count("149M plays"), Some(149_000_000));
-        assert_eq!(parse_count("5.8K views"), Some(5_800));
-        assert_eq!(parse_count("1.2B plays"), Some(1_200_000_000));
-        assert_eq!(parse_count("1,234 views"), Some(1_234));
-        assert_eq!(parse_count("2013"), None);
-        assert_eq!(parse_count("10 songs"), None);
-    }
-
-    #[test]
-    fn durations() {
-        assert_eq!(parse_duration("3:45"), Some(225_000));
-        assert_eq!(parse_duration("1:02:03"), Some(3_723_000));
-        assert_eq!(parse_duration("149M plays"), None);
-        assert_eq!(parse_duration("3:4x"), None);
-    }
-
-    #[test]
-    fn names_from_subtitles() {
-        let n = plain_names("Song • Pink Floyd • 3:45");
-        assert_eq!(n.len(), 1);
-        assert_eq!(n[0].name, "Pink Floyd");
-        assert_eq!(
-            strip_label("Playlist • YouTube Music • 40 songs"),
-            "YouTube Music • 40 songs"
-        );
-        assert_eq!(album_kind("Single • 2024"), AlbumKind::Single);
-        assert_eq!(year_in("Album • 1973"), Some(1973));
-    }
-}
-
 /// The lyrics tab: the words and their source ("Source: Musixmatch" → "Musixmatch").
 pub fn lyrics(v: &Value) -> Option<(String, String)> {
     section_lists(v)
@@ -1176,4 +1140,40 @@ pub fn about(v: &Value) -> Option<String> {
         .chain(Some(&v["contents"]["sectionListRenderer"]))
         .flat_map(|s| arr(&s["contents"]))
         .find_map(|sec| opt_text(&sec["musicDescriptionShelfRenderer"]["description"]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts() {
+        assert_eq!(parse_count("149M plays"), Some(149_000_000));
+        assert_eq!(parse_count("5.8K views"), Some(5_800));
+        assert_eq!(parse_count("1.2B plays"), Some(1_200_000_000));
+        assert_eq!(parse_count("1,234 views"), Some(1_234));
+        assert_eq!(parse_count("2013"), None);
+        assert_eq!(parse_count("10 songs"), None);
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("3:45"), Some(225_000));
+        assert_eq!(parse_duration("1:02:03"), Some(3_723_000));
+        assert_eq!(parse_duration("149M plays"), None);
+        assert_eq!(parse_duration("3:4x"), None);
+    }
+
+    #[test]
+    fn names_from_subtitles() {
+        let n = plain_names("Song • Pink Floyd • 3:45");
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].name, "Pink Floyd");
+        assert_eq!(
+            strip_label("Playlist • YouTube Music • 40 songs"),
+            "YouTube Music • 40 songs"
+        );
+        assert_eq!(album_kind("Single • 2024"), AlbumKind::Single);
+        assert_eq!(year_in("Album • 1973"), Some(1973));
+    }
 }
