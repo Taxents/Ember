@@ -90,7 +90,7 @@ enum RowRef {
 enum MenuTarget {
     /// A track on the page: its index in `page_tracks`, and its row.
     Track(usize, usize),
-    /// A queue position.
+    /// A queue position (and `menu_queue_id`, the song there when the menu opened).
     Queue(usize),
     /// A sidebar playlist, by id.
     Playlist(String),
@@ -162,6 +162,8 @@ struct App {
     /// The artist's logo on the banner, once found.
     logo_url: Option<String>,
     menu: Option<MenuTarget>,
+    /// The song a queue row's menu was opened on.
+    menu_queue_id: Option<String>,
     /// The artists the open menu's "Go to" entries lead to.
     menu_artists: Vec<Named>,
     /// Where the menu opened, for a second menu in its place.
@@ -292,6 +294,7 @@ fn main() {
         header: None,
         logo_url: None,
         menu: None,
+        menu_queue_id: None,
         menu_artists: Vec::new(),
         menu_at: Default::default(),
         autoplay: None,
@@ -1293,6 +1296,7 @@ impl App {
             return;
         }
         let Some(more) = self.more.take() else { return };
+        let again = more.clone();
         self.loading_more = true;
         self.extended = true;
         let generation = self.generation;
@@ -1315,7 +1319,12 @@ impl App {
                                 Extra::Blocks(b) => a.add_blocks(b),
                             }
                         }
-                        Err(e) => log::warn!("more: {e}"),
+                        Err(e) => {
+                            log::warn!("more: {e}");
+                            // Kept, so reaching the end again tries again.
+                            a.more = Some(again);
+                            a.notify_with("Couldn't load more", "Retry", |a| a.load_more());
+                        }
                     }
                 });
             },
@@ -2375,7 +2384,15 @@ impl App {
         self.player.on_event(&e);
         self.together_engine(&e);
         match &e {
-            Event::Started { id, .. } => {
+            Event::Started { id, duration_ms } => {
+                // Its length, kept with the song (and the saved queue, for the bar after a
+                // restart).
+                if let Some(d) = duration_ms
+                    && let Some(t) = self.known.get_mut(id)
+                    && t.duration_ms.is_none()
+                {
+                    t.duration_ms = Some(*d);
+                }
                 self.video_sync();
                 if let Some(ms) = self.resume_at.take().filter(|&ms| ms > 5000) {
                     self.player.engine.seek(ms);
@@ -2723,7 +2740,11 @@ impl App {
         SavedQueue {
             tracks: order
                 .iter()
-                .filter_map(|id| self.known.get(*id).cloned())
+                .filter_map(|id| {
+                    let mut t = self.known.get(*id).cloned()?;
+                    t.duration_ms = t.duration_ms.or_else(|| self.lengths.get(*id).copied());
+                    Some(t)
+                })
                 .collect(),
             at,
             position_ms: self
@@ -3172,6 +3193,9 @@ impl App {
             }
             "queue" | "np" => {
                 if let Some((target, items)) = self.radio_queue_menu(what, row) {
+                    if let MenuTarget::Queue(pos) = target {
+                        self.menu_queue_id = self.queue_ids.get(pos).cloned();
+                    }
                     return self.show_menu(target, items, at);
                 }
                 // Queue rows start after the playing song: make both a play-order position.
@@ -3211,6 +3235,7 @@ impl App {
                     items.push(divider());
                     items.push(entry("remove", "Remove from queue", "close", true));
                 }
+                self.menu_queue_id = self.queue_ids.get(row).cloned();
                 (MenuTarget::Queue(row), items)
             }
             "playlist" => {
@@ -3378,62 +3403,28 @@ impl App {
                     },
                 );
             }
-            MenuTarget::Queue(pos) => match choice {
-                "play" => {
-                    if !self.ask_host(listen::Req::Jump(pos)) {
-                        self.cancel_skip();
-                        self.player.jump(pos);
-                    }
-                }
-                "dislike" => {
-                    if let Some(t) = self.queue_ids.get(pos).and_then(|id| self.known.get(id)) {
-                        self.dislike(t.clone());
-                    }
-                }
-                "song" | "album" => {
-                    let t = self
+            MenuTarget::Queue(pos) => {
+                // The queue may have moved on since the menu opened (a song ended, the radio
+                // added more): act on the song that was clicked, wherever it is now.
+                let Some(id) = self.menu_queue_id.take() else {
+                    return;
+                };
+                let pos = if self.queue_ids.get(pos) == Some(&id) {
+                    pos
+                } else {
+                    let at = self.player.up_next().1;
+                    match self
                         .queue_ids
-                        .get(pos)
-                        .and_then(|id| self.known.get(id))
-                        .cloned();
-                    match (choice, t) {
-                        ("song", Some(t)) => self.open_song(&t),
-                        (_, Some(t)) => {
-                            if let Some(a) = t.album
-                                && let Some(id) = a.id
-                            {
-                                self.navigate(Route {
-                                    kind: PageKind::Album,
-                                    id,
-                                    title: a.name,
-                                });
-                            }
-                        }
-                        _ => {}
+                        .iter()
+                        .enumerate()
+                        .position(|(i, q)| i > at && *q == id)
+                    {
+                        Some(p) => p,
+                        None => return,
                     }
-                }
-                "like" | "unlike" => {
-                    if let Some(id) = self.queue_ids.get(pos).cloned() {
-                        let like = if choice == "like" {
-                            Like::Like
-                        } else {
-                            Like::Indifferent
-                        };
-                        self.set_like(&id, like);
-                    }
-                }
-                "remove" => {
-                    if !self.ask_host(listen::Req::Remove(pos)) {
-                        self.player.remove(pos);
-                        self.queue_changed();
-                    }
-                }
-                _ => {
-                    if let Some(t) = self.queue_ids.get(pos).and_then(|id| self.known.get(id)) {
-                        self.song_chosen(choice, t.clone());
-                    }
-                }
-            },
+                };
+                self.queue_chosen(pos, choice);
+            }
             MenuTarget::Playlist(id) => match choice {
                 "open" => {
                     let title = self
@@ -3538,6 +3529,66 @@ impl App {
                 });
             },
         );
+    }
+
+    /// A queue song's menu entry was chosen; `pos` is where it is now.
+    fn queue_chosen(&mut self, pos: usize, choice: &str) {
+        match choice {
+            "play" => {
+                if !self.ask_host(listen::Req::Jump(pos)) {
+                    self.cancel_skip();
+                    self.player.jump(pos);
+                }
+            }
+            "dislike" => {
+                if let Some(t) = self.queue_ids.get(pos).and_then(|id| self.known.get(id)) {
+                    self.dislike(t.clone());
+                }
+            }
+            "song" | "album" => {
+                let t = self
+                    .queue_ids
+                    .get(pos)
+                    .and_then(|id| self.known.get(id))
+                    .cloned();
+                match (choice, t) {
+                    ("song", Some(t)) => self.open_song(&t),
+                    (_, Some(t)) => {
+                        if let Some(a) = t.album
+                            && let Some(id) = a.id
+                        {
+                            self.navigate(Route {
+                                kind: PageKind::Album,
+                                id,
+                                title: a.name,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "like" | "unlike" => {
+                if let Some(id) = self.queue_ids.get(pos).cloned() {
+                    let like = if choice == "like" {
+                        Like::Like
+                    } else {
+                        Like::Indifferent
+                    };
+                    self.set_like(&id, like);
+                }
+            }
+            "remove" => {
+                if !self.ask_host(listen::Req::Remove(pos)) {
+                    self.player.remove(pos);
+                    self.queue_changed();
+                }
+            }
+            _ => {
+                if let Some(t) = self.queue_ids.get(pos).and_then(|id| self.known.get(id)) {
+                    self.song_chosen(choice, t.clone());
+                }
+            }
+        }
     }
 
     /// Shows a song liked (or not) everywhere it is here.
