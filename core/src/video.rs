@@ -13,7 +13,8 @@
 //! One thread per shown video. It exists only while the picture is on screen: stopping it frees
 //! the decoder, the D3D device and the network source. Frames are read back one at a time,
 //! only when due, so at most one decoded frame waits here. Stopping also cancels the stream
-//! (Media Foundation's reads fail at once) and waits briefly for the thread to end.
+//! (Media Foundation's reads fail at once); a helper thread waits for the thread to end, so
+//! whoever stops it never does.
 
 use crate::audio::Clock;
 use crate::audio::stream::HttpStream;
@@ -46,8 +47,6 @@ const JUMP_AHEAD_MS: i64 = 3000;
 const POLL: Duration = Duration::from_millis(40);
 /// While paused or waiting for the audio to start.
 const IDLE_POLL: Duration = Duration::from_millis(100);
-/// How long dropping a player waits for its thread to end.
-const JOIN_WAIT: Duration = Duration::from_millis(500);
 
 /// One decoded picture: `width × height` RGBA pixels, rows packed.
 pub struct Frame<'a> {
@@ -66,12 +65,12 @@ pub enum Note<'a> {
     Failed(Error),
 }
 
-/// Shows one music video's picture while it lives. Dropping it stops the thread and waits up
-/// to [`JOIN_WAIT`] for it to end; one stuck longer (a read still waiting on the network) is
-/// left to finish by itself, and may hand over one last frame the owner should ignore.
+/// Shows one music video's picture while it lives. Dropping it stops the thread without
+/// waiting for it (it is joined on a helper thread); one still finishing a network read may
+/// hand over one last frame the owner should ignore.
 pub struct VideoPlayer {
     stop: Arc<AtomicBool>,
-    thread: Option<(JoinHandle<()>, crossbeam_channel::Receiver<()>)>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl VideoPlayer {
@@ -87,7 +86,6 @@ impl VideoPlayer {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let st = stop.clone();
-        let (done_tx, done) = crossbeam_channel::bounded(1);
         let spawned = std::thread::Builder::new()
             .name("video".into())
             .spawn(move || {
@@ -100,10 +98,9 @@ impl VideoPlayer {
                     log::warn!("video {video_id}: {e}");
                     sink(Note::Failed(e));
                 }
-                let _ = done_tx.send(());
             });
         let thread = match spawned {
-            Ok(h) => Some((h, done)),
+            Ok(h) => Some(h),
             Err(e) => {
                 log::warn!("video thread: {e}");
                 None
@@ -117,12 +114,13 @@ impl Drop for VideoPlayer {
     fn drop(&mut self) {
         // Also makes the stream's reads fail, so a waiting `ReadSample` returns.
         self.stop.store(true, Ordering::Relaxed);
-        if let Some((h, done)) = self.thread.take() {
-            if done.recv_timeout(JOIN_WAIT).is_ok() {
-                let _ = h.join();
-            } else {
-                log::info!("video: thread still busy, left to finish");
-            }
+        // Dropped on the UI thread: the wait for the thread to end happens elsewhere.
+        if let Some(h) = self.thread.take() {
+            let _ = std::thread::Builder::new()
+                .name("video-join".into())
+                .spawn(move || {
+                    let _ = h.join();
+                });
         }
     }
 }
