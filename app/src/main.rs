@@ -2731,6 +2731,8 @@ impl App {
                 }
             }
             Event::Device(d) => log::info!("device: {d}"),
+            Event::EngineError(e) => log::error!("engine: {e}"),
+            Event::DeviceUnsupported(e) => log::error!("device: {e}"),
             Event::Title { id, title } => {
                 self.together_title(id, title);
                 self.station_title(id, title);

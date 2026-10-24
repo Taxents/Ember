@@ -9,6 +9,9 @@ pub const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb
      (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36";
 
 /// Shared agent: connection reuse across every request, HTTP errors returned as responses.
+///
+/// A body may take as long as it needs (a song on a slow link), but no single read may wait
+/// more than 15 s: a stalled connection fails, a slow one doesn't.
 pub fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
@@ -16,7 +19,7 @@ pub fn agent() -> &'static ureq::Agent {
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(10)))
             .timeout_recv_response(Some(Duration::from_secs(15)))
-            .timeout_recv_body(Some(Duration::from_secs(30)))
+            .timeout_per_read(Some(Duration::from_secs(15)))
             // Artwork loads eight at a time from a few hosts: keep those connections open.
             .max_idle_connections(32)
             .max_idle_connections_per_host(8)
@@ -70,4 +73,18 @@ pub fn get_json(url: &str, headers: &[(&str, &str)]) -> Result<Value> {
 /// URL without its query string, for log and error messages.
 pub fn short(url: &str) -> &str {
     url.split('?').next().unwrap_or(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bodies_have_no_total_time_limit_but_each_read_does() {
+        let c = agent().config();
+        assert_eq!(c.timeouts().recv_body, None);
+        assert_eq!(c.timeout_per_read(), Some(Duration::from_secs(15)));
+        assert_eq!(c.timeouts().connect, Some(Duration::from_secs(10)));
+        assert_eq!(c.timeouts().recv_response, Some(Duration::from_secs(15)));
+    }
 }

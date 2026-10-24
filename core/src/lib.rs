@@ -23,6 +23,8 @@ pub enum Error {
     Device(String),
     /// Work was cancelled (e.g. a stream was dropped while a read was waiting).
     Cancelled,
+    /// The data isn't downloaded yet: try again later (a non-blocking stream read).
+    WouldBlock,
 }
 
 impl std::fmt::Display for Error {
@@ -33,6 +35,7 @@ impl std::fmt::Display for Error {
             Error::Media(s) => write!(f, "media: {s}"),
             Error::Device(s) => write!(f, "audio device: {s}"),
             Error::Cancelled => write!(f, "cancelled"),
+            Error::WouldBlock => write!(f, "not downloaded yet"),
         }
     }
 }
@@ -41,6 +44,9 @@ impl std::error::Error for Error {}
 
 impl From<Error> for std::io::Error {
     fn from(e: Error) -> Self {
-        std::io::Error::other(e)
+        match e {
+            Error::WouldBlock => std::io::Error::new(std::io::ErrorKind::WouldBlock, e),
+            e => std::io::Error::other(e),
+        }
     }
 }

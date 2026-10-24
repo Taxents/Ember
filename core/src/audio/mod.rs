@@ -7,6 +7,8 @@ pub mod output;
 pub mod resample;
 pub mod source;
 pub mod stream;
+#[cfg(test)]
+mod testserver;
 pub mod webm;
 
 pub use engine::{Clock, Engine, Event, Position, Timing};

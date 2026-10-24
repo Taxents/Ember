@@ -6,6 +6,10 @@
 //! untouched: bit-perfect. On the way it measures four bands (bass to treble) for the visualizer,
 //! reading the samples without changing them.
 //!
+//! Pausing never cuts the wave off: the callback plays on for [`FADE_MS`] while fading out,
+//! and fades in again on resume. A flush (seek, skip) can't fade what it drops, so the last
+//! sample heard decays to zero over the same time while the new audio fades in.
+//!
 //! Synced starts (Listen Along): the engine can mark a ring frame as a gate with the instant it
 //! must be heard at. Audio before the gate plays as usual; at the gate the callback writes
 //! silence until the moment comes (from the device's own playback timestamps), then carries on.
@@ -27,6 +31,8 @@ const STEP: usize = 4096;
 pub const NO_GATE: u64 = u64::MAX;
 /// `gate_when`: held until told when.
 pub const HOLD: u64 = u64::MAX;
+/// Length of the pause, resume and flush fades.
+pub const FADE_MS: u32 = 8;
 
 /// State shared between the engine and the callback.
 #[derive(Default)]
@@ -42,6 +48,8 @@ pub struct Shared {
     pub underruns: AtomicU64,
     /// Ask the callback to clear filter state (after a flush).
     pub reset_eq: AtomicBool,
+    /// Counts flushes, so the callback smooths over what was dropped.
+    pub flushes: AtomicU64,
     /// f32 bits: the last buffer's loudness (RMS) in four bands, bass first, before volume.
     pub levels: [AtomicU32; 4],
     /// The ring frame that waits for `gate_when` before it is heard ([`NO_GATE`]: none).
@@ -103,7 +111,7 @@ impl Shared {
         }
     }
 
-    fn set_anchor(&self, frame: u64, ns: u64) {
+    pub(crate) fn set_anchor(&self, frame: u64, ns: u64) {
         self.anchor_seq.fetch_add(1, Ordering::SeqCst);
         self.anchor_frame.store(frame, Ordering::SeqCst);
         self.anchor_ns.store(ns, Ordering::SeqCst);
@@ -114,14 +122,15 @@ impl Shared {
 pub type SharedConsumer = Arc<Mutex<Consumer<f32>>>;
 
 pub struct Output {
-    stream: cpal::Stream,
+    /// `None`: a null output that plays nothing (tests drive the ring themselves).
+    stream: Option<cpal::Stream>,
     pub rate: u32,
     pub channels: usize,
     running: bool,
 }
 
 /// The default device's mix format: (rate, channels).
-pub fn device_format() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
+pub fn device_format() -> Result<Format> {
     let host = cpal::default_host();
     let dev = host
         .default_output_device()
@@ -129,7 +138,61 @@ pub fn device_format() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
     let cfg = dev
         .default_output_config()
         .map_err(|e| Error::Device(e.to_string()))?;
-    Ok((dev, cfg))
+    if pcm(cfg.sample_format()) {
+        return Ok(Format::Usable(dev, cfg));
+    }
+    // A default we can't render (DSD): any PCM format the device also takes.
+    let ranges = dev
+        .supported_output_configs()
+        .map_err(|e| Error::Device(e.to_string()))?
+        .collect();
+    Ok(match pick(&cfg, ranges) {
+        Some(c) => {
+            log::info!(
+                "output: default format {} isn't PCM, using {}",
+                cfg.sample_format(),
+                c.sample_format()
+            );
+            Format::Usable(dev, c)
+        }
+        None => Format::Unsupported(format!(
+            "the output device offers no PCM format (its default is {})",
+            cfg.sample_format()
+        )),
+    })
+}
+
+/// What the default output device can be opened with.
+pub enum Format {
+    Usable(cpal::Device, cpal::SupportedStreamConfig),
+    /// Nothing we can render: trying again won't help.
+    Unsupported(String),
+}
+
+/// Formats [`build`] renders: every PCM one (not DSD).
+fn pcm(f: SampleFormat) -> bool {
+    use SampleFormat::*;
+    matches!(
+        f,
+        I8 | I16 | I24 | I32 | I64 | U8 | U16 | U24 | U32 | U64 | F32 | F64
+    )
+}
+
+/// The best PCM config among `ranges`, at the default's rate when one takes it.
+fn pick(
+    default: &cpal::SupportedStreamConfig,
+    ranges: Vec<cpal::SupportedStreamConfigRange>,
+) -> Option<cpal::SupportedStreamConfig> {
+    let rate = default.sample_rate();
+    let mut ranges: Vec<_> = ranges
+        .into_iter()
+        .filter(|r| pcm(r.sample_format()))
+        .collect();
+    ranges.sort_by(|a, b| b.cmp_default_heuristics(a));
+    match ranges.iter().position(|r| r.contains_rate(rate)) {
+        Some(i) => Some(ranges.swap_remove(i).with_sample_rate(rate)),
+        None => ranges.into_iter().next().map(|r| r.with_max_sample_rate()),
+    }
 }
 
 impl Output {
@@ -147,21 +210,40 @@ impl Output {
         let config: cpal::StreamConfig = (*cfg).into();
         let stream = match cfg.sample_format() {
             SampleFormat::F32 => build::<f32>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::F64 => build::<f64>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::I8 => build::<i8>(dev, config, rate, shared, ring, on_error),
             SampleFormat::I16 => build::<i16>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::I24 => build::<cpal::I24>(dev, config, rate, shared, ring, on_error),
             SampleFormat::I32 => build::<i32>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::I64 => build::<i64>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::U8 => build::<u8>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::U16 => build::<u16>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::U24 => build::<cpal::U24>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::U32 => build::<u32>(dev, config, rate, shared, ring, on_error),
+            SampleFormat::U64 => build::<u64>(dev, config, rate, shared, ring, on_error),
             f => return Err(Error::Device(format!("unsupported sample format {f}"))),
         }?;
         Ok(Output {
-            stream,
+            stream: Some(stream),
             rate,
             channels,
             running: false,
         })
     }
 
+    /// An output without a device: nothing reads the ring.
+    pub fn null(rate: u32) -> Self {
+        Output {
+            stream: None,
+            rate,
+            channels: CH,
+            running: false,
+        }
+    }
+
     pub fn start(&mut self) {
         if !self.running {
-            if let Err(e) = self.stream.play() {
+            if let Some(Err(e)) = self.stream.as_ref().map(|s| s.play()) {
                 log::error!("output start failed: {e}");
             }
             self.running = true;
@@ -171,7 +253,9 @@ impl Output {
     /// Stops the device stream entirely (0% CPU while idle or paused).
     pub fn stop(&mut self) {
         if self.running {
-            let _ = self.stream.pause();
+            if let Some(s) = &self.stream {
+                let _ = s.pause();
+            }
             self.running = false;
         }
     }
@@ -205,6 +289,7 @@ where
     dev.build_output_stream(
         config,
         move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+            no_denormals();
             // When this buffer's first frame will be heard, on the device's own clock.
             let ts = info.timestamp();
             let delay = ts.playback.saturating_duration_since(ts.callback);
@@ -214,6 +299,25 @@ where
         None,
     )
     .map_err(|e| Error::Device(e.to_string()))
+}
+
+/// Flushes denormals to zero on this thread (SSE FTZ and DAZ). An EQ filter ringing down into
+/// silence otherwise spends many times the usual cost on every sample.
+#[inline]
+pub(crate) fn no_denormals() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: only this thread's SSE control register changes, and only the FTZ (bit 15) and
+    // DAZ (bit 6) flags, which no Rust code relies on.
+    unsafe {
+        let mut csr = 0u32;
+        std::arch::asm!("stmxcsr [{}]", in(reg) &mut csr, options(nostack, preserves_flags));
+        csr |= 0x8040;
+        std::arch::asm!(
+            "ldmxcsr [{}]",
+            in(reg) &csr,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
 }
 
 /// Whether a stream error means the stream is dead or on the wrong device. Glitches, a refused
@@ -232,6 +336,14 @@ pub struct Render {
     gain: Option<f32>,
     meter: Meter,
     rate: u32,
+    /// Pause and resume fade: frames into the fade in (`fade_len`: full level).
+    fade: usize,
+    fade_len: usize,
+    /// The last frame written, and the frames left of its decay after a flush.
+    last: [f32; CH],
+    tail: usize,
+    /// [`Shared::flushes`] as last seen.
+    flushes: u64,
 }
 
 /// Splits mono into four bands with one-pole low-passes at 150 Hz, 600 Hz and 2.5 kHz (each
@@ -277,12 +389,18 @@ impl Meter {
 
 impl Render {
     pub fn new(rate: u32) -> Self {
+        let fade_len = (rate * FADE_MS / 1000).max(1) as usize;
         Render {
             eq: Eq::new(rate, STEP),
             scratch: vec![0.0; STEP * CH],
             gain: None,
             meter: Meter::new(rate),
             rate: rate.max(1),
+            fade: fade_len,
+            fade_len,
+            last: [0.0; CH],
+            tail: 0,
+            flushes: 0,
         }
     }
 
@@ -302,8 +420,27 @@ impl Render {
             self.eq.reset();
         }
         let paused = shared.paused.load(Ordering::Relaxed);
+        let flushes = shared.flushes.load(Ordering::Relaxed);
+        if flushes != self.flushes {
+            self.flushes = flushes;
+            self.declick();
+        }
+        // Pausing plays on while it fades out, then stops taking audio.
+        let fading_out = paused && self.fade > 0;
         // The engine holds the lock only for a moment while flushing; output silence then.
-        let mut cons = if paused { None } else { ring.try_lock().ok() };
+        let mut cons = if paused && !fading_out {
+            None
+        } else {
+            match ring.try_lock() {
+                Ok(c) => Some(c),
+                // A panic elsewhere while it was held: the ring itself is still sound.
+                Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            }
+        };
+        if cons.is_none() && !paused {
+            self.declick();
+        }
         let total = data.len() / dev_ch;
         let mut done = 0;
         while done < total {
@@ -336,9 +473,16 @@ impl Render {
                     }
                 }
             }
+            if paused {
+                // Only the fade-out is still taken.
+                take &= self.fade > 0;
+                if take {
+                    n = n.min(self.fade);
+                }
+            }
             let out = &mut data[done * dev_ch..(done + n) * dev_ch];
             let src = if take { cons.as_deref_mut() } else { None };
-            self.segment(out, dev_ch, shared, src, take && !paused);
+            self.segment(out, dev_ch, shared, src, take && !paused, paused);
             done += n;
         }
         // From the next frame on, frames are heard one after another from the end of this
@@ -346,7 +490,14 @@ impl Render {
         shared.set_anchor(shared.played.load(Ordering::Relaxed), heard + ns_per(total));
     }
 
+    /// What was heard stops here: the last frame decays away and what comes next fades in.
+    fn declick(&mut self) {
+        self.tail = self.fade_len;
+        self.fade = 0;
+    }
+
     /// Writes `out` from the ring (`None`: silence). `expect`: a short read is an underrun.
+    /// `paused`: fading out.
     fn segment<T: SizedSample + FromSample<f32>>(
         &mut self,
         out: &mut [T],
@@ -354,6 +505,7 @@ impl Render {
         shared: &Shared,
         cons: Option<&mut Consumer<f32>>,
         expect: bool,
+        paused: bool,
     ) {
         let frames = out.len() / dev_ch;
         let got = match cons {
@@ -373,7 +525,53 @@ impl Render {
         self.meter.measure(buf, &shared.levels);
         let target = f32::from_bits(shared.volume.load(Ordering::Relaxed));
         ramp_gain(buf, self.gain.get_or_insert(target), target);
+        self.apply_fade(got, paused);
+        let len = if self.tail > 0 {
+            self.add_tail(got, frames)
+        } else {
+            got
+        };
+        let buf = &self.scratch[..len * CH];
+        self.last = match buf.as_chunks::<CH>().0.last() {
+            Some(f) if len == frames => *f,
+            // Silence follows: nothing to decay from.
+            _ => [0.0; CH],
+        };
         write_out(out, buf, dev_ch);
+    }
+
+    /// Fades the first `frames` of the scratch buffer out (`paused`) or in. Untouched at full
+    /// level.
+    fn apply_fade(&mut self, frames: usize, paused: bool) {
+        if !paused && self.fade == self.fade_len {
+            return;
+        }
+        for f in self.scratch[..frames * CH].as_chunks_mut::<CH>().0 {
+            if paused {
+                self.fade = self.fade.saturating_sub(1);
+            } else if self.fade < self.fade_len {
+                self.fade += 1;
+            }
+            let g = self.fade as f32 / self.fade_len as f32;
+            f[0] *= g;
+            f[1] *= g;
+        }
+    }
+
+    /// Adds the decaying last frame over `frames`, silence after the `got` frames read;
+    /// returns how many frames the scratch buffer now holds.
+    fn add_tail(&mut self, got: usize, frames: usize) -> usize {
+        self.scratch[got * CH..frames * CH].fill(0.0);
+        for f in self.scratch[..frames * CH].as_chunks_mut::<CH>().0 {
+            if self.tail == 0 {
+                break;
+            }
+            let k = self.tail as f32 / self.fade_len as f32;
+            f[0] += self.last[0] * k;
+            f[1] += self.last[1] * k;
+            self.tail -= 1;
+        }
+        frames
     }
 }
 
@@ -518,6 +716,99 @@ mod tests {
         let mut out = vec![0f32; 512];
         r.fill(&mut out, 2, &shared, &ring, Duration::ZERO);
         assert!(out.iter().all(|&s| s == 0.25), "{:?}", &out[..4]);
+    }
+
+    /// The largest jump between neighbouring samples of the left channel.
+    fn largest_step(out: &[f32]) -> f32 {
+        out.iter()
+            .step_by(2)
+            .zip(out.iter().step_by(2).skip(1))
+            .map(|(a, b)| (b - a).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn pause_and_resume_fade_instead_of_clicking() {
+        let (shared, ring, mut r) = ones(20000);
+        let mut out = vec![0f32; 960 * 2];
+        r.fill(&mut out, 2, &shared, &ring, Duration::ZERO);
+        shared.paused.store(true, Ordering::Relaxed);
+        let mut paused = vec![0f32; 960 * 2];
+        r.fill(&mut paused, 2, &shared, &ring, Duration::ZERO);
+        // 8 ms more were played, fading out; then silence.
+        assert_eq!(shared.played.load(Ordering::Relaxed), 960 + 384);
+        assert!(paused[384 * 2..].iter().all(|&s| s == 0.0));
+        shared.paused.store(false, Ordering::Relaxed);
+        let mut resumed = vec![0f32; 960 * 2];
+        r.fill(&mut resumed, 2, &shared, &ring, Duration::ZERO);
+        assert!(resumed[384 * 2..].iter().all(|&s| s == 1.0));
+        let all = [out, paused, resumed].concat();
+        assert!(largest_step(&all) < 0.01, "{}", largest_step(&all));
+    }
+
+    #[test]
+    fn a_flush_decays_the_old_audio_and_fades_in_the_new() {
+        let shared = Shared::new();
+        let (mut p, c) = rtrb::RingBuffer::<f32>::new(1 << 16);
+        let ring = Arc::new(Mutex::new(c));
+        let _ = p.push_partial_slice(&[0.8; 4000]);
+        let mut r = Render::new(48000);
+        let mut out = vec![0f32; 960 * 2];
+        r.fill(&mut out, 2, &shared, &ring, Duration::ZERO);
+        // What the engine does on a seek: drop what is queued, then queue the new place.
+        shared.flushes.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut c = ring.lock().unwrap();
+            let n = c.slots();
+            c.read_chunk(n).unwrap().commit_all();
+        }
+        let _ = p.push_partial_slice(&[-0.8; 4000]);
+        let mut after = vec![0f32; 960 * 2];
+        r.fill(&mut after, 2, &shared, &ring, Duration::ZERO);
+        assert!(after[384 * 2..].iter().all(|&s| s == -0.8));
+        let all = [out, after].concat();
+        assert!(largest_step(&all) < 0.01, "{}", largest_step(&all));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn denormals_become_zero_on_the_audio_thread() {
+        std::thread::spawn(|| {
+            let tiny = std::hint::black_box(f32::MIN_POSITIVE);
+            assert!(tiny * std::hint::black_box(0.5) > 0.0);
+            no_denormals();
+            assert_eq!(tiny * std::hint::black_box(0.5), 0.0);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_dsd_default_falls_back_to_pcm_at_its_rate() {
+        use cpal::{SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange};
+        let any = SupportedBufferSize::Unknown;
+        let range = |f, lo, hi| SupportedStreamConfigRange::new(2, lo, hi, any, f);
+        let default = SupportedStreamConfig::new(2, 88200, any, SampleFormat::DsdU8);
+        // Prefers the same rate over a better format at another one.
+        let got = pick(
+            &default,
+            vec![
+                range(SampleFormat::DsdU8, 88200, 88200),
+                range(SampleFormat::F32, 48000, 48000),
+                range(SampleFormat::I24, 44100, 192000),
+            ],
+        )
+        .unwrap();
+        assert_eq!(got.sample_format(), SampleFormat::I24);
+        assert_eq!(got.sample_rate(), 88200);
+        // No range at that rate: the best one.
+        let got = pick(&default, vec![range(SampleFormat::U8, 8000, 8000)]).unwrap();
+        assert_eq!(
+            (got.sample_format(), got.sample_rate()),
+            (SampleFormat::U8, 8000)
+        );
+        // Nothing PCM at all.
+        assert!(pick(&default, vec![range(SampleFormat::DsdU16, 88200, 88200)]).is_none());
     }
 
     #[test]
