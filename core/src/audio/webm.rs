@@ -94,7 +94,7 @@ impl<R: Read + Seek> WebmDemuxer<R> {
         let segment_end = if size == UNKNOWN_SIZE {
             u64::MAX
         } else {
-            segment_start + size
+            segment_start.saturating_add(size)
         };
 
         let mut d = WebmDemuxer {
@@ -146,7 +146,7 @@ impl<R: Read + Seek> WebmDemuxer<R> {
                             }
                         }
                         if target == id::CUES {
-                            cues_at = p.map(|p| segment_start + p);
+                            cues_at = p.and_then(|p| segment_start.checked_add(p));
                         }
                     }
                 }
@@ -174,7 +174,11 @@ impl<R: Read + Seek> WebmDemuxer<R> {
         if !have_track {
             return Err(Error::Media("no Opus track".into()));
         }
-        d.duration_ns = duration.map(|t| (t * d.timecode_scale as f64) as u64);
+        // Zero, negative or NaN: unknown.
+        d.duration_ns = duration
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .map(|t| (t * d.timecode_scale as f64) as u64)
+            .filter(|&ns| ns > 0);
         // Cues after the clusters (non-DASH files): read them via the SeekHead pointer.
         if d.cues.is_empty()
             && let Some(p) = cues_at
@@ -263,9 +267,14 @@ impl<R: Read + Seek> WebmDemuxer<R> {
                     _ => {}
                 }
             }
-            if let (Some(t), Some(p)) = (t, p) {
-                self.cues
-                    .push((t * self.timecode_scale, self.segment_start + p));
+            // A cue that overflows points nowhere: leave it out.
+            if let (Some(t), Some(p)) = (t, p)
+                && let (Some(t), Some(p)) = (
+                    t.checked_mul(self.timecode_scale),
+                    self.segment_start.checked_add(p),
+                )
+            {
+                self.cues.push((t, p));
             }
         }
         self.cues.sort_unstable();
@@ -351,7 +360,11 @@ impl<R: Read + Seek> WebmDemuxer<R> {
         }
         let rel = i16::from_be_bytes([c.byte()?, c.byte()?]) as i64;
         let flags = c.byte()?;
-        let ts = (self.cluster_tc as i64 + rel).max(0) as u64 * self.timecode_scale;
+        let ts = self
+            .cluster_tc
+            .saturating_add_signed(rel)
+            .checked_mul(self.timecode_scale)
+            .ok_or_else(|| bad("timestamp"))?;
         let frames: Vec<&[u8]> = match (flags >> 1) & 3 {
             0 => vec![c.rest()],
             lacing => {
@@ -364,7 +377,7 @@ impl<R: Read + Seek> WebmDemuxer<R> {
                             let mut s = 0usize;
                             loop {
                                 let x = c.byte()?;
-                                s += x as usize;
+                                s = s.saturating_add(x as usize);
                                 if x != 255 {
                                     break;
                                 }
@@ -378,7 +391,9 @@ impl<R: Read + Seek> WebmDemuxer<R> {
                         sizes.push(s as usize);
                         for _ in 1..count - 1 {
                             let (raw, len) = c.vint_len()?;
-                            s += raw as i64 - ((1i64 << (7 * len - 1)) - 1);
+                            s = s
+                                .checked_add(raw as i64 - ((1i64 << (7 * len - 1)) - 1))
+                                .ok_or_else(|| bad("lace sizes"))?;
                             sizes.push(s.max(0) as usize);
                         }
                     }
@@ -388,7 +403,10 @@ impl<R: Read + Seek> WebmDemuxer<R> {
                         sizes.extend(std::iter::repeat_n(each, count - 1));
                     }
                 }
-                let used: usize = sizes.iter().sum();
+                let used = sizes
+                    .iter()
+                    .try_fold(0usize, |a, s| a.checked_add(*s))
+                    .ok_or_else(|| bad("lace sizes"))?;
                 sizes.push(
                     c.rest_len()
                         .checked_sub(used)
@@ -560,7 +578,7 @@ impl<'a> Cursor<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let s = self
             .b
-            .get(self.p..self.p + n)
+            .get(self.p..self.p.checked_add(n).ok_or_else(|| bad("short frame"))?)
             .ok_or_else(|| bad("short frame"))?;
         self.p += n;
         Ok(s)
@@ -664,6 +682,47 @@ mod tests {
     impl Seek for Partial {
         fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
             self.data.seek(to)
+        }
+    }
+
+    #[test]
+    fn hostile_numbers_are_errors_not_panics() {
+        let (f, first) = webm();
+        let mut d = WebmDemuxer::open(std::io::Cursor::new(f.clone())).unwrap();
+        // A cluster time that overflows once scaled.
+        assert!(d.next_packet().unwrap().is_some());
+        d.cluster_tc = u64::MAX / 2;
+        assert!(d.next_packet().is_err());
+        // EBML lacing whose sizes overflow.
+        let mut d = WebmDemuxer::open(std::io::Cursor::new(f[..first].to_vec())).unwrap();
+        let mut b = vec![0x81, 0, 0, 0x86, 3];
+        b.extend([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]);
+        b.extend([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]);
+        b.extend([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]);
+        b.extend([7; 8]);
+        assert!(d.parse_block(&b, 0).is_err());
+        // Fixed lacing over too little data, and a frame running past the block.
+        assert!(d.parse_block(&[0x81, 0, 0, 0x84, 255], 0).is_ok());
+        let mut c = Cursor {
+            b: &[1, 2, 3],
+            p: 2,
+        };
+        assert!(c.take(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn a_zero_or_nan_duration_is_unknown() {
+        for bad in [0.0f64, f64::NAN, -5.0] {
+            let (f, _) = webm();
+            // Info with a Duration, before the tracks.
+            let info = known(id::INFO, &known(id::DURATION, &bad.to_be_bytes()));
+            let at = f
+                .windows(4)
+                .position(|w| w == [0x16, 0x54, 0xAE, 0x6B])
+                .unwrap();
+            let f = [&f[..at], &info, &f[at..]].concat();
+            let d = WebmDemuxer::open(std::io::Cursor::new(f)).unwrap();
+            assert_eq!(d.duration_ns, None, "{bad}");
         }
     }
 

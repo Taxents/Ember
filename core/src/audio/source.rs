@@ -100,8 +100,8 @@ impl OpusSource {
 /// timestamp can be ±1 ms (48 samples) off; every Opus frame is a multiple of 2.5 ms (120
 /// samples) from the start, so snapping to that grid recovers the exact position.
 fn opus_sample(ts_ns: u64) -> i64 {
-    let raw = (ts_ns * OPUS_RATE + 500_000_000) / 1_000_000_000;
-    ((raw + 60) / 120 * 120) as i64
+    let raw = (ts_ns as u128 * OPUS_RATE as u128 + 500_000_000) / 1_000_000_000;
+    ((raw + 60) / 120 * 120).min(i64::MAX as u128 / 2) as i64
 }
 
 fn new_opus(ch: usize) -> Result<rusty_opus::OpusDecoder> {
@@ -116,7 +116,8 @@ impl Source for OpusSource {
 
     fn total_frames(&self) -> Option<u64> {
         let d = self.demux.duration_ns?;
-        Some((d * OPUS_RATE / 1_000_000_000).saturating_sub(self.demux.track.pre_skip))
+        let frames = (d as u128 * OPUS_RATE as u128 / 1_000_000_000) as u64;
+        Some(frames.saturating_sub(self.demux.track.pre_skip)).filter(|&f| f > 0)
     }
 
     fn read(&mut self, out: &mut Vec<f32>) -> Result<bool> {
@@ -136,7 +137,10 @@ impl Source for OpusSource {
             }
         };
         self.next = Some(first + n as i64);
-        let pad = (p.discard_padding_ns * OPUS_RATE).div_ceil(1_000_000_000) as usize;
+        let pad = p
+            .discard_padding_ns
+            .saturating_mul(OPUS_RATE)
+            .div_ceil(1_000_000_000) as usize;
         let keep = n.saturating_sub(pad);
         let start = (self.skip_until - first).clamp(0, keep as i64) as usize;
         let gain = self.demux.track.gain;
@@ -156,7 +160,8 @@ impl Source for OpusSource {
     fn seek(&mut self, frame: u64) -> Result<()> {
         let pre_skip = self.demux.track.pre_skip;
         let target = (frame + pre_skip).saturating_sub(OPUS_PREROLL);
-        self.demux.seek(target * 1_000_000_000 / OPUS_RATE)?;
+        self.demux
+            .seek(target.saturating_mul(1_000_000_000) / OPUS_RATE)?;
         self.dec = new_opus(self.ch)?;
         self.next = None;
         self.skip_until = frame as i64;
@@ -401,5 +406,7 @@ mod tests {
         assert_eq!(super::opus_sample(20_001_000_000), 960_000);
         assert_eq!(super::opus_sample(19_999_000_000), 960_000);
         assert_eq!(super::opus_sample(2_500_000), 120);
+        // A hostile timestamp doesn't overflow.
+        assert!(super::opus_sample(u64::MAX) > 0);
     }
 }

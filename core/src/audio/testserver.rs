@@ -17,6 +17,8 @@ pub struct Behaviour {
     pub drop_after: Option<u64>,
     /// Answer 403 (an expired URL) to every request after this many.
     pub refuse_after: Option<u64>,
+    /// The total length Content-Range claims, if not the real one.
+    pub claim_len: Option<u64>,
 }
 
 pub struct Server {
@@ -120,7 +122,7 @@ fn connection(
             w,
             "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{z}/{}\r\n\
              Content-Length: {}\r\n\r\n",
-            data.len(),
+            b.claim_len.unwrap_or(data.len() as u64),
             z + 1 - a
         )?;
         let mut pos = a;

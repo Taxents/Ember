@@ -433,11 +433,13 @@ struct Track {
 impl Track {
     fn new(id: String, l: Loaded, dev_rate: u32) -> Self {
         let rate = l.src.rate();
+        // A length of zero says nothing.
         let duration_ms = l
             .src
             .total_frames()
-            .map(|f| f * 1000 / rate as u64)
-            .or(l.duration_ms);
+            .map(|f| f.saturating_mul(1000) / rate.max(1) as u64)
+            .filter(|&ms| ms > 0)
+            .or(l.duration_ms.filter(|&ms| ms > 0));
         Track {
             id,
             rs: (rate != dev_rate).then(|| Resampler::new(rate, dev_rate)),
@@ -458,7 +460,7 @@ impl Track {
             }
             return Ok(0);
         }
-        let mut frame = ms * rate / 1000;
+        let mut frame = ms.saturating_mul(rate) / 1000;
         if let Some(t) = self.src.total_frames() {
             frame = frame.min(t.saturating_sub(1));
         }
@@ -468,13 +470,15 @@ impl Track {
         if self.rs.is_some() {
             self.rs = Some(Resampler::new(rate as u32, dev_rate));
         }
-        Ok(frame * dev_rate as u64 / rate)
+        Ok(frame.saturating_mul(dev_rate as u64) / rate)
     }
 
     fn remaining(&self) -> Option<Duration> {
         let total = self.src.total_frames()?;
         let left = total.saturating_sub(self.decoded);
-        Some(Duration::from_millis(left * 1000 / self.src.rate() as u64))
+        Some(Duration::from_millis(
+            left.saturating_mul(1000) / self.src.rate().max(1) as u64,
+        ))
     }
 }
 
@@ -1628,6 +1632,17 @@ mod tests {
         assert!(r.rx.try_recv().is_err());
         r.cmd(Cmd::Announce);
         assert_eq!(r.events(), ["started b"]);
+    }
+
+    #[test]
+    fn a_seek_far_past_the_end_lands_at_the_end() {
+        let mut r = Rig::new();
+        r.cmd(Cmd::Play("a".into()));
+        r.play_out(100);
+        r.cmd(Cmd::Seek(u64::MAX));
+        assert!(r.position().unwrap().ms < 2000);
+        r.play_out(500);
+        assert_eq!(r.events(), ["started a", "finished"]);
     }
 
     #[test]
