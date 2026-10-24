@@ -1,0 +1,428 @@
+// The now-playing bar along the bottom of the window.
+
+import { Theme, Icon, IconButton, ValueBar, Art } from "widgets.slint";
+import { Ui, Fmt } from "types.slint";
+
+// ---- now-playing bar ------------------------------------------------------------------------
+
+export component NowPlayingBar inherits Rectangle {
+    height: 84px;
+    // The sidebar's glass, with the same hairline where it meets the page.
+    background: Theme.sidebar;
+    property <float> progress: Ui.np.duration-ms > 0 ? Ui.np.position-ms / Ui.np.duration-ms : 0;
+    property <length> centre-w: clamp(root.width * 0.38, 360px, 620px);
+
+    Rectangle {
+        y: 0;
+        height: 1px;
+        background: Theme.smoke;
+    }
+
+    // Left: artwork and titles; right-click for the song's menu (song, album, artists…).
+    TouchArea {
+        x: 0;
+        width: (root.width - root.centre-w) / 2;
+        enabled: Ui.np.active;
+        pointer-event(e) => {
+            if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
+                Ui.context("np", 0, "", { x: self.absolute-position.x + self.mouse-x, y: self.absolute-position.y + self.mouse-y });
+            }
+        }
+    }
+
+    HorizontalLayout {
+        x: 16px;
+        width: (root.width - root.centre-w) / 2 - 32px;
+        spacing: 12px;
+        alignment: start;
+        Rectangle {
+            width: 52px;
+            Art {
+                width: 52px;
+                height: 52px;
+                radius: 6px;
+                source: Ui.np.art;
+            }
+            // The cover opens the album.
+            TouchArea {
+                enabled: Ui.np.active;
+                mouse-cursor: pointer;
+                clicked => {
+                    Ui.np-open("album");
+                }
+                pointer-event(e) => {
+                    if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
+                        Ui.context("np", 0, "", { x: self.absolute-position.x + self.mouse-x, y: self.absolute-position.y + self.mouse-y });
+                    }
+                }
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            np-title := Text {
+                text: Ui.np.active ? Ui.np.title : "Not playing";
+                color: Ui.np.active ? Theme.ivory : Theme.beige;
+                font-size: 13px;
+                font-weight: 600;
+                overflow: elide;
+                // The title opens the song's page.
+                np-title-ta := TouchArea {
+                    x: 0;
+                    width: min(np-title.width, np-title.preferred-width);
+                    enabled: Ui.np.active;
+                    mouse-cursor: pointer;
+                    clicked => {
+                        Ui.np-open("song");
+                    }
+                    pointer-event(e) => {
+                        if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
+                            Ui.context("np", 0, "", { x: self.absolute-position.x + self.mouse-x, y: self.absolute-position.y + self.mouse-y });
+                        }
+                    }
+                }
+            }
+
+            np-artist := Text {
+                text: Ui.np.artist;
+                color: np-artist-ta.has-hover ? Theme.ivory : Theme.beige;
+                font-size: 12px;
+                overflow: elide;
+                np-artist-ta := TouchArea {
+                    x: 0;
+                    width: min(np-artist.width, np-artist.preferred-width);
+                    enabled: Ui.np.active;
+                    mouse-cursor: pointer;
+                    clicked => {
+                        Ui.open-artist(-2, { x: self.absolute-position.x + self.mouse-x, y: self.absolute-position.y + self.mouse-y });
+                    }
+                }
+            }
+        }
+    }
+
+    // Centre: transport, and the seek bar between the times under it
+    VerticalLayout {
+        x: (root.width - root.centre-w) / 2;
+        width: root.centre-w;
+        alignment: center;
+        spacing: 4px;
+        HorizontalLayout {
+            alignment: center;
+            spacing: 14px;
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    icon: "shuffle";
+                    tooltip: Ui.shuffle ? "Shuffle on" : "Shuffle";
+                    toggle: true;
+                    active: Ui.shuffle;
+                    icon-size: 16px;
+                    clicked => {
+                        Ui.toggle-shuffle();
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    icon: "previous";
+                    tooltip: "Previous";
+                    icon-size: 18px;
+                    enabled: Ui.np.active;
+                    clicked => {
+                        Ui.previous();
+                    }
+                }
+            }
+
+            // Play/pause: the lit control
+            Rectangle {
+                width: 36px;
+                height: 36px;
+                border-radius: 18px;
+                background: pp.pressed ? Theme.amber.darker(0.15) : pp.has-hover ? Theme.amber.brighter(0.08) : Theme.amber;
+                drop-shadow-blur: 12px;
+                drop-shadow-color: #E9A15F44;
+                accessible-role: button;
+                accessible-label: Ui.np.playing ? "Pause" : "Play";
+                accessible-action-default => {
+                    Ui.play-pause();
+                }
+                pp := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        Ui.play-pause();
+                    }
+                }
+
+                pp-focus := FocusScope {
+                    focus-on-click: false;
+                    key-pressed(e) => {
+                        if (e.text == " " || e.text == Key.Return) {
+                            Ui.play-pause();
+                            return accept;
+                        }
+                        reject
+                    }
+                }
+
+                if pp-focus.has-focus: Rectangle {
+                    border-radius: 18px;
+                    border-width: 2px;
+                    border-color: Theme.ivory;
+                }
+
+                // Loading: a ring turning round the button.
+                if Ui.np.loading: Path {
+                    width: 44px;
+                    height: 44px;
+                    x: -4px;
+                    y: -4px;
+                    viewbox-width: 44;
+                    viewbox-height: 44;
+                    stroke: Theme.amber;
+                    stroke-width: 2px;
+                    commands: "M 22 2 A 20 20 0 0 1 42 22";
+                    transform-rotation: 360deg * mod(animation-tick(), 900ms) / 900ms;
+                    transform-origin: { x: 22px, y: 22px };
+                }
+
+                Icon {
+                    name: Ui.np.playing ? "pause" : "play";
+                    width: 16px;
+                    height: 16px;
+                    x: Ui.np.playing ? 10px : 11px;
+                    color: Theme.carbon;
+                }
+            }
+
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    icon: "next";
+                    tooltip: "Next";
+                    icon-size: 18px;
+                    enabled: Ui.np.active;
+                    clicked => {
+                        Ui.next();
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    icon: Ui.repeat == 2 ? "repeat-one" : "repeat";
+                    tooltip: Ui.repeat == 2 ? "Repeat one" : Ui.repeat == 1 ? "Repeat all" : "Repeat";
+                    toggle: true;
+                    active: Ui.repeat != 0;
+                    icon-size: 16px;
+                    clicked => {
+                        Ui.cycle-repeat();
+                    }
+                }
+            }
+        }
+
+        // Placed by hand: the times can't size a layout the seek bar's drag position depends on.
+        Rectangle {
+            height: 16px;
+            Text {
+                x: 0;
+                width: 40px;
+                text: Ui.np.active ? Fmt.time(seek.dragging ? seek.drag-value * Ui.np.duration-ms : Ui.np.position-ms) : "";
+                color: Theme.beige;
+                font-size: 11px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+
+            seek := ValueBar {
+                x: 50px;
+                width: parent.width - 100px;
+                thickness: 3px;
+                label: "Position";
+                value-text: Fmt.time(Ui.np.position-ms) + " of " + Fmt.time(Ui.np.duration-ms);
+                step: Ui.np.duration-ms > 0 ? min(1, 5000 / Ui.np.duration-ms) : 0.05;
+                knob: Ui.np.active && !Ui.np-live;
+                value: Ui.np-live ? 1 : root.progress;
+                released(v) => {
+                    if (Ui.np.duration-ms > 0 && !Ui.np-live) {
+                        Ui.seek(v * Ui.np.duration-ms);
+                    }
+                }
+            }
+
+            Text {
+                x: parent.width - 40px;
+                width: 40px;
+                text: Ui.np-live ? "LIVE" : Ui.np.active ? Fmt.time(Ui.np.duration-ms) : "";
+                color: Ui.np-live ? Theme.amber : Theme.beige;
+                font-size: 11px;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    // Right: like, panels, EQ, volume
+    HorizontalLayout {
+        x: (root.width + root.centre-w) / 2 + 16px;
+        width: (root.width - root.centre-w) / 2 - 32px;
+        alignment: end;
+        spacing: 2px;
+        Rectangle {
+            width: 32px;
+            IconButton {
+                icon: Ui.np.liked ? "heart-filled" : "heart";
+                tooltip: Ui.np.liked ? "Remove from liked" : "Like";
+                toggle: true;
+                active: Ui.np.liked;
+                enabled: Ui.np.active && Ui.signed-in;
+                icon-size: 17px;
+                clicked => {
+                    Ui.toggle-like();
+                }
+            }
+        }
+
+        // A gap between groups: like · panels · sound and sharing · volume.
+        Rectangle {
+            width: 12px;
+        }
+
+        Rectangle {
+            width: 32px;
+            IconButton {
+                icon: "lyrics";
+                active: Ui.panel-open && Ui.panel-tab == 0;
+                enabled: !Ui.lyrics-missing;
+                tooltip: Ui.lyrics-missing ? "No lyrics for this song" : "Lyrics";
+                icon-size: 17px;
+                clicked => {
+                    if (Ui.panel-open && Ui.panel-tab == 0) {
+                        Ui.panel-open = false;
+                    } else {
+                        Ui.panel-open = true;
+                        Ui.panel-tab = 0;
+                    }
+                    Ui.panel-changed();
+                }
+            }
+        }
+
+        Rectangle {
+            width: 32px;
+            IconButton {
+                icon: "queue";
+                tooltip: "Queue";
+                toggle: true;
+                active: Ui.panel-open && Ui.panel-tab == 1;
+                icon-size: 17px;
+                clicked => {
+                    if (Ui.panel-open && Ui.panel-tab == 1) {
+                        Ui.panel-open = false;
+                    } else {
+                        Ui.panel-open = true;
+                        Ui.panel-tab = 1;
+                    }
+                    Ui.panel-changed();
+                }
+            }
+        }
+
+        Rectangle {
+            width: 12px;
+        }
+
+        Rectangle {
+            width: 32px;
+            IconButton {
+                icon: "eq";
+                tooltip: "Equalizer";
+                toggle: true;
+                active: Ui.eq-open || Ui.eq-enabled;
+                icon-size: 17px;
+                clicked => {
+                    Ui.eq-open = !Ui.eq-open;
+                    if (Ui.eq-open) {
+                        Ui.together-open = false;
+                    }
+                }
+            }
+        }
+
+        // Listen Along; in a session, a badge counts who's in it.
+        together-btn := Rectangle {
+            width: 32px;
+            IconButton {
+                icon: "together";
+                tooltip: "Listen Along";
+                toggle: true;
+                active: Ui.together-open || Ui.together-state != 0;
+                icon-size: 17px;
+                clicked => {
+                    Ui.together-open = !Ui.together-open;
+                    if (Ui.together-open) {
+                        Ui.eq-open = false;
+                    }
+                }
+            }
+
+            if (Ui.together-state == 2 || Ui.together-state == 3) && Ui.together-members.length > 0: Rectangle {
+                x: together-btn.width - self.width + 1px;
+                y: together-btn.height / 2 - 17px;
+                height: 14px;
+                width: max(14px, count.preferred-width + 8px);
+                border-radius: 7px;
+                background: Theme.amber;
+                border-width: 1.5px;
+                border-color: Theme.bar;
+                count := Text {
+                    text: Ui.together-members.length;
+                    color: Theme.carbon;
+                    font-size: 9px;
+                    font-weight: 800;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        Rectangle {
+            width: 2px;
+        }
+
+        Rectangle {
+            width: 28px;
+            IconButton {
+                icon: Ui.volume <= 0.001 ? "mute" : "volume";
+                tooltip: Ui.volume <= 0.001 ? "Unmute (Ctrl+M)" : "Mute (Ctrl+M)";
+                x: (parent.width - self.width) / 2;
+                size: 28px;
+                icon-size: 17px;
+                clicked => {
+                    Ui.toggle-mute();
+                }
+            }
+        }
+
+        Rectangle {
+            width: 104px;
+            ValueBar {
+                x: 8px;
+                width: 96px;
+                thickness: 4px;
+                label: "Volume";
+                value: Ui.volume;
+                fill: Theme.ivory;
+                changed(v) => {
+                    Ui.volume = v;
+                    Ui.set-volume(v);
+                }
+            }
+        }
+    }
+}

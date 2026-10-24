@@ -1,0 +1,288 @@
+// The Settings page.
+
+import { Theme, IconButton, PillButton, Art } from "../widgets.slint";
+import { Ui } from "../types.slint";
+
+// One setting: what it is and a word on it, with its control on the right.
+export component SettingRow inherits Rectangle {
+    in property <string> title;
+    in property <string> note;
+    in property <bool> clickable;
+    callback clicked();
+    min-height: 64px;
+    if root.clickable: TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+    HorizontalLayout {
+        padding-top: 12px;
+        padding-bottom: 12px;
+        spacing: 24px;
+        VerticalLayout {
+            alignment: center;
+            spacing: 3px;
+            horizontal-stretch: 1;
+            Text {
+                text: root.title;
+                color: Theme.ivory;
+                font-size: 14px;
+                font-weight: 600;
+            }
+
+            if root.note != "": Text {
+                text: root.note;
+                color: Theme.beige;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+
+        HorizontalLayout {
+            alignment: end;
+            spacing: 8px;
+            VerticalLayout {
+                alignment: center;
+                @children
+            }
+        }
+    }
+
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Theme.smoke.with-alpha(0.6);
+    }
+}
+
+export component SettingsHeading inherits Text {
+    color: Theme.amber;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+}
+
+// Settings: account, updates, playback, sidebar, storage.
+export component SettingsPage inherits Rectangle {
+    property <bool> hidden-open;
+    Flickable {
+        content-height: col.preferred-height;
+        col := VerticalLayout {
+            padding-left: 34px;
+            padding-right: 34px;
+            padding-top: 64px;
+            padding-bottom: 40px;
+            spacing: 4px;
+            alignment: start;
+            Text {
+                text: "Settings";
+                color: Theme.ivory;
+                font-size: 34px;
+                font-weight: 800;
+            }
+
+            Rectangle {
+                height: 20px;
+            }
+
+            SettingsHeading {
+                text: "ACCOUNT";
+            }
+
+            SettingRow {
+                title: Ui.signed-in ? Ui.account-name : "Not signed in";
+                PillButton {
+                    text: Ui.signed-in ? "Sign out" : Ui.signing-in ? "Signing in…" : "Sign in";
+                    primary: !Ui.signed-in;
+                    clicked => {
+                        if (Ui.signed-in) {
+                            Ui.sign-out();
+                        } else if (!Ui.signing-in) {
+                            Ui.sign-in();
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 24px;
+            }
+
+            SettingsHeading {
+                text: "UPDATES";
+            }
+
+            SettingRow {
+                title: "Ember " + Ui.app-version;
+                note: Ui.update-status;
+                if Ui.update-ready != "": PillButton {
+                    text: "Restart to update";
+                    clicked => {
+                        Ui.restart-to-update();
+                    }
+                }
+                if Ui.update-ready == "" && Ui.update-available != "" && Ui.update-progress == "" && !Ui.update-unverified: PillButton {
+                    text: "Download and install";
+                    clicked => {
+                        Ui.update-install();
+                    }
+                }
+                if Ui.update-ready == "" && (Ui.update-available == "" || Ui.update-unverified): PillButton {
+                    text: "Check for updates";
+                    primary: false;
+                    clicked => {
+                        Ui.check-updates();
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 24px;
+            }
+
+            SettingsHeading {
+                text: "PLAYBACK";
+            }
+
+            SettingRow {
+                title: "Equalizer";
+                PillButton {
+                    text: "Open";
+                    icon: "eq";
+                    primary: false;
+                    clicked => {
+                        Ui.eq-open = true;
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 24px;
+            }
+
+            SettingsHeading {
+                text: "LYRICS";
+            }
+
+            SettingRow {
+                title: "Lyrics from other sources";
+                note: "Also look on Unison and LRCLIB, which are sent the song's title, artist, album and length. Off: only YouTube's lyrics.";
+                PillButton {
+                    text: Ui.lyrics-third-party ? "On" : "Off";
+                    primary: Ui.lyrics-third-party;
+                    accessible-role: switch;
+                    accessible-checkable: true;
+                    accessible-checked: Ui.lyrics-third-party;
+                    clicked => {
+                        Ui.lyrics-third-party = !Ui.lyrics-third-party;
+                        Ui.lyrics-third-party-changed(Ui.lyrics-third-party);
+                    }
+                }
+            }
+
+            if Ui.lyrics-third-party: SettingRow {
+                title: "Unison ID";
+                note: "Unison knows this app by a random ID. A new one isn't linked to the lookups made so far.";
+                PillButton {
+                    text: "Make a new one";
+                    primary: false;
+                    clicked => {
+                        Ui.reset-lyrics-id();
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 24px;
+            }
+
+            SettingsHeading {
+                text: "SIDEBAR";
+            }
+
+            SettingRow {
+                title: Ui.hidden-count > 0 ? "Hidden playlists (" + Ui.hidden-count + ")" : "Hidden playlists";
+                // The whole row opens and closes the list, not just the chevron.
+                clickable: Ui.hidden-count > 0;
+                clicked => {
+                    root.hidden-open = !root.hidden-open;
+                }
+                if Ui.hidden-count > 0: IconButton {
+                    icon: root.hidden-open ? "chevron-down" : "chevron-right";
+                    tooltip: root.hidden-open ? "Hide the list" : "Show hidden playlists";
+                    clicked => {
+                        root.hidden-open = !root.hidden-open;
+                    }
+                }
+            }
+
+            if root.hidden-open && Ui.hidden-count > 0: VerticalLayout {
+                padding-left: 4px;
+                for p in Ui.hidden-playlists: HorizontalLayout {
+                    height: 52px;
+                    spacing: 12px;
+                    alignment: stretch;
+                    VerticalLayout {
+                        alignment: center;
+                        Art {
+                            width: 36px;
+                            height: 36px;
+                            source: p.cover;
+                        }
+                    }
+
+                    Text {
+                        text: p.title;
+                        color: Theme.ivory;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+                        PillButton {
+                            text: "Unhide";
+                            primary: false;
+                            clicked => {
+                                Ui.unhide-playlist(p.id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 24px;
+            }
+
+            SettingsHeading {
+                text: "STORAGE";
+            }
+
+            SettingRow {
+                title: Ui.cache-size != "" ? "Cache (" + Ui.cache-size + ")" : "Cache";
+                PillButton {
+                    text: "Clear";
+                    primary: false;
+                    clicked => {
+                        Ui.clear-cache();
+                    }
+                }
+            }
+
+            SettingRow {
+                title: "App folder";
+                PillButton {
+                    text: "Open";
+                    primary: false;
+                    clicked => {
+                        Ui.open-data-folder();
+                    }
+                }
+            }
+        }
+    }
+}
