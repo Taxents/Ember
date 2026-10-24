@@ -20,9 +20,11 @@ use crate::yt::Resolver;
 use crate::{Error, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rtrb::{Producer, RingBuffer};
+use std::any::Any;
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 const CH: usize = 2;
@@ -69,6 +71,9 @@ pub enum Event {
     },
     /// The output device changed or failed.
     Device(String),
+    /// A bug in the engine: what was playing is dropped, and the engine carries on (the next
+    /// `play` works as usual).
+    EngineError(String),
     /// A live station said what it plays now (its ICY `StreamTitle`; empty: nothing said).
     Title { id: String, title: String },
     /// Synced mode: a start from `ms` into `id` is being prepared and will wait for a time.
@@ -192,7 +197,10 @@ impl Engine {
             .name("decoder".into())
             .spawn(move || {
                 let _done = done_tx;
-                w.run(cmd_rx)
+                // A panic drops what was playing, not the engine.
+                while let Err(p) = catch_unwind(AssertUnwindSafe(|| w.run(&cmd_rx))) {
+                    w.recover(panic_message(&*p));
+                }
             })
             .map_err(|e| Error::Device(e.to_string()))?;
         Ok(Engine {
@@ -254,7 +262,7 @@ impl Engine {
     /// Exactly what is heard when (see [`Timing`]).
     pub fn timing(&self) -> Option<Timing> {
         let (frame, ns) = self.shared.anchor()?;
-        let tl = self.timeline.lock().unwrap();
+        let tl = lock(&self.timeline);
         let m = tl.audible(frame)?;
         let held = self.shared.gate() == Some(m.at) && frame == m.at;
         let frames = frame - m.at + m.offset;
@@ -344,7 +352,7 @@ fn position(
     timeline: &Mutex<Timeline>,
     cmd: Option<&Sender<Cmd>>,
 ) -> Option<Position> {
-    let mut tl = timeline.lock().unwrap();
+    let mut tl = lock(timeline);
     let heard = heard(shared, tl.rate);
     if let Some(cmd) = cmd
         && !tl.nudged
@@ -431,7 +439,7 @@ struct Track {
 }
 
 impl Track {
-    fn new(id: String, l: Loaded, dev_rate: u32) -> Self {
+    fn new(id: String, l: Loaded, dev_rate: u32) -> Result<Self> {
         let rate = l.src.rate();
         // A length of zero says nothing.
         let duration_ms = l
@@ -440,14 +448,16 @@ impl Track {
             .map(|f| f.saturating_mul(1000) / rate.max(1) as u64)
             .filter(|&ms| ms > 0)
             .or(l.duration_ms.filter(|&ms| ms > 0));
-        Track {
+        Ok(Track {
             id,
-            rs: (rate != dev_rate).then(|| Resampler::new(rate, dev_rate)),
+            rs: (rate != dev_rate)
+                .then(|| Resampler::new(rate, dev_rate))
+                .transpose()?,
             src: l.src,
             decoded: 0,
             eof: false,
             duration_ms,
-        }
+        })
     }
 
     /// Reposition to `ms`; returns the exact position used, in device frames.
@@ -456,7 +466,7 @@ impl Track {
         if self.src.live() {
             // Live radio carries on from where the stream is (after a device change).
             if self.rs.is_some() {
-                self.rs = Some(Resampler::new(rate as u32, dev_rate));
+                self.rs = Some(Resampler::new(rate as u32, dev_rate)?);
             }
             return Ok(0);
         }
@@ -468,7 +478,7 @@ impl Track {
         self.decoded = frame;
         self.eof = false;
         if self.rs.is_some() {
-            self.rs = Some(Resampler::new(rate as u32, dev_rate));
+            self.rs = Some(Resampler::new(rate as u32, dev_rate)?);
         }
         Ok(frame.saturating_mul(dev_rate as u64) / rate)
     }
@@ -615,7 +625,7 @@ impl Worker {
             self.shared.played.store(self.written, Ordering::Relaxed);
             self.carry.clear();
             self.dev_rate = rate;
-            self.timeline.lock().unwrap().rate = rate;
+            lock(&self.timeline).rate = rate;
             self.shared.reset_eq.store(true, Ordering::Relaxed);
         }
         log::info!(
@@ -629,7 +639,7 @@ impl Worker {
         Ok(!keep)
     }
 
-    fn run(&mut self, rx: Receiver<Cmd>) {
+    fn run(&mut self, rx: &Receiver<Cmd>) {
         loop {
             let got = match self.wait_time() {
                 Some(t) => rx.recv_timeout(t),
@@ -709,17 +719,7 @@ impl Worker {
             Cmd::Seek(ms) => self.seek(ms),
             // The loop announces after every command.
             Cmd::Announce => {}
-            Cmd::Stop => {
-                self.generation += 1;
-                self.flush();
-                self.cur = None;
-                self.prev = None;
-                self.next = None;
-                self.next_id = None;
-                self.loading_next = false;
-                self.loading_play = false;
-                self.finished_sent = true;
-            }
+            Cmd::Stop => self.stop(),
             Cmd::Loaded {
                 generation,
                 next,
@@ -729,6 +729,27 @@ impl Worker {
             Cmd::DeviceError(e) => self.device_error(e),
         }
         true
+    }
+
+    fn stop(&mut self) {
+        self.generation += 1;
+        self.flush();
+        self.cur = None;
+        self.prev = None;
+        self.next = None;
+        self.next_id = None;
+        self.loading_next = false;
+        self.loading_play = false;
+        self.pending = None;
+        self.finished_sent = true;
+    }
+
+    /// After a panic in [`Worker::run`]: what was playing may be half-changed, so it goes; the
+    /// worker then carries on as after a stop.
+    fn recover(&mut self, msg: String) {
+        log::error!("decoder panicked: {msg}");
+        self.stop();
+        let _ = self.events.send(Event::EngineError(msg));
     }
 
     fn play(&mut self, id: String) {
@@ -778,12 +799,7 @@ impl Worker {
             return;
         }
         let played = self.shared.played.load(Ordering::Relaxed);
-        let audible = self
-            .timeline
-            .lock()
-            .unwrap()
-            .audible(played)
-            .map(|m| m.id.clone());
+        let audible = lock(&self.timeline).audible(played).map(|m| m.id.clone());
         // Live radio can't be sought: keep playing.
         if let (Some(a), Some(t)) = (&audible, &self.cur)
             && *a == t.id
@@ -854,7 +870,7 @@ impl Worker {
     /// Makes `t` the decoding track, audible from the current end of the ring (that frame).
     fn start(&mut self, t: Track, offset: u64, announce: bool) -> u64 {
         let at = self.written + (self.carry.len() / CH) as u64;
-        self.timeline.lock().unwrap().marks.push_back(Mark {
+        lock(&self.timeline).marks.push_back(Mark {
             at,
             id: t.id.clone(),
             offset,
@@ -876,9 +892,9 @@ impl Worker {
         {
             // Marks go before `played` jumps, under the lock readers take: nobody sees the old
             // track run on through the dropped audio.
-            let mut tl = self.timeline.lock().unwrap();
+            let mut tl = lock(&self.timeline);
             tl.marks.clear();
-            let mut c = self.consumer.lock().unwrap();
+            let mut c = lock(&self.consumer);
             let n = c.slots();
             if let Ok(chunk) = c.read_chunk(n) {
                 chunk.commit_all();
@@ -901,18 +917,28 @@ impl Worker {
         let loader = self.loader.clone();
         let events = self.events.clone();
         let cancel = self.cancel.child();
-        std::thread::Builder::new()
+        let load_id = id.clone();
+        let spawned = std::thread::Builder::new()
             .name("track-load".into())
             .spawn(move || {
-                let result = loader(&id, &cancel, events);
+                let result = catch_unwind(AssertUnwindSafe(|| loader(&id, &cancel, events)))
+                    .unwrap_or_else(|p| {
+                        Err(Error::Media(format!(
+                            "opening panicked: {}",
+                            panic_message(&*p)
+                        )))
+                    });
                 let _ = tx.send(Cmd::Loaded {
                     generation,
                     next,
                     id,
                     result,
                 });
-            })
-            .expect("spawn loader");
+            });
+        if let Err(e) = spawned {
+            let e = Error::Device(format!("can't start loading: {e}"));
+            self.loaded(generation, next, load_id, Err(e));
+        }
     }
 
     fn loaded(&mut self, generation: u64, next: bool, id: String, result: Result<Loaded>) {
@@ -925,17 +951,14 @@ impl Worker {
             }
             self.loading_next = false;
             self.next_id = None;
-            match result {
-                Ok(l) => self.next = Some(Track::new(id, l, self.dev_rate)),
+            match result.and_then(|l| Track::new(id.clone(), l, self.dev_rate)) {
+                Ok(t) => self.next = Some(t),
                 Err(e) => self.fail(id, e),
             }
         } else {
             self.loading_play = false;
-            match result {
-                Ok(l) => {
-                    let t = Track::new(id, l, self.dev_rate);
-                    self.begin(t);
-                }
+            match result.and_then(|l| Track::new(id.clone(), l, self.dev_rate)) {
+                Ok(t) => self.begin(t),
                 Err(e) => {
                     // The queue decides what follows a failed track.
                     self.fail(id, e);
@@ -1058,14 +1081,26 @@ impl Worker {
                 }
             };
             t.decoded += (self.pcm.len() / CH) as u64;
-            match &mut t.rs {
-                Some(rs) => {
-                    rs.process(&self.pcm, &mut self.carry);
-                    if !more {
-                        rs.finish(&mut self.carry);
+            let resampled = match &mut t.rs {
+                Some(rs) => rs.process(&self.pcm, &mut self.carry).and_then(|()| {
+                    if more {
+                        Ok(())
+                    } else {
+                        rs.finish(&mut self.carry)
                     }
+                }),
+                None => {
+                    self.carry.extend_from_slice(&self.pcm);
+                    Ok(())
                 }
-                None => self.carry.extend_from_slice(&self.pcm),
+            };
+            if let Err(e) = resampled {
+                let id = t.id.clone();
+                t.eof = true;
+                let handed_over =
+                    self.next.is_some() || self.loading_next || self.next_id.is_some();
+                self.report(id, e, handed_over);
+                continue;
             }
             if !more {
                 t.eof = true;
@@ -1098,7 +1133,7 @@ impl Worker {
         let played = self.shared.played.load(Ordering::Relaxed);
         let mut started = Vec::new();
         {
-            let mut tl = self.timeline.lock().unwrap();
+            let mut tl = lock(&self.timeline);
             // Tracks start when they are heard, not when the device takes them.
             let heard = heard(&self.shared, tl.rate);
             tl.nudged = false;
@@ -1154,7 +1189,7 @@ impl Worker {
             self.prev = None;
             self.shared.expecting.store(false, Ordering::Relaxed);
             // Nothing is audible any more: no position, so play and previous start afresh.
-            self.timeline.lock().unwrap().marks.clear();
+            lock(&self.timeline).marks.clear();
             let _ = self.events.send(Event::Finished);
         } else if drained && ended {
             // Waiting on a late next track: silence here isn't an underrun.
@@ -1224,7 +1259,18 @@ impl Worker {
                 .flatten()
             {
                 let rate = t.src.rate();
-                t.rs = (rate != self.dev_rate).then(|| Resampler::new(rate, self.dev_rate));
+                match (rate != self.dev_rate)
+                    .then(|| Resampler::new(rate, self.dev_rate))
+                    .transpose()
+                {
+                    Ok(rs) => t.rs = rs,
+                    Err(e) => {
+                        // It can't go on at the new rate: let it end.
+                        log::error!("{}: {e}", t.id);
+                        t.rs = None;
+                        t.eof = true;
+                    }
+                }
             }
             if let Some((id, ms)) = resume {
                 self.seek_audible(Some(id), ms);
@@ -1242,6 +1288,19 @@ impl Worker {
             }
         }
     }
+}
+
+/// Locks `m`, also after a panic elsewhere while it was held: everything kept under these locks
+/// stays consistent between statements, and the engine recovers (see [`Worker::recover`]).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn panic_message(p: &(dyn Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into())
 }
 
 /// A refreshed URL may only continue the same file: another format (or a re-encode) spliced
@@ -1330,7 +1389,10 @@ mod tests {
         frames: u64,
         level: f32,
         fail_at: Option<u64>,
+        /// Panic (a bug) on reading this far in.
+        panic_at: Option<u64>,
         load_error: bool,
+        load_panic: bool,
         load_delay: Duration,
     }
 
@@ -1340,7 +1402,9 @@ mod tests {
                 frames: 2 * RATE,
                 level: 0.5,
                 fail_at: None,
+                panic_at: None,
                 load_error: false,
+                load_panic: false,
                 load_delay: Duration::ZERO,
             }
         }
@@ -1362,6 +1426,9 @@ mod tests {
             if self.spec.fail_at.is_some_and(|f| self.pos >= f) {
                 return Err(Error::Media("broken packet".into()));
             }
+            if self.spec.panic_at.is_some_and(|f| self.pos >= f) {
+                panic!("test panic");
+            }
             let n = 960.min(self.spec.frames - self.pos);
             out.extend(std::iter::repeat_n(self.spec.level, n as usize * CH));
             self.pos += n;
@@ -1371,6 +1438,28 @@ mod tests {
             self.pos = frame;
             Ok(())
         }
+    }
+
+    /// Opens [`Tone`]s as `specs` say, noting each load in `loads`.
+    fn tone_loader(
+        specs: Arc<Mutex<HashMap<String, Spec>>>,
+        loads: Arc<Mutex<Vec<String>>>,
+    ) -> Loader {
+        Arc::new(move |id, _, _| {
+            loads.lock().unwrap().push(id.into());
+            let spec = specs.lock().unwrap().get(id).cloned().unwrap_or_default();
+            std::thread::sleep(spec.load_delay);
+            if spec.load_panic {
+                panic!("test panic");
+            }
+            if spec.load_error {
+                return Err(Error::Unavailable("test".into()));
+            }
+            Ok(Loaded {
+                duration_ms: None,
+                src: Box::new(Tone { spec, pos: 0 }),
+            })
+        })
     }
 
     /// A worker without a device or a thread: each step is driven by the test.
@@ -1388,21 +1477,7 @@ mod tests {
             let (etx, events) = crossbeam_channel::unbounded();
             let specs: Arc<Mutex<HashMap<String, Spec>>> = Arc::default();
             let loads: Arc<Mutex<Vec<String>>> = Arc::default();
-            let loader: Loader = {
-                let (specs, loads) = (specs.clone(), loads.clone());
-                Arc::new(move |id, _, _| {
-                    loads.lock().unwrap().push(id.into());
-                    let spec = specs.lock().unwrap().get(id).cloned().unwrap_or_default();
-                    std::thread::sleep(spec.load_delay);
-                    if spec.load_error {
-                        return Err(Error::Unavailable("test".into()));
-                    }
-                    Ok(Loaded {
-                        duration_ms: None,
-                        src: Box::new(Tone { spec, pos: 0 }),
-                    })
-                })
-            };
+            let loader = tone_loader(specs.clone(), loads.clone());
             let timeline = Arc::new(Mutex::new(Timeline::default()));
             let w = Worker::new(loader, true, Shared::new(), timeline, tx, etx).unwrap();
             Rig {
@@ -1483,6 +1558,7 @@ mod tests {
                         ..
                     } => format!("failed {id}, handed over"),
                     Event::Failed { id, .. } => format!("failed {id}"),
+                    Event::EngineError(_) => "engine error".into(),
                     e => format!("{e:?}"),
                 })
                 .collect()
@@ -1544,6 +1620,65 @@ mod tests {
         r.play_out(100);
         assert_eq!(r.events(), ["started a", "started b"]);
         assert_eq!(r.loads(), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_panic_while_opening_fails_the_track() {
+        let mut r = Rig::new();
+        r.track("a", |s| s.load_panic = true);
+        r.cmd(Cmd::Play("a".into()));
+        r.play_out(100);
+        assert_eq!(r.events(), ["failed a"]);
+        r.cmd(Cmd::Play("b".into()));
+        r.play_out(100);
+        assert_eq!(r.events(), ["started b"]);
+    }
+
+    #[test]
+    fn a_panic_while_decoding_drops_the_track_not_the_engine() {
+        let specs: Arc<Mutex<HashMap<String, Spec>>> = Arc::default();
+        specs.lock().unwrap().insert(
+            "a".into(),
+            Spec {
+                panic_at: Some(RATE / 10),
+                ..Default::default()
+            },
+        );
+        let e = Engine::with_loader(tone_loader(specs, Arc::default()), true).unwrap();
+        let until = |want: &dyn Fn(&Event) -> bool| loop {
+            match e.events().recv_timeout(Duration::from_secs(5)) {
+                Ok(ev) if want(&ev) => return ev,
+                Ok(_) => {}
+                Err(err) => panic!("no such event: {err}"),
+            }
+        };
+        e.play("a");
+        let ev = until(&|ev| matches!(ev, Event::EngineError(_)));
+        assert!(matches!(ev, Event::EngineError(m) if m.contains("test panic")));
+        e.play("b");
+        until(&|ev| matches!(ev, Event::Started { id, .. } if id == "b"));
+        assert!(e.position().is_some_and(|p| p.id == "b"));
+    }
+
+    #[test]
+    fn locks_left_poisoned_by_a_panic_still_work() {
+        let mut r = Rig::new();
+        r.cmd(Cmd::Play("a".into()));
+        r.play_out(100);
+        let timeline = r.w.timeline.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = timeline.lock().unwrap();
+            panic!("test panic");
+        })
+        .join();
+        assert!(r.w.timeline.is_poisoned());
+        r.w.recover("test".into());
+        assert_eq!(r.events(), ["started a", "engine error"]);
+        assert_eq!(r.position(), None);
+        r.cmd(Cmd::Play("b".into()));
+        r.play_out(100);
+        assert_eq!(r.events(), ["started b"]);
+        assert_eq!(r.position().unwrap().id, "b");
     }
 
     #[test]

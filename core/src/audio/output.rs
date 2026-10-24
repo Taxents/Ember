@@ -368,7 +368,12 @@ impl Render {
         let mut cons = if paused && !fading_out {
             None
         } else {
-            ring.try_lock().ok()
+            match ring.try_lock() {
+                Ok(c) => Some(c),
+                // A panic elsewhere while it was held: the ring itself is still sound.
+                Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            }
         };
         if cons.is_none() && !paused {
             self.declick();
