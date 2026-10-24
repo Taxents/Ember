@@ -8,10 +8,13 @@
 //! * The API sits behind Cloudflare, which wants a browser user agent and a radio.garden
 //!   referer.
 //! * Favourites, recently played stations, searches and visited places: [`store`].
+//! * Listen Along: a hosting station's exact bytes are tapped and replayed on listeners
+//!   through a [`relay`].
 
 pub mod icy;
 pub mod logo;
 pub mod live;
+pub mod relay;
 pub mod store;
 
 use crate::{Error, Result};

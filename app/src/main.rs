@@ -4,6 +4,7 @@
 
 mod images;
 mod logos;
+mod listen;
 mod lyric_view;
 mod pages;
 mod radio;
@@ -116,6 +117,8 @@ struct Autoplay {
     seed: String,
     chips: Vec<Chip>,
     picked: usize,
+    /// The `play_seq` of the request in flight: an older one arriving later is dropped.
+    seq: u64,
 }
 
 struct App {
@@ -188,15 +191,27 @@ struct App {
     hidden_lists: Vec<PlaylistCard>,
     /// Songs for the playlist being named in the sidebar.
     naming_ids: Vec<String>,
+    /// Bumped each time the sidebar's playlists are asked for: only the latest answer shows.
+    playlists_seq: u64,
+    /// Playlists just saved to (`Some`) or removed from (`None`) your library, shown so until
+    /// YouTube's list (which lags a little) agrees.
+    library_wish: Vec<(String, Option<PlaylistCard>)>,
     playlist_rows: Rc<VecModel<SidebarPlaylist>>,
     account: Option<Account>,
 
     /// Seek to this once the restored track starts.
     resume_at: Option<u64>,
     minimized: bool,
-    position_timer: Timer,
+    /// Runs while skips come quickly; when it ends, the song they stopped at plays.
+    skip_timer: Timer,
+    /// Skips moved past songs without playing them (see [`App::skip`]).
+    skip_pending: bool,
+    /// Since when the current song has had no audible position (see [`App::tick`]).
+    waiting_since: Option<std::time::Instant>,
     /// Reads the band levels for the visualizer while playing (about 30 times a second).
     meter_timer: Timer,
+    /// Meter ticks so far: the clock moves every 8th, levels every 2nd (see [`App::meter_tick`]).
+    meter_ticks: u32,
     /// Per band: the recent peak (for scale) and the shown level.
     meter: [(f32, f32); 4],
     levels: Rc<VecModel<f32>>,
@@ -205,6 +220,9 @@ struct App {
     /// Sizes the page list waits to lay out at (see [`App::page_metrics`]).
     metrics: Option<rows::Metrics>,
     metrics_timer: Timer,
+    /// Listen Along, while in a session.
+    together: Option<listen::Session>,
+    together_timer: Timer,
 }
 
 thread_local! {
@@ -273,6 +291,8 @@ fn main() {
         plays: settings::load_plays(),
         plays_asked: Default::default(),
         play_seq: 0,
+        playlists_seq: 0,
+        library_wish: Vec::new(),
         page_cache: HashMap::new(),
         opened_from: None,
         extended: false,
@@ -288,8 +308,13 @@ fn main() {
         account: None,
         resume_at: None,
         minimized: false,
-        position_timer: Timer::default(),
+        skip_timer: Timer::default(),
+        skip_pending: false,
+        waiting_since: None,
+        together: None,
+        together_timer: Timer::default(),
         meter_timer: Timer::default(),
+        meter_ticks: 0,
         meter: [(0.0, 0.0); 4],
         levels: Rc::new(VecModel::from(vec![0.0; 4])),
         save_timer: Timer::default(),
@@ -401,6 +426,33 @@ fn wire(ui: &AppWindow) {
             },
         );
     });
+    g.on_together_opened(|| {
+        with(|a| a.together_opened());
+    });
+    g.on_together_start(|| {
+        with(|a| a.together_start());
+    });
+    g.on_together_join(|code| {
+        with(|a| a.together_join(&code));
+    });
+    g.on_together_copy(|| {
+        with(|a| a.together_copy());
+    });
+    g.on_together_leave(|| {
+        with(|a| a.together_leave(""));
+    });
+    g.on_together_resync(|| {
+        with(|a| a.together_resync());
+    });
+    g.on_together_name_changed(|name| {
+        with(|a| {
+            a.settings.together_name = name.trim().to_string();
+            a.save_later();
+        });
+    });
+    g.on_move_playlist(|from, to| {
+        with(|a| a.move_playlist(from.max(0) as usize, to.max(0) as usize));
+    });
     g.on_unhide_playlist(|id| {
         with(|a| {
             a.settings.hidden_playlists.retain(|h| h.as_str() != id.as_str());
@@ -489,14 +541,17 @@ fn wire(ui: &AppWindow) {
         with(|a| a.play_pause());
     });
     g.on_next(|| {
-        with(|a| a.player.next());
+        with(|a| a.skip(1));
     });
     g.on_previous(|| {
-        with(|a| a.player.previous());
+        with(|a| a.skip(-1));
     });
     g.on_seek(|ms| {
         with(|a| {
-            a.player.engine.seek(ms.max(0) as u64);
+            let ms = ms.max(0) as u64;
+            if !a.ask_host(listen::Req::Seek(ms)) {
+                a.player.engine.seek(ms);
+            }
             a.tick();
         });
     });
@@ -506,18 +561,28 @@ fn wire(ui: &AppWindow) {
     g.on_toggle_shuffle(|| {
         with(|a| {
             let on = !a.player.shuffle();
-            a.player.set_shuffle(on);
-            a.queue_changed();
+            if !a.ask_host(listen::Req::Shuffle(on)) {
+                a.player.set_shuffle(on);
+                a.queue_changed();
+            }
         });
     });
     g.on_cycle_repeat(|| {
         with(|a| {
-            a.player.set_repeat(match a.player.repeat {
+            let r = match a.player.repeat {
                 Repeat::Off => Repeat::All,
                 Repeat::All => Repeat::One,
                 Repeat::One => Repeat::Off,
-            });
-            a.queue_changed();
+            };
+            let code = match r {
+                Repeat::Off => 0,
+                Repeat::All => 1,
+                Repeat::One => 2,
+            };
+            if !a.ask_host(listen::Req::Repeat(code)) {
+                a.player.set_repeat(r);
+                a.queue_changed();
+            }
         });
     });
     g.on_toggle_like(|| {
@@ -527,19 +592,29 @@ fn wire(ui: &AppWindow) {
         with(|a| a.panel_changed());
     });
     g.on_queue_jump(|i| {
-        with(|a| a.player.jump(a.queue_from + i as usize));
+        with(|a| {
+            let pos = a.queue_from + i as usize;
+            if !a.ask_host(listen::Req::Jump(pos)) {
+                a.player.jump(pos);
+            }
+        });
     });
     g.on_queue_remove(|i| {
         with(|a| {
-            a.player.remove(a.queue_from + i as usize);
-            a.queue_changed();
+            let pos = a.queue_from + i as usize;
+            if !a.ask_host(listen::Req::Remove(pos)) {
+                a.player.remove(pos);
+                a.queue_changed();
+            }
         });
     });
     g.on_queue_move(|from, to| {
         with(|a| {
-            let at = a.queue_from;
-            a.player.move_item(at + from as usize, at + to as usize);
-            a.queue_changed();
+            let (from, to) = (a.queue_from + from as usize, a.queue_from + to as usize);
+            if !a.ask_host(listen::Req::Move(from, to)) {
+                a.player.move_item(from, to);
+                a.queue_changed();
+            }
         });
     });
     g.on_eq_toggle(|| {
@@ -623,6 +698,14 @@ impl App {
                 self.player.set_shuffle(true);
             }
             self.resume_at = Some(q.position_ms);
+            // Still a radio: its choices show, and it isn't started again from scratch.
+            self.autoplay = q.autoplay.map(|(seed, chips, picked)| Autoplay {
+                seed,
+                chips,
+                picked,
+                seq: 0,
+            });
+            self.show_autoplay();
             self.queue_changed();
             self.show_now_playing(false);
         }
@@ -1323,18 +1406,16 @@ impl App {
             title: title.into(),
         };
         match item {
-            // A song plays with the other songs beside it.
-            Item::Track(_) => {
-                let items: Vec<Item> = match &self.rows[row] {
-                    RowRef::Shelf(items, _) => items.clone(),
-                    _ => vec![item],
-                };
-                let start = items[..i.min(items.len())]
-                    .iter()
-                    .filter(|x| matches!(x, Item::Track(_)))
-                    .count();
-                self.play_list(pages::tracks_of(items), Some(start), None);
+            // A music video plays (unless it is already) and opens its song page, the
+            // picture centred.
+            Item::Track(ref t) if t.kind == TrackKind::Video => {
+                let t = t.clone();
+                if self.player.current() != Some(t.video_id.as_str()) {
+                    self.play_shelf_track(row, i, item);
+                }
+                self.open_video(&t);
             }
+            Item::Track(_) => self.play_shelf_track(row, i, item),
             Item::Album(ref a) => {
                 let r = route(PageKind::Album, &a.id, &a.title);
                 self.opened_from = Some(item);
@@ -1360,10 +1441,24 @@ impl App {
         }
     }
 
-    /// The play button on a card.
+    /// A song card plays with the other songs beside it.
+    fn play_shelf_track(&mut self, row: usize, i: usize, item: Item) {
+        let items: Vec<Item> = match &self.rows[row] {
+            RowRef::Shelf(items, _) => items.clone(),
+            _ => vec![item],
+        };
+        let start = items[..i.min(items.len())]
+            .iter()
+            .filter(|x| matches!(x, Item::Track(_)))
+            .count();
+        self.play_list(pages::tracks_of(items), Some(start), None);
+    }
+
+    /// The play button on a card: it plays, opening nothing.
     fn card_play(&mut self, row: usize, i: usize) {
         match self.card_item(row, i).cloned() {
-            Some(Item::Track(_)) => self.card_clicked(row, i),
+            Some(Item::Track(_)) if self.radio_card_clicked(row, i) => {}
+            Some(item @ Item::Track(_)) => self.play_shelf_track(row, i, item),
             Some(item) => self.play_item(item, Mode::Play),
             None => {}
         }
@@ -1422,7 +1517,7 @@ impl App {
         let playlist = self.history[self.at].id.clone();
         let client = self.client.clone();
         let generation = self.generation;
-        workers::run(
+        workers::run_ordered(
             move || client.move_in_playlist(&playlist, &set_id, before.as_deref()),
             move |r| {
                 if let Err(e) = r {
@@ -1453,7 +1548,8 @@ impl App {
             return;
         }
         let generation = self.generation;
-        workers::run_urgent(
+        // Rate-limited (it may wait its turn a while): kept off the threads pages load on.
+        workers::run_background(
             move || logos::find(&name, channel.as_deref()),
             move |url| {
                 with(|a| {
@@ -1819,6 +1915,12 @@ impl App {
             PageKind::Search | PageKind::Song
         ) {
             let t = self.page_tracks[ti].clone();
+            // A music video found by search opens on its song page, the picture centred.
+            let video = t.kind == TrackKind::Video && self.history[self.at].kind == PageKind::Search;
+            if video {
+                self.autoplay_from(t.clone(), None);
+                return self.open_video(&t);
+            }
             return self.autoplay_from(t, None);
         }
         let group = self.page_groups[ti];
@@ -1832,12 +1934,76 @@ impl App {
                 tracks.push(t.clone());
             }
         }
-        self.play_list(tracks, Some(start), None);
+        // A list showing only its top few (an artist's Top songs): the whole list plays, from
+        // its "See all" playlist. The clicked song starts at once; the rest follow when loaded.
+        let full = (group != 0)
+            .then(|| {
+                self.rows[..i as usize].iter().rev().find_map(|r| match r {
+                    RowRef::Heading(m) => Some(m.clone()),
+                    _ => None,
+                })
+            })
+            .flatten()
+            .flatten()
+            .filter(|m| m.browse_id.starts_with("VL"));
+        let Some(more) = full else {
+            return self.play_list(tracks, Some(start), None);
+        };
+        let shown: Vec<String> = tracks.iter().map(|t| t.video_id.clone()).collect();
+        let chosen = shown[start].clone();
+        if !self.listening() {
+            self.play_list(tracks, Some(start), None);
+        }
+        self.play_seq += 1;
+        let seq = self.play_seq;
+        let client = self.client.clone();
+        workers::run_urgent(
+            {
+                let id = more.browse_id.clone();
+                move || client.playlist_all(&id, 500).map(|p| p.tracks)
+            },
+            move |res| {
+                with(|a| match res {
+                    // Something else was played since.
+                    Ok(_) if a.play_seq != seq => {}
+                    Ok(_) if !a.listening() && !a.player.queue().starts_with(&shown) => {}
+                    Ok(all) if a.listening() => {
+                        let start = all.iter().position(|t| t.video_id == chosen);
+                        a.play_list(all, start, None);
+                    }
+                    Ok(all) => {
+                        let rest: Vec<Track> = all
+                            .into_iter()
+                            .filter(|t| !t.unavailable && !shown.contains(&t.video_id))
+                            .collect();
+                        if rest.is_empty() {
+                            return;
+                        }
+                        let ids = rest.iter().map(|t| t.video_id.clone()).collect();
+                        for t in rest {
+                            a.known.insert(t.video_id.clone(), t);
+                        }
+                        a.player.append(ids);
+                        a.queue_changed();
+                    }
+                    Err(e) => log::warn!("{}: {e}", more.browse_id),
+                });
+            },
+        );
     }
 
     /// Plays `tracks` from `start` (else a random one when shuffling, else the first). `shuffle`
     /// sets shuffle on or off; `None` leaves it.
     fn play_list(&mut self, tracks: Vec<Track>, start: Option<usize>, shuffle: Option<bool>) {
+        if self.listening() {
+            let tracks: Vec<Track> = tracks.into_iter().filter(|t| !t.unavailable).collect();
+            self.ask_host(listen::Req::Play {
+                tracks,
+                start,
+                shuffle,
+            });
+            return;
+        }
         self.autoplay = None;
         if let Some(on) = shuffle {
             self.player.set_shuffle(on);
@@ -1927,6 +2093,10 @@ impl App {
         if self.player.current() != Some(id.as_str()) {
             self.play_list(vec![t], Some(0), Some(false));
         }
+        // Listening along: the host's app grows the radio.
+        if self.listening() {
+            return;
+        }
         let (picked, watch) = match chip {
             Some((i, w)) => (i, Some(w)),
             None => (0, None),
@@ -1935,10 +2105,12 @@ impl App {
             Some(a) if watch.is_some() => a.chips,
             _ => Vec::new(),
         };
+        let seq = self.play_seq;
         self.autoplay = Some(Autoplay {
             seed: id.clone(),
             chips,
             picked,
+            seq,
         });
         self.show_autoplay();
         let client = self.client.clone();
@@ -1947,9 +2119,9 @@ impl App {
                 Some(w) => client.watch_next(Some(&id), Some(&w.playlist_id), w.params.as_deref()),
                 None => client.radio(&id),
             },
-            |r| {
+            move |r| {
                 with(|a| match r {
-                    Ok(w) => a.autoplay_arrived(w),
+                    Ok(w) => a.autoplay_arrived(w, seq),
                     Err(e) => log::warn!("autoplay: {e}"),
                 });
             },
@@ -1957,11 +2129,12 @@ impl App {
     }
 
     /// The radio arrived: it becomes everything after the song, if that's still what plays.
-    fn autoplay_arrived(&mut self, w: WatchNext) {
+    fn autoplay_arrived(&mut self, w: WatchNext, seq: u64) {
         let Some(ap) = &mut self.autoplay else {
             return;
         };
-        if self.player.current() != Some(ap.seed.as_str()) {
+        // Asked again since (another choice, the radio button) or something else plays.
+        if ap.seq != seq || self.player.current() != Some(ap.seed.as_str()) {
             return;
         }
         // The choices come with the first answer; picking one keeps them.
@@ -2049,6 +2222,13 @@ impl App {
             Mode::Play => self.play_list(tracks, None, Some(false)),
             Mode::Shuffle => self.play_list(tracks, None, Some(true)),
             Mode::Next | Mode::Queue => {
+                let playable = tracks.iter().filter(|t| !t.unavailable).cloned().collect();
+                if self.ask_host(listen::Req::Add {
+                    tracks: playable,
+                    next: mode == Mode::Next,
+                }) {
+                    return;
+                }
                 let ids: Vec<String> = tracks
                     .iter()
                     .filter(|t| !t.unavailable)
@@ -2071,10 +2251,56 @@ impl App {
         }
     }
 
+    /// Next (1) or previous (-1). The first press acts at once; presses that follow quickly
+    /// only move along the queue (showing each song), and the one they stop at plays, so
+    /// pressing a lot doesn't start and abandon a load per press.
+    fn skip(&mut self, dir: i64) {
+        if self.ask_host(if dir > 0 {
+            listen::Req::Next
+        } else {
+            listen::Req::Previous
+        }) {
+            return;
+        }
+        if !self.skip_timer.running() {
+            if dir > 0 {
+                self.player.next();
+            } else {
+                self.player.previous();
+            }
+        } else if self.player.step_to(dir) {
+            // What was loading (or playing) is no longer wanted.
+            self.player.engine.stop();
+            self.skip_pending = true;
+            self.resume_at = None;
+            self.show_now_playing(false);
+            self.queue_changed();
+        }
+        self.skip_timer
+            .start(TimerMode::SingleShot, Duration::from_millis(400), || {
+                with(|a| {
+                    if std::mem::take(&mut a.skip_pending) {
+                        a.player.play_current();
+                    }
+                });
+            });
+    }
+
     fn play_pause(&mut self) {
+        if self.ask_host(listen::Req::Toggle) {
+            return;
+        }
         match self.player.engine.position() {
-            Some(p) if p.paused => self.player.engine.resume(),
-            Some(_) => self.player.engine.pause(),
+            // Hosting Listen Along: everyone starts again together.
+            Some(p) if p.paused => {
+                if !self.together_resume() {
+                    self.player.engine.resume();
+                }
+            }
+            Some(_) => {
+                self.player.engine.pause();
+                self.together_paused();
+            }
             None => self.player.play_current(),
         }
         self.tick();
@@ -2101,6 +2327,7 @@ impl App {
 
     fn on_engine(&mut self, e: Event) {
         self.player.on_event(&e);
+        self.together_engine(&e);
         match &e {
             Event::Started { id, .. } => {
                 self.video_sync();
@@ -2116,6 +2343,7 @@ impl App {
                     self.station_started(id);
                 }
                 if !station
+                    && !self.listening()
                     && self.queue_from >= self.queue_ids.len()
                     && self.player.repeat == Repeat::Off
                     && self.autoplay.as_ref().is_none_or(|ap| ap.seed != *id)
@@ -2137,7 +2365,11 @@ impl App {
             Event::Finished => self.tick(),
             Event::Failed { id, error } => log::warn!("{id}: {error}"),
             Event::Device(d) => log::info!("device: {d}"),
-            Event::Title { id, title } => self.station_title(id, title),
+            Event::Title { id, title } => {
+                self.together_title(id, title);
+                self.station_title(id, title);
+            }
+            Event::Cueing { .. } | Event::Cued { .. } => {}
         }
     }
 
@@ -2183,10 +2415,23 @@ impl App {
         self.tick();
     }
 
-    /// Reads the engine position; keeps a 4 Hz timer running only while playing and visible.
     /// Turns the engine's band levels into 0..1 bars: each band against its own recent peak (so
     /// quiet songs move too), jumping up at once and falling back smoothly.
+    /// Every redraw is the whole window, so things that move share frames: the clock moves on
+    /// every 8th tick (~4 Hz), and levels (the sung line's glow, the playing row's bars) go out
+    /// ~15 times a second, or with any frame drawn anyway.
     fn meter_tick(&mut self) {
+        self.meter_ticks = self.meter_ticks.wrapping_add(1);
+        let drew = if self.meter_ticks.is_multiple_of(8) {
+            self.tick();
+            true
+        } else {
+            self.lyrics_tick()
+        };
+        if !self.meter_timer.running() {
+            return; // `tick` stopped it
+        }
+        let write = drew || self.meter_ticks.is_multiple_of(2);
         let raw = self.player.engine.levels();
         for (i, (peak, shown)) in self.meter.iter_mut().enumerate() {
             let v = raw[i];
@@ -2196,9 +2441,10 @@ impl App {
             // Bass gets a punchier curve, like the old immersive background's pulse.
             let x = if i == 0 { x * x } else { x.powf(1.4) };
             *shown = x.max(*shown * 0.82);
-            self.levels.set_row_data(i, *shown);
+            if write {
+                self.levels.set_row_data(i, *shown);
+            }
         }
-        self.lyrics_tick();
     }
 
     /// Fetches the playing song's lyrics for the panel, and lets a song page of it follow along.
@@ -2229,7 +2475,7 @@ impl App {
             return;
         };
         let client = self.client.clone();
-        workers::run(
+        workers::run_background(
             move || pages::lyrics_for(&client, &t, None),
             move |found| {
                 with(|a| {
@@ -2256,17 +2502,18 @@ impl App {
     /// Moves the lyrics to the playback position: the sung line at 4 Hz from `tick`, and its
     /// word-by-word fill at ~30 Hz from the meter timer, the fill only while lyrics are on
     /// screen (the panel's lyrics tab, or this song's page).
-    fn lyrics_tick(&mut self) {
+    /// Moves the lyrics along; whether any row changed (a frame is drawn anyway).
+    fn lyrics_tick(&mut self) -> bool {
         if self.lyrics.as_ref().is_none_or(|l| l.lyrics.lines.is_empty()) {
-            return;
+            return false;
         }
         let Some(p) = self.player.engine.position() else {
-            return;
+            return false;
         };
         let ui = self.ui();
         let g = ui.global::<Ui>();
         let Some(f) = self.lyrics.as_mut() else {
-            return;
+            return false;
         };
         let page = g.get_page();
         let visible = (g.get_panel_open() && g.get_panel_tab() == 0)
@@ -2277,8 +2524,13 @@ impl App {
             g.set_lyric_line(line);
         }
         let (row, through) = f.pause.map_or((-1, 0.0), |(r, k)| (r as i32, k));
+        let drew = f.drew;
+        // The waiting dots move ~15 times a second, unless this tick draws anyway.
+        if drew || row != g.get_lyric_pause_row() || self.meter_ticks.is_multiple_of(2) {
+            g.set_lyric_pause(through);
+        }
         g.set_lyric_pause_row(row);
-        g.set_lyric_pause(through);
+        drew
     }
 
     fn tick(&mut self) {
@@ -2307,15 +2559,21 @@ impl App {
             }
         }
         g.set_np(np);
-        let want = playing && !self.minimized;
-        if want && !self.position_timer.running() {
-            self.position_timer
-                .start(TimerMode::Repeated, Duration::from_millis(250), || {
-                    with(|a| a.tick());
-                });
-        } else if !want && self.position_timer.running() {
-            self.position_timer.stop();
+        // A song that's current but not audible yet (loading, seeking, a skip) keeps the clock
+        // asking for a while: its start can come without an event that would wake it again.
+        let waiting = pos.is_none() && self.player.current().is_some();
+        if !waiting {
+            self.waiting_since = None;
         }
+        let waited = self.waiting_since.get_or_insert_with(std::time::Instant::now).elapsed();
+        if waiting && (3000..3250).contains(&waited.as_millis()) {
+            log::warn!(
+                "{}: no audible position after 3 s",
+                self.player.current().unwrap_or_default()
+            );
+        }
+        let want = (playing || waiting && waited < Duration::from_secs(20)) && !self.minimized;
+        // The meter's timer moves the clock too (see `meter_tick`).
         if want && !self.meter_timer.running() {
             g.set_levels(ModelRc::from(self.levels.clone()));
             self.meter_timer
@@ -2335,15 +2593,24 @@ impl App {
         self.queue_from = (at + 1).min(self.queue_ids.len());
         let rows: Vec<TrackRow> = self.queue_ids[self.queue_from..]
             .iter()
-            .map(|id| match self.known.get(id) {
-                Some(t) => self.row_for(t, false, true),
-                None => TrackRow {
-                    title: id.clone().into(),
-                    ..Default::default()
-                },
+            .enumerate()
+            .map(|(i, id)| {
+                let mut row = match self.known.get(id) {
+                    Some(t) => self.row_for(t, false, true),
+                    None => TrackRow {
+                        title: id.clone().into(),
+                        ..Default::default()
+                    },
+                };
+                // Listen Along: who added it.
+                if let Some(by) = self.added_by(id, self.queue_from + i) {
+                    row.artist = format!("{} \u{b7} added by {by}", row.artist).into();
+                }
+                row
             })
             .collect();
         self.queue_rows.set_vec(rows);
+        self.together_queue_changed();
         let current = self.player.current().map(str::to_string);
         for (ri, r) in self.rows.iter().enumerate() {
             let RowRef::Track(ti) = r else { continue };
@@ -2384,6 +2651,10 @@ impl App {
                 .unwrap_or(0),
             shuffle: self.player.shuffle(),
             repeat: self.player.repeat,
+            autoplay: self
+                .autoplay
+                .as_ref()
+                .map(|a| (a.seed.clone(), a.chips.clone(), a.picked)),
         }
         .save();
     }
@@ -2423,7 +2694,7 @@ impl App {
         np.liked = like == Like::Like;
         g.set_np(np);
         let client = self.client.clone();
-        workers::spawn(move || {
+        workers::spawn_ordered(move || {
             if let Err(e) = client.rate(&id, like) {
                 log::warn!("like: {e}");
             }
@@ -2454,8 +2725,8 @@ impl App {
                     self.play_pause();
                 }
             }
-            Remote::Next => self.player.next(),
-            Remote::Previous => self.player.previous(),
+            Remote::Next => self.skip(1),
+            Remote::Previous => self.skip(-1),
             Remote::Back => self.go(-1),
             Remote::Forward => self.go(1),
             Remote::Minimized => self.minimize(),
@@ -2472,7 +2743,6 @@ impl App {
         }
         self.minimized = true;
         self.video_sync();
-        self.position_timer.stop();
         self.meter_timer.stop();
         self.images.clear();
         let blank = |rows: &dyn rows::RowStore| {
@@ -2631,15 +2901,19 @@ impl App {
         if !self.client.signed_in() {
             return;
         }
+        self.playlists_seq += 1;
+        let seq = self.playlists_seq;
         let client = self.client.clone();
-        workers::run(
+        // After the changes asked for before it, so it sees them.
+        workers::run_ordered(
             move || client.library_playlists(),
-            |r| {
+            move |r| {
                 with(|a| match r {
-                    // Signed out meanwhile: they aren't yours to show any more.
-                    _ if !a.client.signed_in() => {}
+                    // Signed out meanwhile (they aren't yours to show any more), or asked for
+                    // again since: that answer is the one to show.
+                    _ if !a.client.signed_in() || seq != a.playlists_seq => {}
                     Ok(f) => {
-                        let (hidden, shown): (Vec<_>, Vec<_>) = f
+                        let all: Vec<PlaylistCard> = f
                             .shelves
                             .into_iter()
                             .flat_map(|s| s.items)
@@ -2647,28 +2921,70 @@ impl App {
                                 Item::Playlist(p) if p.id != "VLLM" => Some(p),
                                 _ => None,
                             })
-                            .partition(|p| a.settings.hidden_playlists.contains(&p.id));
-                        a.playlists = shown;
-                        a.hidden_lists = hidden;
-                        a.show_hidden_lists();
-                        let rows: Vec<SidebarPlaylist> = a
-                            .playlists
-                            .iter()
-                            .map(|p| SidebarPlaylist {
-                                id: p.id.clone().into(),
-                                title: p.title.clone().into(),
-                                cover: Image::default(),
-                            })
                             .collect();
-                        a.playlist_rows.set_vec(rows);
-                        for i in 0..a.playlists.len() {
-                            a.sidebar_cover(i);
-                        }
+                        // What YouTube now agrees with needn't be remembered.
+                        a.library_wish.retain(|(id, wish)| {
+                            all.iter().any(|p| p.id == *id) != wish.is_some()
+                        });
+                        a.set_playlists(all);
                     }
                     Err(e) => log::warn!("playlists: {e}"),
                 });
             },
         );
+    }
+
+    /// Shows your playlists in the sidebar: what you just saved or removed as such, hidden ones
+    /// apart, in the order you put them in.
+    fn set_playlists(&mut self, mut all: Vec<PlaylistCard>) {
+        for (id, wish) in &self.library_wish {
+            match wish {
+                Some(card) if !all.iter().any(|p| p.id == *id) => all.insert(0, card.clone()),
+                None => all.retain(|p| p.id != *id),
+                _ => {}
+            }
+        }
+        let order = &self.settings.playlist_order;
+        // Stable: ones not in the order (new since) keep YouTube's order, first.
+        all.sort_by_key(|p| order.iter().position(|o| *o == p.id).map_or(0, |i| i + 1));
+        let (hidden, shown): (Vec<_>, Vec<_>) = all
+            .into_iter()
+            .partition(|p| self.settings.hidden_playlists.contains(&p.id));
+        self.playlists = shown;
+        self.hidden_lists = hidden;
+        self.show_hidden_lists();
+        let rows: Vec<SidebarPlaylist> = self
+            .playlists
+            .iter()
+            .map(|p| SidebarPlaylist {
+                id: p.id.clone().into(),
+                title: p.title.clone().into(),
+                cover: Image::default(),
+            })
+            .collect();
+        self.playlist_rows.set_vec(rows);
+        for i in 0..self.playlists.len() {
+            self.sidebar_cover(i);
+        }
+    }
+
+    /// A sidebar playlist was dragged from `from` to before `to`.
+    fn move_playlist(&mut self, from: usize, to: usize) {
+        if from >= self.playlists.len() || to > self.playlists.len() || to == from || to == from + 1
+        {
+            return;
+        }
+        let p = self.playlists.remove(from);
+        self.playlists.insert(if to > from { to - 1 } else { to }, p);
+        self.settings.playlist_order = self
+            .playlists
+            .iter()
+            .chain(&self.hidden_lists)
+            .map(|p| p.id.clone())
+            .collect();
+        self.save_later();
+        let all = self.playlists.iter().chain(&self.hidden_lists).cloned().collect();
+        self.set_playlists(all);
     }
 
     // ---- right-click menu ------------------------------------------------------------------
@@ -2876,6 +3192,13 @@ impl App {
                 match choice {
                     "play" => self.play_page(row as i32),
                     "next" | "queue" => {
+                        let req = listen::Req::Add {
+                            tracks: vec![t.clone()],
+                            next: choice == "next",
+                        };
+                        if self.ask_host(req) {
+                            return;
+                        }
                         let id = t.video_id.clone();
                         self.known.insert(id.clone(), t);
                         if choice == "next" {
@@ -2957,7 +3280,7 @@ impl App {
                 let generation = self.generation;
                 let showing = self.history[self.at].id == playlist;
                 self.page_cache.remove(&format!("{:?}|{}", PageKind::Playlist, playlist));
-                workers::run(
+                workers::run_ordered(
                     move || client.add_to_playlist(&playlist, &ids),
                     move |r| {
                         with(|a| match r {
@@ -2970,7 +3293,11 @@ impl App {
                 );
             }
             MenuTarget::Queue(pos) => match choice {
-                "play" => self.player.jump(pos),
+                "play" => {
+                    if !self.ask_host(listen::Req::Jump(pos)) {
+                        self.player.jump(pos);
+                    }
+                }
                 "dislike" => {
                     if let Some(t) = self.queue_ids.get(pos).and_then(|id| self.known.get(id)) {
                         self.dislike(t.clone());
@@ -3009,8 +3336,10 @@ impl App {
                     }
                 }
                 "remove" => {
-                    self.player.remove(pos);
-                    self.queue_changed();
+                    if !self.ask_host(listen::Req::Remove(pos)) {
+                        self.player.remove(pos);
+                        self.queue_changed();
+                    }
                 }
                 _ => {
                     if let Some(t) = self.queue_ids.get(pos).and_then(|id| self.known.get(id)) {
@@ -3112,7 +3441,7 @@ impl App {
             g.set_np(np);
         }
         let (client, id) = (self.client.clone(), id.to_string());
-        workers::spawn(move || {
+        workers::spawn_ordered(move || {
             if let Err(e) = client.rate(&id, like) {
                 log::warn!("like: {e}");
             }
@@ -3125,6 +3454,14 @@ impl App {
             id: t.video_id.clone(),
             title: t.title.clone(),
         });
+    }
+
+    /// A music video's song page, which scrolls to centre the picture once it shows.
+    fn open_video(&mut self, t: &Track) {
+        self.open_song(t);
+        let ui = self.ui();
+        let g = ui.global::<Ui>();
+        g.set_centre_video_serial(g.get_centre_video_serial().wrapping_add(1));
     }
 
     /// The song entries every song menu shares (track rows, cards, the queue).
@@ -3183,7 +3520,7 @@ impl App {
         c.title = name.clone().into();
         g.set_collection(c);
         let client = self.client.clone();
-        workers::run_urgent(
+        workers::run_ordered(
             move || client.rename_playlist(&id, &name),
             |r| {
                 with(|a| match r {
@@ -3223,7 +3560,7 @@ impl App {
             }
         }
         let client = self.client.clone();
-        workers::spawn(move || {
+        workers::spawn_ordered(move || {
             if let Err(e) = client.feedback(&token) {
                 log::warn!("library: {e}");
             }
@@ -3239,7 +3576,7 @@ impl App {
             self.drop_from_page(&|i| pages::item_id(i) == id);
         }
         let client = self.client.clone();
-        workers::run(
+        workers::run_ordered(
             move || -> music_core::Result<()> {
                 let id = match &item {
                     Item::Album(a) => client.album(&a.id)?.playlist_id.unwrap_or_default(),
@@ -3267,13 +3604,30 @@ impl App {
         };
         *saved = !*saved;
         let (id, save) = (id.clone(), *saved);
+        // A playlist: in the sidebar (or out of it) at once, not when YouTube's list catches up.
+        let r = &self.history[self.at];
+        if r.kind == PageKind::Playlist
+            && let Some(h) = &self.header
+        {
+            let card = save.then(|| PlaylistCard {
+                id: r.id.clone(),
+                title: h.title.clone(),
+                thumbs: h.thumbs.clone(),
+                ..Default::default()
+            });
+            let rid = r.id.clone();
+            self.library_wish.retain(|(w, _)| *w != rid);
+            self.library_wish.push((rid, card));
+            let all = self.playlists.iter().chain(&self.hidden_lists).cloned().collect();
+            self.set_playlists(all);
+        }
         let ui = self.ui();
         let g = ui.global::<Ui>();
         let mut c = g.get_collection();
         c.saved = save;
         g.set_collection(c);
         let client = self.client.clone();
-        workers::run(
+        workers::run_ordered(
             move || client.save_playlist(&id, save),
             |r| {
                 with(|a| match r {
@@ -3299,7 +3653,7 @@ impl App {
         c.following = follow;
         g.set_collection(c);
         let client = self.client.clone();
-        workers::spawn(move || {
+        workers::spawn_ordered(move || {
             if let Err(e) = client.subscribe(&channel, follow) {
                 log::warn!("follow: {e}");
             }
@@ -3324,8 +3678,13 @@ impl App {
             p.like = Some(Like::Dislike);
         }
         self.drop_from_page(&|i| matches!(i, Item::Track(x) if x.video_id == id));
-        // Out of the queue: skipped if it's playing, else taken out.
-        if self.player.current() == Some(id.as_str()) {
+        // Out of the queue: skipped if it's playing, else taken out (listening along: by the
+        // host, who is asked to skip it if it plays).
+        if self.listening() {
+            if self.player.current() == Some(id.as_str()) {
+                self.ask_host(listen::Req::Next);
+            }
+        } else if self.player.current() == Some(id.as_str()) {
             self.player.next();
         }
         let at = self.player.up_next().1;
@@ -3337,11 +3696,13 @@ impl App {
             .map(|(i, _)| i)
             .collect();
         for pos in gone.into_iter().rev() {
-            self.player.remove(pos);
+            if !self.ask_host(listen::Req::Remove(pos)) {
+                self.player.remove(pos);
+            }
         }
         self.queue_changed();
         let client = self.client.clone();
-        workers::spawn(move || {
+        workers::spawn_ordered(move || {
             if let Err(e) = client.rate(&t.video_id, Like::Dislike) {
                 log::warn!("dislike: {e}");
             }
@@ -3356,7 +3717,7 @@ impl App {
         let id = pages::item_id(&item).to_string();
         self.drop_from_page(&|i| pages::item_id(i) == id);
         let client = self.client.clone();
-        workers::spawn(move || {
+        workers::spawn_ordered(move || {
             if let Err(e) = client.feedback(&token) {
                 log::warn!("not interested: {e}");
             }
@@ -3511,7 +3872,7 @@ impl App {
         let playlist = self.history[self.at].id.clone();
         let client = self.client.clone();
         let generation = self.generation;
-        workers::run(
+        workers::run_ordered(
             move || client.remove_from_playlist(&playlist, &[t]),
             move |r| {
                 if let Err(e) = r {
@@ -3576,7 +3937,7 @@ impl App {
             return;
         }
         let client = self.client.clone();
-        workers::run(
+        workers::run_ordered(
             move || client.create_playlist(&name, "", &ids),
             |r| {
                 with(|a| match r {
@@ -3594,7 +3955,7 @@ impl App {
         self.forget_pages(PageKind::AllPlaylists);
         let client = self.client.clone();
         let gone = id.clone();
-        workers::run(
+        workers::run_ordered(
             move || client.delete_playlist(&gone),
             move |r| {
                 with(|a| match r {

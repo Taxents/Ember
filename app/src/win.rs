@@ -429,3 +429,27 @@ pub fn copy_text(hwnd: HWND, text: &str) {
         let _ = CloseClipboard();
     }
 }
+
+/// The clipboard's text, if it holds any.
+pub fn paste_text(hwnd: HWND) -> Option<String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+    unsafe {
+        OpenClipboard(Some(hwnd)).ok()?;
+        let mut text = None;
+        if let Ok(h) = GetClipboardData(CF_UNICODETEXT.0 as u32) {
+            let mem = HGLOBAL(h.0);
+            let p = GlobalLock(mem) as *const u16;
+            if !p.is_null() {
+                let max = GlobalSize(mem) / 2;
+                let len = (0..max).take_while(|&i| *p.add(i) != 0).count();
+                text = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)));
+                let _ = GlobalUnlock(mem);
+            }
+        }
+        let _ = CloseClipboard();
+        text
+    }
+}

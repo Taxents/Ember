@@ -1,11 +1,15 @@
 fn main() {
     slint_build::compile("ui/app.slint").expect("slint");
 
-    // The exe's own icon (Explorer, shortcuts, the taskbar before the window opens).
+    // The exe's own icon (Explorer, shortcuts, the taskbar before the window opens) and name
+    // (Task Manager shows the description, which would otherwise be the crate's name).
     println!("cargo:rerun-if-changed=icons/ember.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         winresource::WindowsResource::new()
             .set_icon("icons/ember.ico")
+            .set("FileDescription", "Ember")
+            .set("ProductName", "Ember")
+            .set("OriginalFilename", "ember.exe")
             .compile()
             .expect("icon resource");
     }

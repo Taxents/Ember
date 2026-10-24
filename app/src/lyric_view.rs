@@ -24,6 +24,8 @@ pub struct Follow {
     filled: Vec<(usize, String)>,
     /// A long instrumental gap: the row of the line after it, and how far through it (0..1).
     pub pause: Option<(usize, f32)>,
+    /// Whether the last `at` changed any row (so the window redraws this tick anyway).
+    pub drew: bool,
 }
 
 impl Follow {
@@ -36,6 +38,7 @@ impl Follow {
             line: -1,
             filled: Vec::new(),
             pause: None,
+            drew: false,
         }
     }
 
@@ -57,6 +60,7 @@ impl Follow {
         let paused = pause.is_some() && self.pause.is_none();
         self.pause = pause;
         let changed = line != self.line;
+        self.drew = false;
         if changed || paused {
             // Back to plain; the view fades the line from all lit (`done`) into that.
             for (i, _) in std::mem::take(&mut self.filled) {
@@ -66,6 +70,7 @@ impl Follow {
                     self.model.set_row_data(i, r);
                 }
                 self.set_fill(i, &plain(&lines[i].text()), "");
+                self.drew = true;
             }
             self.line = line;
         }
@@ -80,6 +85,7 @@ impl Follow {
                     None => self.filled.push((i, m.clone())),
                 }
                 self.set_fill(i, &m, &glow);
+                self.drew = true;
             }
         }
         changed.then_some(line)
@@ -117,12 +123,22 @@ fn pause_at(lines: &[Line], line: i32, t: u64) -> Option<(usize, f32)> {
 /// The UI's lines. A background line's `group` is the main line it belongs to.
 pub fn rows(l: &Lyrics) -> Vec<LyricLine> {
     let mut group = 0;
+    // When the singing before a main line ends: the previous group's end (0 before the first,
+    // as `pause_at` counts it).
+    let mut sung_until = 0;
+    let mut seen_main = false;
     l.lines
         .iter()
         .enumerate()
         .map(|(i, x)| {
+            let mut gap = 0;
             if !x.background {
+                gap = x.start.saturating_sub(sung_until);
                 group = i;
+                sung_until = x.end;
+                seen_main = true;
+            } else if seen_main {
+                sung_until = sung_until.max(x.end);
             }
             let text = x.text();
             LyricLine {
@@ -134,6 +150,7 @@ pub fn rows(l: &Lyrics) -> Vec<LyricLine> {
                 group: group as i32,
                 agent: x.agent as i32,
                 background: x.background,
+                gap: gap.min(i32::MAX as u64) as i32,
             }
         })
         .collect()

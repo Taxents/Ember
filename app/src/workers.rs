@@ -16,13 +16,16 @@ struct Jobs {
 struct Pool {
     jobs: Mutex<Jobs>,
     ready: Condvar,
+    /// First in, first out (changes to your account, which must land in the order made).
+    fifo: bool,
 }
 
 impl Pool {
-    fn start(name: &'static str, threads: usize) -> Arc<Pool> {
+    fn start(name: &'static str, threads: usize, fifo: bool) -> Arc<Pool> {
         let q = Arc::new(Pool {
             jobs: Mutex::new(Jobs::default()),
             ready: Condvar::new(),
+            fifo,
         });
         for i in 0..threads {
             let q = q.clone();
@@ -34,7 +37,12 @@ impl Pool {
                         let job = {
                             let mut jobs = q.jobs.lock().unwrap();
                             loop {
-                                if let Some(j) = jobs.urgent.pop().or_else(|| jobs.normal.pop()) {
+                                let next = if q.fifo && !jobs.normal.is_empty() {
+                                    Some(jobs.normal.remove(0))
+                                } else {
+                                    jobs.urgent.pop().or_else(|| jobs.normal.pop())
+                                };
+                                if let Some(j) = next {
                                     break j;
                                 }
                                 jobs = q.ready.wait(jobs).unwrap();
@@ -62,19 +70,45 @@ impl Pool {
 
 fn api() -> &'static Pool {
     static POOL: OnceLock<Arc<Pool>> = OnceLock::new();
-    POOL.get_or_init(|| Pool::start("net", 3))
+    POOL.get_or_init(|| Pool::start("net", 3, false))
 }
 
 fn art() -> &'static Pool {
     static POOL: OnceLock<Arc<Pool>> = OnceLock::new();
     // Mostly waiting on the network (images come from a few hosts, over kept-alive connections).
-    POOL.get_or_init(|| Pool::start("art", 8))
+    POOL.get_or_init(|| Pool::start("art", 8, false))
 }
 
 fn background() -> &'static Pool {
     static POOL: OnceLock<Arc<Pool>> = OnceLock::new();
-    // Look-ups nobody waits for (play counts per row): never in the way of a page or a click.
-    POOL.get_or_init(|| Pool::start("bg", 2))
+    // Look-ups nobody waits on, or that can be slow (play counts per row, logos, lyrics): never
+    // in the way of a page or a click.
+    POOL.get_or_init(|| Pool::start("bg", 3, false))
+}
+
+fn ordered() -> &'static Pool {
+    static POOL: OnceLock<Arc<Pool>> = OnceLock::new();
+    POOL.get_or_init(|| Pool::start("account", 1, true))
+}
+
+/// [`run`], one at a time in the order asked: changes to your account (like, save, add to a
+/// playlist), so clicking quickly lands them as clicked.
+pub fn run_ordered<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+    done: impl FnOnce(T) + Send + 'static,
+) {
+    ordered().push(
+        Box::new(move || {
+            let r = job();
+            let _ = slint::invoke_from_event_loop(move || done(r));
+        }),
+        false,
+    );
+}
+
+/// [`spawn`], in order with [`run_ordered`].
+pub fn spawn_ordered(job: impl FnOnce() + Send + 'static) {
+    ordered().push(Box::new(job), false);
 }
 
 /// [`run`], on threads of their own, for the many small look-ups a page asks for.

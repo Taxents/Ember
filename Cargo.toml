@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "signin", "app"]
+members = ["core", "signin", "app", "together"]
 # The audio test harness is local only and builds on its own.
 exclude = ["cli"]
 

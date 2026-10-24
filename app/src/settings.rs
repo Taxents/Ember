@@ -3,7 +3,7 @@
 use music_core::audio::EqSettings;
 use music_core::paths::{config_dir, write_atomic};
 use music_core::player::Repeat;
-use music_core::yt::model::Track;
+use music_core::yt::model::{Chip, Track};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +21,11 @@ pub struct Settings {
     pub panel_tab: i32,
     /// Playlists hidden from the app (YouTube playlists that aren't music), by id.
     pub hidden_playlists: Vec<String>,
+    /// The sidebar's playlists in the order you dragged them into, by id (ones not in it, new
+    /// since, go first).
+    pub playlist_order: Vec<String>,
+    /// Your name in Listen Along.
+    pub together_name: String,
 }
 
 impl Default for Settings {
@@ -34,6 +39,8 @@ impl Default for Settings {
             panel_open: false,
             panel_tab: 1,
             hidden_playlists: Vec::new(),
+            playlist_order: Vec::new(),
+            together_name: std::env::var("USERNAME").unwrap_or_default(),
         }
     }
 }
@@ -47,6 +54,8 @@ pub struct SavedQueue {
     pub position_ms: u64,
     pub shuffle: bool,
     pub repeat: Repeat,
+    /// The queue is a radio: the song it grows from, its choices and the one picked.
+    pub autoplay: Option<(String, Vec<Chip>, usize)>,
 }
 
 fn load<T: for<'a> Deserialize<'a> + Default>(name: &str) -> T {

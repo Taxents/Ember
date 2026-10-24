@@ -25,6 +25,8 @@ pub struct Player {
     skip: HashSet<String>,
     /// Tracks that failed in a row, so a queue where nothing plays stops instead of looping.
     failures: usize,
+    /// Listening along: the queue only mirrors someone else's, and never drives the engine.
+    pub follower: bool,
 }
 
 impl Player {
@@ -39,6 +41,7 @@ impl Player {
             seed: 0x9E3779B97F4A7C15,
             skip: HashSet::new(),
             failures: 0,
+            follower: false,
         }
     }
 
@@ -81,8 +84,23 @@ impl Player {
         self.at = at.min(self.queue.len().saturating_sub(1));
     }
 
+    /// Moves `dir` tracks on (or back) without playing: skips pressed in quick succession move
+    /// along, and only where they stop gets played. Whether it moved.
+    pub fn step_to(&mut self, dir: i64) -> bool {
+        match self.step(dir, true) {
+            Some(i) if i != self.at => {
+                self.at = i;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Plays the current track from the start (after `restore`, or to retry).
     pub fn play_current(&mut self) {
+        if self.follower {
+            return;
+        }
         if let Some(id) = self.current().map(str::to_string) {
             self.engine.play(&id);
         }
@@ -178,7 +196,9 @@ impl Player {
         if !live && self.engine.position().is_some_and(|p| p.ms > 3000)
             || self.at == 0 && self.repeat != Repeat::All
         {
-            self.engine.seek(0);
+            if !self.follower {
+                self.engine.seek(0);
+            }
             return;
         }
         if let Some(i) = self.step(-1, true) {
@@ -226,6 +246,7 @@ impl Player {
                 self.skip.clear();
                 self.update_next();
             }
+            Event::Failed { .. } if self.follower => {}
             Event::Failed { id, .. } if self.current() == Some(id.as_str()) => {
                 self.failures += 1;
                 if self.failures < self.order.len() {
@@ -240,7 +261,19 @@ impl Player {
         }
     }
 
+    /// The song that follows the current one by itself, if any.
+    pub fn upcoming(&self) -> Option<String> {
+        (1..=self.order.len() as i64)
+            .map_while(|d| self.step(d, false))
+            .map(|i| self.queue[self.order[i]].clone())
+            .find(|id| !self.skip.contains(id))
+            .filter(|_| !self.current().is_some_and(crate::radio::is_station))
+    }
+
     fn update_next(&mut self) {
+        if self.follower {
+            return;
+        }
         // A station never ends by itself, so nothing is opened ahead after it.
         let next = (1..=self.order.len() as i64)
             .map_while(|d| self.step(d, false))

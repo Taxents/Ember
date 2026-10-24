@@ -1,0 +1,18 @@
+[package]
+name = "together"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Listen Along transport: P2P QUIC sessions (iroh) and host clock sync"
+
+[dependencies]
+iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "io-util"] }
+crossbeam-channel = "0.5"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }

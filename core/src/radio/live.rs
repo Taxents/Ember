@@ -11,8 +11,11 @@
 //!   without closing is replaced by a watchdog after [`STALL`].
 //! * Latency: about 0.75 s is buffered before playback starts, and the pipe holds at most
 //!   [`CAP`] bytes, so a paused station never falls far behind.
+//! * Listen Along: while hosting, every byte the pipe accepts is also tapped; a listener's
+//!   source decodes a relay's pipe instead of the network ([`super::relay`]).
 
 use super::icy::IcyDemux;
+use super::relay::Tapping;
 use crate::audio::Event;
 use crate::audio::source::{Source, push_stereo};
 use crate::{Error, Result};
@@ -38,7 +41,13 @@ const READ_MAX: usize = 4 * 1024;
 /// Starved this long: the connection is dead, start another.
 pub const STALL: Duration = Duration::from_secs(12);
 /// Longest wait for audio when opening.
-const OPEN_WAIT: Duration = Duration::from_secs(8);
+pub(super) const OPEN_WAIT: Duration = Duration::from_secs(8);
+/// Longest a playing decoder's read waits for the rest of a packet. Reads only start with
+/// [`MIN_AHEAD`] buffered, so this is only reached by a packet (or junk run) bigger than that
+/// with the network gone quiet. Running out of it ends the source with an error rather than
+/// skipping the packet: the bytes the demuxer already took would be lost on this side only,
+/// and a Listen Along listener fed the same bytes would decode different frames from then on.
+const PACKET_WAIT: Duration = Duration::from_secs(5);
 /// Failed connections in a row before giving up.
 const RETRIES: u32 = 5;
 /// A connection that held this long resets the failure count.
@@ -56,16 +65,30 @@ struct Buf {
     generation: u64,
     /// Since when the decoder has had too little to read.
     starved: Option<Instant>,
+    /// Listen Along: every byte the pipe accepts is also handed here (see [`super::relay`]).
+    tap: Option<Tapping>,
 }
 
 /// Bounded byte queue between the network thread and the decoder.
 pub struct Pipe {
     m: Mutex<Buf>,
     cv: Condvar,
+    /// `push` waits while this much is buffered.
+    cap: usize,
 }
 
 impl Pipe {
     pub fn new() -> Arc<Self> {
+        Self::with_cap(CAP)
+    }
+
+    /// A pipe whose `push` never waits (a Listen Along relay: dropping or holding back bytes
+    /// would desync the listener).
+    pub fn unbounded() -> Arc<Self> {
+        Self::with_cap(usize::MAX)
+    }
+
+    fn with_cap(cap: usize) -> Arc<Self> {
         Arc::new(Pipe {
             m: Mutex::new(Buf {
                 q: VecDeque::with_capacity(64 * 1024),
@@ -73,19 +96,34 @@ impl Pipe {
                 closed: false,
                 generation: 0,
                 starved: Some(Instant::now()),
+                tap: None,
             }),
             cv: Condvar::new(),
+            cap,
         })
     }
 
+    /// Starts tapping: every byte accepted from now on is also passed to `tap`.
+    pub(super) fn set_tap(&self, tap: Tapping) {
+        self.m.lock().unwrap().tap = Some(tap);
+    }
+
     /// Appends, waiting while full. False once the reader is gone or `generation` was replaced.
+    ///
+    /// The tap sees the bytes here, under the lock, only once they are accepted: in exactly the
+    /// order the decoder will read them, and never the refused pushes of a replaced connection.
     pub fn push(&self, generation: u64, data: &[u8]) -> bool {
         let mut b = self.m.lock().unwrap();
-        while b.q.len() >= CAP && !b.closed && b.generation == generation {
+        while b.q.len() >= self.cap && !b.closed && b.generation == generation {
             b = self.cv.wait(b).unwrap();
         }
         if b.closed || b.generation != generation {
             return false;
+        }
+        if let Some(t) = &b.tap
+            && !t.data(data)
+        {
+            b.tap = None;
         }
         b.q.extend(data);
         if b.q.len() >= MIN_AHEAD {
@@ -100,13 +138,20 @@ impl Pipe {
         let mut b = self.m.lock().unwrap();
         if b.generation == generation {
             b.eof = true;
+            if let Some(t) = b.tap.take() {
+                t.end();
+            }
             self.cv.notify_all();
         }
     }
 
     /// The reader is gone: the network side stops.
     pub fn close(&self) {
-        self.m.lock().unwrap().closed = true;
+        let mut b = self.m.lock().unwrap();
+        b.closed = true;
+        if let Some(t) = b.tap.take() {
+            t.end();
+        }
         self.cv.notify_all();
     }
 
@@ -423,7 +468,10 @@ impl Feed {
 
 /// A playing station, as the engine's source.
 pub struct LiveSource {
-    feed: Arc<Feed>,
+    pipe: Arc<Pipe>,
+    play_id: String,
+    /// The network side; none for a Listen Along relay (it never reconnects by itself).
+    feed: Option<Arc<Feed>>,
     fmt: Box<dyn FormatReader>,
     dec: Box<dyn AudioDecoder>,
     track_id: u32,
@@ -436,7 +484,7 @@ pub struct LiveSource {
 
 impl LiveSource {
     pub fn buffered(&self) -> usize {
-        self.feed.pipe.buffered()
+        self.pipe.buffered()
     }
 }
 
@@ -455,6 +503,8 @@ impl Source for LiveSource {
             Ok(Some(p)) => p,
             Ok(None) => return Ok(false),
             Err(E::IoError(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+            // The pipe ran dry mid-packet for PACKET_WAIT: skipping would lose bytes (see there).
+            Err(E::IoError(e)) => return Err(Error::Net(format!("radio stream: {e}"))),
             Err(e) => return self.error(format!("demux: {e}")),
         };
         if p.track_id != self.track_id {
@@ -489,15 +539,17 @@ impl Source for LiveSource {
     }
 
     fn stalled(&self) -> bool {
-        let pipe = &self.feed.pipe;
+        let pipe = &self.pipe;
         if pipe.ready(MIN_AHEAD) {
             return false;
         }
-        // A connection that went quiet without closing: replace it.
-        if pipe.starved_for().is_some_and(|d| d >= STALL) {
-            log::warn!("{}: stalled, reconnecting", self.feed.play_id);
+        // A connection that went quiet without closing: replace it. (A relay just waits.)
+        if let Some(feed) = &self.feed
+            && pipe.starved_for().is_some_and(|d| d >= STALL)
+        {
+            log::warn!("{}: stalled, reconnecting", self.play_id);
             let generation = pipe.next_generation();
-            self.feed.spawn(generation, None);
+            feed.spawn(generation, None);
         }
         true
     }
@@ -508,7 +560,7 @@ impl LiveSource {
     fn error(&mut self, e: String) -> Result<bool> {
         self.errors += 1;
         if self.errors == 1 {
-            log::warn!("{}: {e}", self.feed.play_id);
+            log::warn!("{}: {e}", self.play_id);
         }
         if self.errors > 200 {
             return Err(Error::Media(e));
@@ -562,6 +614,16 @@ pub fn open(id: &str, events: Option<Sender<Event>>) -> Result<LiveSource> {
     open_conn(id, channel, url, conn, events)
 }
 
+/// A source decoding a Listen Along relay's pipe: no network side, so it never reconnects.
+pub(super) fn from_relay(
+    pipe: Arc<Pipe>,
+    play_id: &str,
+    content_type: &str,
+    kbps: Option<u32>,
+) -> Result<LiveSource> {
+    from_pipe(pipe, play_id, None, content_type, kbps)
+}
+
 /// [`open`] with the connection already made (tests and probes).
 pub fn open_conn(
     id: &str,
@@ -573,6 +635,10 @@ pub fn open_conn(
     let pipe = Pipe::new();
     let ct = conn.content_type.clone();
     let kbps = conn.kbps;
+    // Hosting Listen Along: a new epoch, announced before the first byte.
+    if let Some(t) = super::relay::capture(id, &ct, kbps) {
+        pipe.set_tap(t);
+    }
     let feed = Arc::new(Feed {
         pipe: pipe.clone(),
         play_id: id.to_string(),
@@ -582,12 +648,25 @@ pub fn open_conn(
         title: Mutex::new(None),
     });
     feed.spawn(0, Some(conn));
-    from_pipe(feed, &ct, kbps)
+    from_pipe(feed.pipe.clone(), id, Some(feed), &ct, kbps)
 }
 
-fn from_pipe(feed: Arc<Feed>, content_type: &str, kbps: Option<u32>) -> Result<LiveSource> {
-    let pipe = feed.pipe.clone();
+/// Probes and buffers a pipe someone else fills (the station's [`Feed`], or a relay).
+///
+/// Given the same bytes, what this decodes doesn't depend on when they arrive: reads that
+/// find the pipe short only wait (in arbitrary chunks, which symphonia's buffered stream
+/// hides), and a wait that runs out fails the open or ends the source ([`PACKET_WAIT`]) rather
+/// than dropping what was half read.
+fn from_pipe(
+    pipe: Arc<Pipe>,
+    play_id: &str,
+    feed: Option<Arc<Feed>>,
+    content_type: &str,
+    kbps: Option<u32>,
+) -> Result<LiveSource> {
     if !pipe.wait_for(MIN_AHEAD, OPEN_WAIT) {
+        // Stops the network side too (it would otherwise wait on a full pipe forever).
+        pipe.close();
         return Err(Error::Net("the station sent no audio".into()));
     }
     let wait = Arc::new(Mutex::new(OPEN_WAIT));
@@ -631,9 +710,11 @@ fn from_pipe(feed: Arc<Feed>, content_type: &str, kbps: Option<u32>) -> Result<L
     let per_sec = kbps.map_or(16_000, |k| k as usize * 125);
     let ahead = MIN_AHEAD + READ_MAX + (per_sec * 3 / 4).min(64 * 1024);
     pipe.wait_for(ahead, OPEN_WAIT);
-    // From here reads only happen when enough is buffered; never wait long on the network.
-    *wait.lock().unwrap() = Duration::from_millis(500);
+    // From here reads only happen when enough is buffered, so they rarely wait at all.
+    *wait.lock().unwrap() = PACKET_WAIT;
     Ok(LiveSource {
+        pipe,
+        play_id: play_id.to_string(),
         feed,
         fmt,
         dec,
@@ -777,7 +858,14 @@ mod tests {
                 f.pipe.finish(0);
             })
         };
-        let mut src = from_pipe(f, "audio/mpeg", Some(128)).unwrap();
+        let mut src = from_pipe(
+            f.pipe.clone(),
+            "radio:test",
+            Some(f),
+            "audio/mpeg",
+            Some(128),
+        )
+        .unwrap();
         assert_eq!(src.rate(), 44_100);
         assert!(src.live() && src.total_frames().is_none());
         assert!(src.seek(0).is_err());
@@ -788,6 +876,197 @@ mod tests {
         assert!((55 * 1152..=60 * 1152).contains(&frames), "{frames} frames");
         assert!(pcm.iter().all(|s| s.abs() < 1e-6));
         assert_eq!(src.quality, "MP3 \u{b7} 128 kbit/s");
+    }
+
+    /// MPEG-1 Layer III frames (128 kbit/s, 44.1 kHz, stereo): plain side info over
+    /// pseudo-random Huffman data. Not music, but varied, non-silent samples.
+    fn noisy_mp3(frames: usize) -> Vec<u8> {
+        let mut seed = 0x2545_f491_u32;
+        let mut out = Vec::new();
+        for _ in 0..frames {
+            let mut f = vec![0u8; 417];
+            f[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+            for b in &mut f[36..] {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *b = (seed >> 24) as u8;
+            }
+            // Side info (32 bytes): main_data_begin 0 (no reservoir), private, scfsi, then per
+            // granule and channel: part2_3_length, big_values, global_gain, scalefac_compress,
+            // no window switching, table_select ×3, region0/1 counts, flags.
+            let mut bits: Vec<(u32, u32)> = vec![(0, 9), (0, 3), (0, 8)];
+            for _ in 0..4 {
+                bits.extend([(700, 12), (120, 9), (170, 8), (0, 4), (0, 1)]);
+                bits.extend([
+                    (7, 5),
+                    (7, 5),
+                    (7, 5),
+                    (7, 4),
+                    (7, 3),
+                    (0, 1),
+                    (0, 1),
+                    (0, 1),
+                ]);
+            }
+            let mut pos = 32;
+            for (v, n) in bits {
+                for i in (0..n).rev() {
+                    if v >> i & 1 == 1 {
+                        f[pos / 8] |= 0x80 >> (pos % 8);
+                    }
+                    pos += 1;
+                }
+            }
+            assert_eq!(pos, 36 * 8);
+            out.extend_from_slice(&f);
+        }
+        out
+    }
+
+    /// Decodes to the end like the engine does: reads only when not stalled.
+    fn decode_all(mut src: LiveSource) -> Vec<f32> {
+        let mut pcm = Vec::new();
+        loop {
+            if src.stalled() {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            if !src.read(&mut pcm).unwrap() {
+                return pcm;
+            }
+        }
+    }
+
+    #[test]
+    fn a_relay_fed_the_tap_decodes_bit_identical_pcm() {
+        use crate::radio::relay::{self, TapEvent};
+        #[derive(Default)]
+        struct Log {
+            starts: Vec<(u64, String, String, Option<u32>)>,
+            bytes: Vec<u8>,
+            ends: Vec<u64>,
+        }
+        let audio = noisy_mp3(90);
+        let stream = icy(&audio, 3000, |i| format!("Song {i}"));
+        let log = Arc::new(Mutex::new(Log::default()));
+        let l = log.clone();
+        relay::set_tap(Some(Arc::new(move |e: TapEvent<'_>| {
+            let mut l = l.lock().unwrap();
+            match e {
+                TapEvent::Start {
+                    epoch,
+                    id,
+                    content_type,
+                    kbps,
+                } => l.starts.push((epoch, id.into(), content_type.into(), kbps)),
+                TapEvent::Data { epoch, bytes } => {
+                    assert_eq!(Some(epoch), l.starts.last().map(|s| s.0));
+                    l.bytes.extend_from_slice(bytes);
+                }
+                TapEvent::End { epoch } => l.ends.push(epoch),
+            }
+        })));
+        // The host: a station opened while hosting, as `open_conn` does.
+        let f = feed(None);
+        f.pipe
+            .set_tap(relay::capture("radio:test", "audio/mpeg", Some(128)).unwrap());
+        relay::set_tap(None); // a running station keeps tapping until its next bytes...
+        let host = {
+            let f = f.clone();
+            std::thread::spawn(move || {
+                f.pump(conn(stream, 3000), 0);
+                f.pipe.finish(0);
+            })
+        };
+        let src = from_pipe(
+            f.pipe.clone(),
+            "radio:test",
+            Some(f),
+            "audio/mpeg",
+            Some(128),
+        );
+        host.join().unwrap();
+        let host_pcm = decode_all(src.unwrap());
+        assert!(host_pcm.len() / 2 > 80 * 1152, "{} samples", host_pcm.len());
+        assert!(host_pcm.iter().any(|s| s.abs() > 1e-3), "not silence");
+
+        let log = log.lock().unwrap();
+        // ...which it didn't get: clearing the tap ended the epoch at once.
+        assert_eq!(log.starts.len(), 1);
+        assert_eq!(log.ends, [log.starts[0].0]);
+        assert!(log.bytes.is_empty());
+        drop(log);
+
+        // Tapping for real this time.
+        let log = Arc::new(Mutex::new(Log::default()));
+        let l = log.clone();
+        relay::set_tap(Some(Arc::new(move |e: TapEvent<'_>| {
+            let mut l = l.lock().unwrap();
+            match e {
+                TapEvent::Start { epoch, .. } => l.starts.push((epoch, "".into(), "".into(), None)),
+                TapEvent::Data { bytes, .. } => l.bytes.extend_from_slice(bytes),
+                TapEvent::End { epoch } => l.ends.push(epoch),
+            }
+        })));
+        let f = feed(None);
+        f.pipe
+            .set_tap(relay::capture("radio:test", "audio/mpeg", Some(128)).unwrap());
+        let stream = icy(&audio, 3000, |i| format!("Song {i}"));
+        let host = {
+            let f = f.clone();
+            std::thread::spawn(move || {
+                f.pump(conn(stream, 3000), 0);
+                f.pipe.finish(0);
+            })
+        };
+        let src = from_pipe(
+            f.pipe.clone(),
+            "radio:test",
+            Some(f),
+            "audio/mpeg",
+            Some(128),
+        );
+        host.join().unwrap();
+        let host_pcm = decode_all(src.unwrap());
+        relay::set_tap(None);
+        let tapped = {
+            let l = log.lock().unwrap();
+            assert_eq!(l.starts.len(), 1);
+            assert_eq!(l.ends, [l.starts[0].0], "one End, after the last byte");
+            l.bytes.clone()
+        };
+        assert_eq!(tapped, audio, "the tap sees exactly the decoder's bytes");
+
+        // Listeners: the same bytes, cut differently and arriving at their own pace.
+        for chunk in [1, 13, 417, 4000, usize::MAX] {
+            let id = format!("radio:listener{}", chunk.min(99_999));
+            let r = relay::expect_relay(&id);
+            let feeder = {
+                let r = r.clone();
+                let bytes = tapped.clone();
+                std::thread::spawn(move || {
+                    r.start("audio/mpeg", Some(128));
+                    for (i, c) in bytes.chunks(chunk).enumerate() {
+                        r.push(c);
+                        if i % 50 == 0 {
+                            std::thread::yield_now();
+                        }
+                    }
+                    r.finish();
+                })
+            };
+            let r = relay::take_relay(&id).unwrap();
+            let src = relay::open_relay(&id, r, None).unwrap();
+            assert!(src.feed.is_none());
+            let pcm = decode_all(src);
+            feeder.join().unwrap();
+            assert_eq!(pcm.len(), host_pcm.len(), "chunk {chunk}");
+            assert!(
+                pcm.iter()
+                    .zip(&host_pcm)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "chunk {chunk}: PCM differs"
+            );
+        }
     }
 
     #[test]

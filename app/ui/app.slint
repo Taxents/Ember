@@ -71,6 +71,8 @@ export struct LyricLine {
     group: int,
     agent: int,
     background: bool,
+    // How long (ms) the instrumental break before it lasts: the waiting dots breathe by it.
+    gap: int,
 }
 
 // "Written by" and who.
@@ -242,7 +244,11 @@ export global Ui {
     callback rename(string);
     callback new-playlist(); // asks for its name in the sidebar
     in-out property <bool> naming-playlist;
+    // Where the name field sits in the window, so a press outside it can put it away.
+    in-out property <{x: length, y: length, width: length, height: length}> naming-field;
     callback create-playlist(string); // the name typed ("" when cancelled)
+    // A sidebar playlist dragged from one place to before another.
+    callback move-playlist(int, int);
     callback np-open(string); // the playing song's "song" or "album" page
     callback toggle-follow(); // the banner's artist
 
@@ -270,6 +276,9 @@ export global Ui {
     // to hold it (rows.rs), so the two sizes must match.
     in property <bool> video-on;
     in property <image> video-frame;
+    // Bumped when a music video is opened: its song page glides down to centre the panel once
+    // it shows (and until you scroll it yourself, or leave the page).
+    in property <int> centre-video-serial;
     callback near-end();
     callback row-shown(int, int); // list (0 page, 1 queue), index: load its artwork
 
@@ -327,6 +336,27 @@ export global Ui {
 
     in-out property <bool> sidebar-collapsed;
     callback sidebar-changed();
+
+    // Listen Along: friends join a host's session and hear the same music in sync.
+    in-out property <bool> together-open; // the popover
+    in property <int> together-state; // 0 off, 1 connecting/starting, 2 hosting, 3 listening
+    in property <string> together-code; // hosting: the invite code
+    in property <string> together-host; // listening: the host's name
+    // Everyone in the session, host first, already worded by Rust ("Sam (host)").
+    in property <[string]> together-members;
+    // A status or error line ("Connecting…", "Invite code copied"), "" for none.
+    in property <string> together-status;
+    // An invite code found on the clipboard when the popover opened, "" for none.
+    in property <string> together-found;
+    in-out property <string> together-name; // your display name (editable)
+    callback together-opened(); // the popover opened: Rust checks the clipboard
+    // Start a session (not `together-host`: that name is the host's name above).
+    callback together-start();
+    callback together-join(string); // join with this code
+    callback together-copy(); // copy the invite code again
+    callback together-leave(); // stop hosting, or leave
+    callback together-resync(); // listener: start again in sync (rarely needed)
+    callback together-name-changed(string);
 }
 
 global Fmt {
@@ -347,19 +377,59 @@ component SideRow inherits Rectangle {
     callback clicked();
     // Right-clicked at this point (window coordinates).
     callback menu(Point);
+    // Rows that can be dragged into another order: this one's place among `count`, and where a
+    // drag would drop it (-1: none), shared by the rows.
+    in property <bool> draggable;
+    in property <int> index;
+    in property <int> count;
+    in-out property <int> drop-target: -1;
+    callback dropped(int, int);
+    property <length> step: 32px; // its height and the list's spacing
+    property <bool> dragging: root.draggable && ta.pressed && abs(ta.mouse-y - ta.pressed-y) > 4px;
+    // A drag ends with a release, which isn't a click.
+    property <bool> dragged;
     height: 30px;
     border-radius: 6px;
     background: selected ? Theme.smoke : ta.has-hover ? Theme.smoke.with-alpha(0.45) : transparent;
+    opacity: root.dragging ? 0.5 : 1;
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => {
-            root.clicked();
+            if !root.dragged {
+                root.clicked();
+            }
+        }
+        moved => {
+            if root.dragging {
+                root.dragged = true;
+                // Rows below move it after them, rows above before them.
+                root.drop-target = max(0, min(root.count, root.index + round((self.mouse-y - self.pressed-y) / root.step) + (self.mouse-y > self.pressed-y ? 1 : 0)));
+            }
         }
         pointer-event(e) => {
             if (e.button == PointerEventButton.right && e.kind == PointerEventKind.up) {
                 root.menu({ x: self.absolute-position.x + self.mouse-x, y: self.absolute-position.y + self.mouse-y });
+            } else if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) {
+                root.dragged = false;
+            } else if (e.button == PointerEventButton.left && e.kind == PointerEventKind.up) {
+                if root.dragged && root.drop-target >= 0 {
+                    root.dropped(root.index, root.drop-target);
+                }
+                root.drop-target = -1;
             }
         }
+    }
+
+    // Where the dragged row would land: a line above this row (or below the last).
+    if root.draggable && root.drop-target == root.index: Rectangle {
+        y: -2px;
+        height: 2px;
+        background: Theme.amber;
+    }
+    if root.draggable && root.drop-target == root.count && root.index == root.count - 1: Rectangle {
+        y: root.height;
+        height: 2px;
+        background: Theme.amber;
     }
 
     HorizontalLayout {
@@ -492,6 +562,8 @@ component Sidebar inherits Rectangle {
     in-out property <bool> playlists-open: true;
     // A search was made: the keyboard goes back to the shortcuts.
     callback searched();
+    // Where a dragged playlist would drop (-1: no drag).
+    property <int> playlist-drop: -1;
     public function focus-search() {
         search.focus-input();
     }
@@ -652,6 +724,18 @@ component Sidebar inherits Rectangle {
                 // Naming a new playlist, right where it'll appear: Enter makes it, Escape doesn't.
                 if Ui.naming-playlist && !root.collapsed: FocusScope {
                     height: 30px;
+                    function place() {
+                        Ui.naming-field = { x: self.absolute-position.x, y: self.absolute-position.y, width: self.width, height: self.height };
+                    }
+                    init => {
+                        self.place();
+                    }
+                    changed width => {
+                        self.place();
+                    }
+                    changed absolute-position => {
+                        self.place();
+                    }
                     key-pressed(e) => {
                         if e.text == Key.Escape {
                             Ui.create-playlist("");
@@ -697,7 +781,14 @@ component Sidebar inherits Rectangle {
                 }
                 if root.playlists-open && !root.collapsed: VerticalLayout {
                     spacing: 2px;
-                    for p in Ui.playlists: SideRow {
+                    for p[i] in Ui.playlists: SideRow {
+                        draggable: !root.collapsed;
+                        index: i;
+                        count: Ui.playlists.length;
+                        drop-target <=> root.playlist-drop;
+                        dropped(from, to) => {
+                            Ui.move-playlist(from, to);
+                        }
                         has-cover: true;
                         cover: p.cover;
                         label: p.title;
@@ -1084,18 +1175,25 @@ component LyricRow inherits Rectangle {
         width: 60px;
         height: 22px;
         spacing: 9px;
-        property <float> breathe: 1 + 0.12 * sin(animation-tick() / 1ms * 0.25deg);
         for k in 3: Rectangle {
             width: 11px;
             height: 11px;
             y: (22px - self.height) / 2;
-            border-radius: self.width / 2;
-            background: Theme.ivory;
-            opacity: 0.28 + 0.72 * clamp(Ui.lyric-pause * 3 - k, 0, 1);
-            transform-scale: Ui.lyric-pause > 0.94 ? 0.6 : parent.breathe;
+            // Shrinking away just before the line comes in, eased; apart from the breathing
+            // inside, which mustn't restart this animation on every step.
+            transform-scale: Ui.lyric-pause > 0.94 ? 0.6 : 1;
             animate transform-scale { duration: 220ms; }
+            Rectangle {
+                border-radius: self.width / 2;
+                background: Theme.ivory;
+                opacity: 0.28 + 0.72 * clamp(Ui.lyric-pause * 3 - k, 0, 1);
+                transform-scale: root.breathe;
+            }
         }
     }
+    // The dots breathe on the break's own clock (Rust moves `lyric-pause` with the music), not
+    // `animation-tick()`, which would redraw the whole window every frame for as long as they show.
+    property <float> breathe: 1 + 0.12 * sin(Ui.lyric-pause * root.line.gap * 0.25deg);
 
     // The sung line's words glow faintly, a touch more with the bass.
     property <float> bass: root.sung && !root.line.background ? Ui.levels[0] : 0;
@@ -1948,12 +2046,44 @@ component PageView inherits Rectangle {
     changed serial => {
         list.content-y = 0;
     }
+    // An opened music video: once its panel shows, glide down to centre it in the view, and
+    // keep it there while the page fills in, until you scroll yourself or leave the page.
+    property <int> centre-serial: Ui.centre-video-serial;
+    property <bool> centring;
+    property <int> centre-page;
+    property <length> centre-set; // where gliding last put the list: anything else was you
+    property <length> centre-target: min(0px, max(list.height - list.content-height,
+        -(root.banner-h + 16px + root.video-h / 2 - list.height / 2)));
+    changed centre-serial => {
+        root.centring = true;
+        root.centre-page = Ui.page-serial;
+        list.content-y = 0;
+        root.centre-set = 0;
+    }
+    Timer {
+        interval: 16ms;
+        running: root.centring && Ui.video-on && Ui.page-serial == root.centre-page
+            && abs(list.content-y - root.centre-target) > 0.5px;
+        triggered => {
+            if abs(list.content-y - root.centre-set) > 1px {
+                root.centring = false;
+                return;
+            }
+            let d = root.centre-target - list.content-y;
+            let step = abs(d) <= 1px ? d : (d > 0 ? max(1px, d * 0.18) : min(-1px, d * 0.18));
+            list.content-y += step;
+            root.centre-set = list.content-y;
+        }
+    }
 
     // The whole page's height is known, and only the rows near the view exist, each at its place.
     list := Flickable {
         content-height: Ui.page-height;
         changed content-y => {
             Ui.page-scrolled(-self.content-y);
+        }
+        flicked => {
+            root.centring = false;
         }
         for row in Ui.tracks: Rectangle {
             property <int> i: row.index;
@@ -2892,6 +3022,418 @@ component EqPanel inherits Rectangle {
     }
 }
 
+// ---- listen along ---------------------------------------------------------------------------
+
+// A one-line text field for the Listen Along popover, with a placeholder.
+component TogetherField inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> text <=> input.text;
+    in property <bool> mono;
+    callback edited(string);
+    callback accepted(string);
+    height: 32px;
+    border-radius: 8px;
+    background: input.has-focus ? Theme.smoke : Theme.smoke.with-alpha(0.6);
+    border-width: input.has-focus ? 1px : 0;
+    border-color: Theme.amber.with-alpha(0.6);
+    TouchArea {
+        mouse-cursor: MouseCursor.text;
+        clicked => {
+            input.focus();
+        }
+    }
+
+    if input.text == "": Text {
+        x: 10px;
+        text: root.placeholder;
+        color: Theme.dim;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+    input := TextInput {
+        x: 10px;
+        width: parent.width - 20px;
+        color: Theme.ivory;
+        selection-background-color: Theme.amber.with-alpha(0.45);
+        font-size: 13px;
+        font-family: root.mono ? "Consolas" : "";
+        single-line: true;
+        vertical-alignment: center;
+        edited => {
+            root.edited(self.text);
+        }
+        accepted => {
+            root.accepted(self.text);
+        }
+    }
+}
+
+// A small rounded button: secondary glass, or `danger` in the warning red the menus use.
+component TogetherButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> danger;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 28px;
+    min-width: label.preferred-width + 26px;
+    border-radius: 14px;
+    opacity: enabled ? 1 : 0.45;
+    background: danger ? (ta.pressed ? #E8806A40 : ta.has-hover && enabled ? #E8806A30 : #E8806A1C)
+        : (ta.pressed ? #F1E5D214 : ta.has-hover && enabled ? #F1E5D224 : #F1E5D21A);
+    border-width: 1px;
+    border-color: danger ? #E8806A33 : #F1E5D214;
+    ta := TouchArea {
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if (root.enabled) {
+                root.clicked();
+            }
+        }
+    }
+
+    label := Text {
+        text: root.text;
+        color: root.danger ? #E8806A : Theme.ivory;
+        font-size: 12px;
+        font-weight: 600;
+        vertical-alignment: center;
+    }
+}
+
+// Everyone in the session, one row each.
+component TogetherMembers inherits VerticalLayout {
+    spacing: 2px;
+    for m[i] in Ui.together-members: Rectangle {
+        height: 28px;
+        border-radius: 6px;
+        background: i == 0 ? #F1E5D20A : transparent;
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            spacing: 10px;
+            Rectangle {
+                width: 16px;
+                Icon {
+                    name: "user";
+                    width: 16px;
+                    height: 16px;
+                    color: i == 0 ? Theme.amber : Theme.beige;
+                }
+            }
+
+            Text {
+                text: m;
+                color: Theme.ivory;
+                font-size: 13px;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+component TogetherHeading inherits Text {
+    color: Theme.beige;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+}
+
+// The Listen Along popover over the now-playing bar: start or join a session, or see who's in it.
+component TogetherPanel inherits Rectangle {
+    width: 340px;
+    height: lay.preferred-height;
+    border-radius: 12px;
+    background: Theme.panel;
+    border-width: 1px;
+    border-color: Theme.smoke;
+    drop-shadow-blur: 30px;
+    drop-shadow-color: #000000a0;
+    init => {
+        Ui.together-opened();
+    }
+    TouchArea { } // keeps clicks inside from closing the panel
+
+    lay := VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+        HorizontalLayout {
+            spacing: 10px;
+            Rectangle {
+                width: 18px;
+                Icon {
+                    name: "together";
+                    width: 18px;
+                    height: 18px;
+                    color: Theme.amber;
+                }
+            }
+
+            Text {
+                text: Ui.together-state == 2 ? "You're hosting"
+                    : Ui.together-state == 3 ? "Listening along with " + Ui.together-host : "Listen Along";
+                color: Theme.ivory;
+                font-size: 15px;
+                font-weight: 700;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+        }
+
+        // Off: start a session, or join one.
+        if Ui.together-state == 0: VerticalLayout {
+            spacing: 12px;
+            Text {
+                text: "Listen together with friends, in perfect sync. Start a session and send them the invite code.";
+                color: Theme.beige;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            VerticalLayout {
+                spacing: 6px;
+                TogetherHeading {
+                    text: "YOUR NAME";
+                }
+
+                TogetherField {
+                    placeholder: "How friends see you";
+                    text <=> Ui.together-name;
+                    edited(t) => {
+                        Ui.together-name-changed(t);
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                PillButton {
+                    text: "Start a session";
+                    icon: "together";
+                    clicked => {
+                        Ui.together-start();
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.smoke;
+            }
+
+            TogetherHeading {
+                text: "JOIN A SESSION";
+            }
+
+            // An invite code on the clipboard: one click joins.
+            if Ui.together-found != "": Rectangle {
+                height: 52px;
+                border-radius: 10px;
+                background: jf.pressed ? #E9A15F33 : jf.has-hover ? #E9A15F26 : #E9A15F1A;
+                border-width: 1px;
+                border-color: Theme.amber.with-alpha(0.5);
+                jf := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        Ui.together-join(Ui.together-found);
+                    }
+                }
+
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 14px;
+                    spacing: 12px;
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        Text {
+                            text: "Join session";
+                            color: Theme.amber;
+                            font-size: 13px;
+                            font-weight: 700;
+                        }
+
+                        Text {
+                            text: "Invite code " + Ui.together-found;
+                            color: Theme.beige;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+                    }
+
+                    Rectangle {
+                        width: 16px;
+                        Icon {
+                            name: "chevron-right";
+                            width: 16px;
+                            height: 16px;
+                            color: Theme.amber;
+                        }
+                    }
+                }
+            }
+
+            if Ui.together-found == "": HorizontalLayout {
+                spacing: 8px;
+                code := TogetherField {
+                    placeholder: "Paste an invite code";
+                    mono: true;
+                    accepted(t) => {
+                        if (t != "") {
+                            Ui.together-join(t);
+                        }
+                    }
+                }
+
+                TogetherButton {
+                    y: 2px;
+                    text: "Join";
+                    enabled: code.text != "";
+                    clicked => {
+                        Ui.together-join(code.text);
+                    }
+                }
+            }
+        }
+
+        // Connecting or starting.
+        if Ui.together-state == 1: HorizontalLayout {
+            spacing: 12px;
+            HorizontalLayout {
+                spacing: 4px;
+                alignment: center;
+                for d in [0, 1, 2]: Rectangle {
+                    width: 6px;
+                    height: 6px;
+                    y: (28px - 6px) / 2;
+                    border-radius: 3px;
+                    background: Theme.amber;
+                    opacity: 0.3 + 0.7 * abs(sin((animation-tick() / 1ms * 0.24 - d * 60) * 1deg));
+                }
+            }
+
+            Text {
+                text: "Connecting…";
+                color: Theme.beige;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+
+            Rectangle { }
+
+            TogetherButton {
+                text: "Cancel";
+                clicked => {
+                    Ui.together-leave();
+                }
+            }
+        }
+
+        // Hosting: the invite code, who's here, and ending it.
+        if Ui.together-state == 2: VerticalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        height: 32px;
+                        border-radius: 8px;
+                        background: #F1E5D20D;
+                        border-width: 1px;
+                        border-color: Theme.smoke;
+                        Text {
+                            x: 10px;
+                            width: parent.width - 20px;
+                            text: Ui.together-code;
+                            color: Theme.ivory;
+                            font-family: "Consolas";
+                            font-size: 13px;
+                            letter-spacing: 0.5px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    TogetherButton {
+                        y: 2px;
+                        text: "Copy";
+                        clicked => {
+                            Ui.together-copy();
+                        }
+                    }
+                }
+
+                Text {
+                    text: "Friends paste this in Listen Along to join";
+                    color: Theme.dim;
+                    font-size: 11px;
+                }
+            }
+
+            TogetherHeading {
+                text: "IN THIS SESSION";
+            }
+
+            TogetherMembers { }
+
+            HorizontalLayout {
+                alignment: end;
+                TogetherButton {
+                    text: "End session";
+                    danger: true;
+                    clicked => {
+                        Ui.together-leave();
+                    }
+                }
+            }
+        }
+
+        // Listening: who's here, resync, and leaving.
+        if Ui.together-state == 3: VerticalLayout {
+            spacing: 12px;
+            TogetherHeading {
+                text: "IN THIS SESSION";
+            }
+
+            TogetherMembers { }
+
+            HorizontalLayout {
+                spacing: 8px;
+                TogetherButton {
+                    text: "Resync";
+                    clicked => {
+                        Ui.together-resync();
+                    }
+                }
+
+                Text {
+                    text: "If you hear a delay";
+                    color: Theme.dim;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { }
+
+                TogetherButton {
+                    text: "Leave";
+                    danger: true;
+                    clicked => {
+                        Ui.together-leave();
+                    }
+                }
+            }
+        }
+
+        if Ui.together-status != "": Text {
+            text: Ui.together-status;
+            color: Theme.beige;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+    }
+}
+
 // ---- now-playing bar ------------------------------------------------------------------------
 
 component NowPlayingBar inherits Rectangle {
@@ -3173,6 +3715,44 @@ component NowPlayingBar inherits Rectangle {
                 icon-size: 17px;
                 clicked => {
                     Ui.eq-open = !Ui.eq-open;
+                    if (Ui.eq-open) {
+                        Ui.together-open = false;
+                    }
+                }
+            }
+        }
+
+        // Listen Along; in a session, a badge counts who's in it.
+        together-btn := Rectangle {
+            width: 32px;
+            IconButton {
+                icon: "together";
+                active: Ui.together-open || Ui.together-state != 0;
+                icon-size: 17px;
+                clicked => {
+                    Ui.together-open = !Ui.together-open;
+                    if (Ui.together-open) {
+                        Ui.eq-open = false;
+                    }
+                }
+            }
+
+            if (Ui.together-state == 2 || Ui.together-state == 3) && Ui.together-members.length > 0: Rectangle {
+                x: together-btn.width - self.width + 1px;
+                y: together-btn.height / 2 - 17px;
+                height: 14px;
+                width: max(14px, count.preferred-width + 8px);
+                border-radius: 7px;
+                background: Theme.amber;
+                border-width: 1.5px;
+                border-color: Theme.bar;
+                count := Text {
+                    text: Ui.together-members.length;
+                    color: Theme.carbon;
+                    font-size: 9px;
+                    font-weight: 800;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
                 }
             }
         }
@@ -3251,6 +3831,11 @@ export component AppWindow inherits Window {
                 }
                 if (Ui.eq-open) {
                     Ui.eq-open = false;
+                    return accept;
+                }
+                if (Ui.together-open) {
+                    Ui.together-open = false;
+                    keys.focus();
                     return accept;
                 }
                 if (Ui.panel-open) {
@@ -3345,6 +3930,18 @@ export component AppWindow inherits Window {
             y: parent.height - bar.height - self.height - 8px;
         }
 
+        // Listen Along: a press outside closes it (and takes the keyboard back from its fields).
+        if Ui.together-open: TouchArea {
+            clicked => {
+                Ui.together-open = false;
+                keys.focus();
+            }
+        }
+        if Ui.together-open: TogetherPanel {
+            x: parent.width - self.width - 16px;
+            y: parent.height - bar.height - self.height - 8px;
+        }
+
         // A press anywhere outside the menu closes it.
         if Ui.menu-open: TouchArea {
             pointer-event(e) => {
@@ -3356,6 +3953,31 @@ export component AppWindow inherits Window {
         if Ui.menu-open: ContextMenu {
             x: max(4px, min(Ui.menu-at.x, parent.width - self.width - 8px));
             y: max(4px, min(Ui.menu-at.y, parent.height - self.height - 8px));
+        }
+
+        // Naming a new playlist: a press anywhere but the field puts it away. (A click elsewhere
+        // doesn't take the keyboard from it, so the field can't tell by itself.)
+        if Ui.naming-playlist: Rectangle {
+            property <length> fx: Ui.naming-field.x;
+            property <length> fy: Ui.naming-field.y;
+            property <length> fw: Ui.naming-field.width;
+            property <length> fh: Ui.naming-field.height;
+            for r in [
+                { x: 0px, y: 0px, w: parent.width, h: fy },
+                { x: 0px, y: fy + fh, w: parent.width, h: parent.height - fy - fh },
+                { x: 0px, y: fy, w: fx, h: fh },
+                { x: fx + fw, y: fy, w: parent.width - fx - fw, h: fh },
+            ]: TouchArea {
+                x: r.x;
+                y: r.y;
+                width: max(0px, r.w);
+                height: max(0px, r.h);
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down) {
+                        Ui.create-playlist("");
+                    }
+                }
+            }
         }
     }
 }

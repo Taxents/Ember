@@ -5,7 +5,13 @@
 //! to the device. With a flat EQ, full volume and a matching rate, samples pass through
 //! untouched: bit-perfect. On the way it measures four bands (bass to treble) for the visualizer,
 //! reading the samples without changing them.
+//!
+//! Synced starts (Listen Along): the engine can mark a ring frame as a gate with the instant it
+//! must be heard at. Audio before the gate plays as usual; at the gate the callback writes
+//! silence until the moment comes (from the device's own playback timestamps), then carries on.
+//! It never drops audio: a start that comes too late simply starts late.
 
+use super::clock;
 use super::eq::{Eq, SharedEq};
 use crate::{Error, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -17,6 +23,10 @@ use std::sync::{Arc, Mutex};
 const CH: usize = 2;
 /// Frames processed per inner step of the callback.
 const STEP: usize = 4096;
+/// `gate_frame`: no gate.
+pub const NO_GATE: u64 = u64::MAX;
+/// `gate_when`: held until told when.
+pub const HOLD: u64 = u64::MAX;
 
 /// State shared between the engine and the callback.
 #[derive(Default)]
@@ -34,13 +44,70 @@ pub struct Shared {
     pub reset_eq: AtomicBool,
     /// f32 bits: the last buffer's loudness (RMS) in four bands, bass first, before volume.
     pub levels: [AtomicU32; 4],
+    /// The ring frame that waits for `gate_when` before it is heard ([`NO_GATE`]: none).
+    pub gate_frame: AtomicU64,
+    /// When the gate frame must be heard, in [`clock`] ns ([`HOLD`]: not yet known).
+    pub gate_when: AtomicU64,
+    /// How late the last gate opened, ns (0: on time).
+    pub gate_late: AtomicU64,
+    /// Where ring frames are heard: frame `anchor_frame` at `anchor_ns`, and the ones after it
+    /// one device frame apart. Written by the callback; `anchor_seq` is odd while it writes.
+    anchor_seq: AtomicU64,
+    anchor_frame: AtomicU64,
+    anchor_ns: AtomicU64,
 }
 
 impl Shared {
     pub fn new() -> Arc<Self> {
         let s = Shared::default();
         s.volume.store(1f32.to_bits(), Ordering::Relaxed);
+        s.gate_frame.store(NO_GATE, Ordering::Relaxed);
         Arc::new(s)
+    }
+
+    /// Makes ring frame `frame` wait until `when_ns` ([`HOLD`]: until [`Shared::open_gate`]).
+    pub fn set_gate(&self, frame: u64, when_ns: u64) {
+        self.gate_frame.store(NO_GATE, Ordering::SeqCst);
+        self.gate_when.store(when_ns, Ordering::SeqCst);
+        self.gate_late.store(0, Ordering::SeqCst);
+        self.gate_frame.store(frame, Ordering::SeqCst);
+    }
+
+    /// Says when a held gate opens.
+    pub fn open_gate(&self, when_ns: u64) {
+        self.gate_when.store(when_ns, Ordering::SeqCst);
+    }
+
+    pub fn clear_gate(&self) {
+        self.gate_frame.store(NO_GATE, Ordering::SeqCst);
+    }
+
+    /// The ring frame waiting at a gate, if any.
+    pub fn gate(&self) -> Option<u64> {
+        Some(self.gate_frame.load(Ordering::SeqCst)).filter(|&f| f != NO_GATE)
+    }
+
+    /// (ring frame, the clock ns it is heard at), as of the last callback.
+    pub fn anchor(&self) -> Option<(u64, u64)> {
+        loop {
+            let s1 = self.anchor_seq.load(Ordering::SeqCst);
+            if s1 & 1 == 1 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let f = self.anchor_frame.load(Ordering::SeqCst);
+            let t = self.anchor_ns.load(Ordering::SeqCst);
+            if self.anchor_seq.load(Ordering::SeqCst) == s1 {
+                return (s1 != 0).then_some((f, t));
+            }
+        }
+    }
+
+    fn set_anchor(&self, frame: u64, ns: u64) {
+        self.anchor_seq.fetch_add(1, Ordering::SeqCst);
+        self.anchor_frame.store(frame, Ordering::SeqCst);
+        self.anchor_ns.store(ns, Ordering::SeqCst);
+        self.anchor_seq.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -137,7 +204,12 @@ where
     };
     dev.build_output_stream(
         config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| r.fill(data, dev_ch, &shared, &ring),
+        move |data: &mut [T], info: &cpal::OutputCallbackInfo| {
+            // When this buffer's first frame will be heard, on the device's own clock.
+            let ts = info.timestamp();
+            let delay = ts.playback.saturating_duration_since(ts.callback);
+            r.fill(data, dev_ch, &shared, &ring, delay)
+        },
         on_error,
         None,
     )
@@ -159,6 +231,7 @@ pub struct Render {
     /// (a fresh stream, e.g. after a device change, must not ramp down from full volume).
     gain: Option<f32>,
     meter: Meter,
+    rate: u32,
 }
 
 /// Splits mono into four bands with one-pole low-passes at 150 Hz, 600 Hz and 2.5 kHz (each
@@ -209,43 +282,98 @@ impl Render {
             scratch: vec![0.0; STEP * CH],
             gain: None,
             meter: Meter::new(rate),
+            rate: rate.max(1),
         }
     }
 
+    /// Fills `data`, whose first frame is heard `delay` from now.
     pub fn fill<T: SizedSample + FromSample<f32>>(
         &mut self,
         data: &mut [T],
         dev_ch: usize,
         shared: &Shared,
         ring: &SharedConsumer,
+        delay: std::time::Duration,
     ) {
+        let heard = clock::now_ns() + delay.as_nanos() as u64;
+        let rate = self.rate as u64;
+        let ns_per = |frames: usize| frames as u64 * 1_000_000_000 / rate;
         if shared.reset_eq.swap(false, Ordering::Relaxed) {
             self.eq.reset();
         }
         let paused = shared.paused.load(Ordering::Relaxed);
         // The engine holds the lock only for a moment while flushing; output silence then.
         let mut cons = if paused { None } else { ring.try_lock().ok() };
-        for out in data.chunks_mut(STEP * dev_ch) {
-            let frames = out.len() / dev_ch;
-            let got = match cons.as_mut() {
-                Some(c) => {
-                    let n = (c.slots() / CH).min(frames);
-                    let (a, _) = c.pop_partial_slice(&mut self.scratch[..n * CH]);
-                    a.len() / CH
+        let total = data.len() / dev_ch;
+        let mut done = 0;
+        while done < total {
+            let mut n = (total - done).min(STEP);
+            let mut take = true;
+            if let Some(gate) = shared.gate() {
+                let played = shared.played.load(Ordering::Relaxed);
+                if played < gate {
+                    n = n.min((gate - played) as usize);
+                } else {
+                    let when = shared.gate_when.load(Ordering::SeqCst);
+                    let at = heard + ns_per(done);
+                    if when == HOLD {
+                        take = false;
+                    } else if when > at {
+                        // Silence up to the frame that is heard at `when`.
+                        let wait = ((when - at) as u128 * rate as u128).div_ceil(1_000_000_000);
+                        n = n.min(wait as usize);
+                        take = false;
+                    } else {
+                        // The moment came (or passed: then start now, never skip audio).
+                        shared.gate_late.store(at - when, Ordering::Relaxed);
+                        let _ = shared.gate_frame.compare_exchange(
+                            gate,
+                            NO_GATE,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        );
+                        continue;
+                    }
                 }
-                None => 0,
-            };
-            shared.played.fetch_add(got as u64, Ordering::Relaxed);
-            if got < frames && !paused && shared.expecting.load(Ordering::Relaxed) {
-                shared.underruns.fetch_add(1, Ordering::Relaxed);
             }
-            let buf = &mut self.scratch[..got * CH];
-            self.eq.process(&shared.eq, buf);
-            self.meter.measure(buf, &shared.levels);
-            let target = f32::from_bits(shared.volume.load(Ordering::Relaxed));
-            ramp_gain(buf, self.gain.get_or_insert(target), target);
-            write_out(out, buf, dev_ch);
+            let out = &mut data[done * dev_ch..(done + n) * dev_ch];
+            let src = if take { cons.as_deref_mut() } else { None };
+            self.segment(out, dev_ch, shared, src, take && !paused);
+            done += n;
         }
+        // From the next frame on, frames are heard one after another from the end of this
+        // buffer (until a gate, a pause or an underrun puts silence between).
+        shared.set_anchor(shared.played.load(Ordering::Relaxed), heard + ns_per(total));
+    }
+
+    /// Writes `out` from the ring (`None`: silence). `expect`: a short read is an underrun.
+    fn segment<T: SizedSample + FromSample<f32>>(
+        &mut self,
+        out: &mut [T],
+        dev_ch: usize,
+        shared: &Shared,
+        cons: Option<&mut Consumer<f32>>,
+        expect: bool,
+    ) {
+        let frames = out.len() / dev_ch;
+        let got = match cons {
+            Some(c) => {
+                let n = (c.slots() / CH).min(frames);
+                let (a, _) = c.pop_partial_slice(&mut self.scratch[..n * CH]);
+                a.len() / CH
+            }
+            None => 0,
+        };
+        shared.played.fetch_add(got as u64, Ordering::Relaxed);
+        if got < frames && expect && shared.expecting.load(Ordering::Relaxed) {
+            shared.underruns.fetch_add(1, Ordering::Relaxed);
+        }
+        let buf = &mut self.scratch[..got * CH];
+        self.eq.process(&shared.eq, buf);
+        self.meter.measure(buf, &shared.levels);
+        let target = f32::from_bits(shared.volume.load(Ordering::Relaxed));
+        ramp_gain(buf, self.gain.get_or_insert(target), target);
+        write_out(out, buf, dev_ch);
     }
 }
 
@@ -292,6 +420,7 @@ fn write_out<T: SizedSample + FromSample<f32>>(out: &mut [T], stereo: &[f32], de
 mod tests {
     use super::*;
     use crate::audio::eq::EqSettings;
+    use std::time::Duration;
 
     #[test]
     fn flat_path_is_bit_perfect() {
@@ -309,9 +438,9 @@ mod tests {
         let ring = Arc::new(Mutex::new(c));
         let mut r = Render::new(48000);
         let mut out = vec![0f32; 10000];
-        r.fill(&mut out, 2, &shared, &ring);
+        r.fill(&mut out, 2, &shared, &ring, Duration::ZERO);
         let mut out2 = vec![0f32; 10000];
-        r.fill(&mut out2, 2, &shared, &ring);
+        r.fill(&mut out2, 2, &shared, &ring, Duration::ZERO);
         out.extend(out2);
         assert!(
             input
@@ -320,6 +449,62 @@ mod tests {
                 .all(|(a, b)| a.to_bits() == b.to_bits())
         );
         assert_eq!(shared.played.load(Ordering::Relaxed), 10000);
+    }
+
+    /// A ring of `n` frames of 1.0, with a fresh renderer at 48 kHz.
+    fn ones(n: usize) -> (Arc<Shared>, SharedConsumer, Render) {
+        let shared = Shared::new();
+        let (mut p, c) = rtrb::RingBuffer::<f32>::new(1 << 16);
+        let _ = p.push_partial_slice(&vec![1.0; n * 2]);
+        (shared, Arc::new(Mutex::new(c)), Render::new(48000))
+    }
+
+    #[test]
+    fn gate_waits_with_silence_until_its_moment() {
+        let (shared, ring, mut r) = ones(4000);
+        // Frame 10 must be heard 10 ms (480 frames) after this buffer's first frame.
+        shared.set_gate(10, clock::now_ns() + 10_000_000);
+        let mut out = vec![0f32; 2000 * 2];
+        r.fill(&mut out, 2, &shared, &ring, Duration::ZERO);
+        let first_after = out[20..].iter().position(|&s| s == 1.0).unwrap() / 2 + 10;
+        assert!(out[..20].iter().all(|&s| s == 1.0));
+        // The callback starts a moment after `when` was taken: up to a few frames early.
+        assert!((470..=481).contains(&first_after), "{first_after}");
+        assert!(out[first_after * 2..].iter().all(|&s| s == 1.0));
+        assert_eq!(shared.gate(), None);
+        // No audio was dropped: 10 before the gate, the rest after.
+        let heard = out.iter().filter(|&&s| s == 1.0).count() / 2;
+        assert_eq!(shared.played.load(Ordering::Relaxed), heard as u64);
+    }
+
+    #[test]
+    fn held_gate_plays_nothing_past_it() {
+        let (shared, ring, mut r) = ones(4000);
+        shared.set_gate(100, HOLD);
+        let mut out = vec![0f32; 1000 * 2];
+        r.fill(&mut out, 2, &shared, &ring, Duration::ZERO);
+        assert_eq!(shared.played.load(Ordering::Relaxed), 100);
+        assert!(out[200..].iter().all(|&s| s == 0.0));
+        assert_eq!(shared.underruns.load(Ordering::Relaxed), 0);
+        // Late: starts at once, nothing skipped.
+        shared.open_gate(1);
+        r.fill(&mut out, 2, &shared, &ring, Duration::ZERO);
+        assert!(out.iter().all(|&s| s == 1.0));
+        assert_eq!(shared.played.load(Ordering::Relaxed), 1100);
+        assert!(shared.gate_late.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn anchor_says_when_the_next_frame_is_heard() {
+        let (shared, ring, mut r) = ones(4000);
+        let before = clock::now_ns();
+        let mut out = vec![0f32; 480 * 2];
+        r.fill(&mut out, 2, &shared, &ring, Duration::from_millis(20));
+        let (f, ns) = shared.anchor().unwrap();
+        assert_eq!(f, 480);
+        // 20 ms latency + the 10 ms buffer.
+        let d = ns - before;
+        assert!((30_000_000..31_000_000).contains(&d), "{d}");
     }
 
     #[test]
@@ -331,7 +516,7 @@ mod tests {
         let ring = Arc::new(Mutex::new(c));
         let mut r = Render::new(48000);
         let mut out = vec![0f32; 512];
-        r.fill(&mut out, 2, &shared, &ring);
+        r.fill(&mut out, 2, &shared, &ring, Duration::ZERO);
         assert!(out.iter().all(|&s| s == 0.25), "{:?}", &out[..4]);
     }
 

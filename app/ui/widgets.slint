@@ -239,7 +239,8 @@ export component MiniVisualizer inherits Rectangle {
         y: root.height - self.height;
         border-radius: 1px;
         background: root.bar-color;
-        animate height { duration: 70ms; }
+        // Not animated: the levels already come smoothed ~30 times a second, and easing each
+        // step would keep an animation running, redrawing the whole window every frame.
     }
 }
 

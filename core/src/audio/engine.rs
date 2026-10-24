@@ -4,8 +4,14 @@
 //! is written straight after the current one's last into the same ring. A timeline of marks
 //! (ring frame → track) turns the callback's frame counter into "which track, what position"
 //! without the callback knowing anything about tracks.
+//!
+//! Synced mode (Listen Along): every start waits at a gate in the ring (see `output`) until an
+//! instant shared by everyone listening. A start nobody has timed yet is held, announced with
+//! [`Event::Cueing`] and, once enough is decoded, [`Event::Cued`]; [`Engine::start_at`] then
+//! says when. Nothing is corrected while a song plays.
 
-use super::output::{self, Output, Shared, SharedConsumer};
+use super::clock;
+use super::output::{self, HOLD, Output, Shared, SharedConsumer};
 use super::resample::Resampler;
 use super::source::{self, Source};
 use super::stream::HttpStream;
@@ -52,6 +58,10 @@ pub enum Event {
     Device(String),
     /// A live station said what it plays now (its ICY `StreamTitle`; empty: nothing said).
     Title { id: String, title: String },
+    /// Synced mode: a start from `ms` into `id` is being prepared and will wait for a time.
+    Cueing { id: String, ms: u64 },
+    /// Synced mode: that start has audio ready and waits for [`Engine::start_at`].
+    Cued { id: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,8 +72,51 @@ pub struct Position {
     pub paused: bool,
 }
 
+/// Exactly where playback is: `ms` into `id` is heard at `at`.
+#[derive(Debug, Clone)]
+pub struct Timing {
+    pub id: String,
+    pub ms: f64,
+    pub at: Instant,
+    pub duration_ms: Option<u64>,
+    pub paused: bool,
+    /// Waiting at a synced start (`ms` is where it will start, `at` means nothing yet).
+    pub held: bool,
+}
+
+impl Timing {
+    /// What is heard at `t` (playing on from `at`; a held or paused one stays put).
+    pub fn ms_at(&self, t: Instant) -> f64 {
+        if self.held || self.paused {
+            return self.ms;
+        }
+        if t >= self.at {
+            self.ms + (t - self.at).as_secs_f64() * 1000.0
+        } else {
+            self.ms - (self.at - t).as_secs_f64() * 1000.0
+        }
+    }
+
+    /// When `ms` into the track is heard.
+    pub fn instant_of(&self, ms: f64) -> Instant {
+        let d = Duration::from_secs_f64((ms - self.ms).abs() / 1000.0);
+        if ms >= self.ms { self.at + d } else { self.at - d }
+    }
+}
+
 enum Cmd {
     Play(String),
+    Cue {
+        id: String,
+        ms: u64,
+        when: Option<Instant>,
+    },
+    StartAt(Instant),
+    NextAt {
+        id: String,
+        when: Instant,
+    },
+    Synced(bool),
     SetNext(Option<String>),
     Pause,
     Resume,
@@ -132,6 +185,51 @@ impl Engine {
     }
     pub fn stop(&self) {
         let _ = self.cmd.send(Cmd::Stop);
+    }
+    /// Synced mode: every start waits at a gate (see the module docs).
+    pub fn set_synced(&self, on: bool) {
+        let _ = self.cmd.send(Cmd::Synced(on));
+    }
+    /// Plays `id` from `ms`, heard from `when` (`None`: held until [`Engine::start_at`]).
+    pub fn cue(&self, id: &str, ms: u64, when: Option<Instant>) {
+        let _ = self.cmd.send(Cmd::Cue {
+            id: id.into(),
+            ms,
+            when,
+        });
+    }
+    /// A held start is heard from `when`.
+    pub fn start_at(&self, when: Instant) {
+        let _ = self.cmd.send(Cmd::StartAt(when));
+    }
+    /// The next track `id` (see [`Engine::set_next`]) starts at `when`, after silence if the
+    /// current one ends sooner.
+    pub fn set_next_at(&self, id: &str, when: Instant) {
+        self.set_next(Some(id));
+        let _ = self.cmd.send(Cmd::NextAt {
+            id: id.into(),
+            when,
+        });
+    }
+    /// Exactly what is heard when (see [`Timing`]).
+    pub fn timing(&self) -> Option<Timing> {
+        let (frame, ns) = self.shared.anchor()?;
+        let tl = self.timeline.lock().unwrap();
+        let m = tl.audible(frame)?;
+        let held = self.shared.gate() == Some(m.at) && frame == m.at;
+        let frames = frame - m.at + m.offset;
+        Some(Timing {
+            id: m.id.clone(),
+            ms: frames as f64 * 1000.0 / tl.rate.max(1) as f64,
+            at: clock::instant_of(ns),
+            duration_ms: m.duration_ms,
+            paused: self.shared.paused.load(Ordering::Relaxed),
+            held,
+        })
+    }
+    /// How late the last synced start was heard (0: on time).
+    pub fn start_late(&self) -> Duration {
+        Duration::from_nanos(self.shared.gate_late.load(Ordering::Relaxed))
     }
     pub fn set_volume(&self, v: f32) {
         self.shared
@@ -328,6 +426,17 @@ struct Worker {
     /// The output must be (re)opened at this time (device changed or lost, or none yet).
     reopen_at: Option<Instant>,
     reopen_failures: u32,
+    /// Synced mode (see the module docs).
+    synced: bool,
+    /// The next start's position and time, from `Cue`.
+    pending: Option<(u64, Option<Instant>)>,
+    /// When the next track starts, once said.
+    next_when: Option<(String, Instant)>,
+    /// The track waiting at the gate; whether its opening was logged.
+    gate_id: Option<String>,
+    gate_logged: bool,
+    /// A held start that hasn't said `Cued` yet.
+    cue_wait: Option<String>,
 }
 
 impl Worker {
@@ -363,6 +472,12 @@ impl Worker {
             idle_since: Some(Instant::now()),
             reopen_at: None,
             reopen_failures: 0,
+            synced: false,
+            pending: None,
+            next_when: None,
+            gate_id: None,
+            gate_logged: true,
+            cue_wait: None,
         };
         // No device yet (none plugged in, or busy): keep trying, playback starts once one is.
         if let Err(e) = w.open_output() {
@@ -452,7 +567,40 @@ impl Worker {
     fn handle(&mut self, c: Cmd) -> bool {
         match c {
             Cmd::Quit => return false,
-            Cmd::Play(id) => self.play(id),
+            Cmd::Play(id) => {
+                self.pending = None;
+                self.play(id);
+            }
+            Cmd::Cue { id, ms, when } => {
+                self.shared.paused.store(false, Ordering::Relaxed);
+                self.pending = Some((ms, when));
+                self.play(id);
+            }
+            Cmd::StartAt(when) => {
+                if self.shared.gate().is_some() {
+                    self.shared.open_gate(clock::ns_of(when));
+                    self.cue_wait = None;
+                }
+            }
+            Cmd::NextAt { id, when } => {
+                if self.gate_id.as_deref() == Some(id.as_str())
+                    && self.shared.gate().is_some()
+                    && self.shared.gate_when.load(Ordering::SeqCst) == HOLD
+                {
+                    // Already waiting at its start.
+                    self.shared.open_gate(clock::ns_of(when));
+                    self.cue_wait = None;
+                } else {
+                    self.next_when = Some((id, when));
+                }
+            }
+            Cmd::Synced(on) => {
+                self.synced = on;
+                if !on && self.shared.gate().is_some() {
+                    self.shared.open_gate(0);
+                }
+                self.next_when = None;
+            }
             Cmd::SetNext(id) => self.set_next(id),
             Cmd::Pause => {
                 self.shared.paused.store(true, Ordering::Relaxed);
@@ -496,7 +644,7 @@ impl Worker {
         // Skipping to the preloaded track starts instantly.
         if let Some(t) = self.next.take().filter(|t| t.id == id) {
             self.cur = None;
-            self.start(t, 0, true);
+            self.begin(t);
             return;
         }
         self.cur = None;
@@ -514,6 +662,9 @@ impl Worker {
         }
         self.next = None;
         self.loading_next = false;
+        if self.next_when.as_ref().map(|(i, _)| i) != id.as_ref() {
+            self.next_when = None;
+        }
         self.next_id = id;
     }
 
@@ -550,13 +701,50 @@ impl Worker {
         let Some(mut t) = self.cur.take() else { return };
         self.flush();
         match t.seek(ms, self.dev_rate) {
-            Ok(offset) => self.start(t, offset, false),
+            Ok(offset) => {
+                let id = t.id.clone();
+                let at = self.start(t, offset, false);
+                if self.synced {
+                    self.gate(at, id, ms, None);
+                }
+            }
             Err(e) => self.fail(t.id, e),
         }
     }
 
-    /// Makes `t` the decoding track, audible from the current end of the ring.
-    fn start(&mut self, t: Track, offset: u64, announce: bool) {
+    /// Starts a track asked for with `Play` or `Cue`: from where `Cue` said, and in synced mode
+    /// at the gate.
+    fn begin(&mut self, mut t: Track) {
+        let (ms, when) = self.pending.take().unwrap_or((0, None));
+        let mut offset = 0;
+        if ms > 0 && !t.src.live() {
+            match t.seek(ms, self.dev_rate) {
+                Ok(o) => offset = o,
+                Err(e) => return self.fail(t.id, e),
+            }
+        }
+        let id = t.id.clone();
+        let at = self.start(t, offset, true);
+        if self.synced {
+            self.gate(at, id, ms, when);
+        }
+    }
+
+    /// Ring frame `at` (the start of `id`, `ms` in) waits until `when` (`None`: held).
+    fn gate(&mut self, at: u64, id: String, ms: u64, when: Option<Instant>) {
+        self.shared.set_gate(at, when.map_or(HOLD, clock::ns_of));
+        self.gate_id = Some(id.clone());
+        self.gate_logged = false;
+        if when.is_none() {
+            self.cue_wait = Some(id.clone());
+            let _ = self.events.send(Event::Cueing { id, ms });
+        } else {
+            self.cue_wait = None;
+        }
+    }
+
+    /// Makes `t` the decoding track, audible from the current end of the ring (that frame).
+    fn start(&mut self, t: Track, offset: u64, announce: bool) -> u64 {
         let at = self.written + (self.carry.len() / CH) as u64;
         self.timeline.lock().unwrap().marks.push_back(Mark {
             at,
@@ -571,6 +759,7 @@ impl Worker {
         if let Some(o) = &mut self.output {
             o.start();
         }
+        at
     }
 
     /// Drops everything queued for output.
@@ -587,6 +776,9 @@ impl Worker {
         }
         self.carry.clear();
         self.shared.reset_eq.store(true, Ordering::Relaxed);
+        self.shared.clear_gate();
+        self.gate_id = None;
+        self.cue_wait = None;
         self.timeline.lock().unwrap().marks.clear();
         self.shared.expecting.store(false, Ordering::Relaxed);
     }
@@ -629,7 +821,7 @@ impl Worker {
             match result {
                 Ok(l) => {
                     let t = Track::new(id, l, self.dev_rate);
-                    self.start(t, 0, true);
+                    self.begin(t);
                 }
                 Err(e) => {
                     // The queue decides what follows a failed track.
@@ -705,9 +897,19 @@ impl Worker {
             let Some(t) = self.cur.as_mut() else { return };
             if t.eof {
                 if let Some(n) = self.next.take() {
-                    // Gapless hand-over: the next track starts right after the last sample.
+                    // Gapless hand-over: the next track starts right after the last sample (in
+                    // synced mode at its time, after silence if this one ended sooner).
                     self.prev = self.cur.take();
-                    self.start(n, 0, true);
+                    let id = n.id.clone();
+                    let when = self
+                        .next_when
+                        .take()
+                        .filter(|(i, _)| *i == id)
+                        .map(|(_, w)| w);
+                    let at = self.start(n, 0, true);
+                    if self.synced {
+                        self.gate(at, id, 0, when);
+                    }
                     continue;
                 }
                 self.maybe_preload();
@@ -794,6 +996,23 @@ impl Worker {
         }
         for e in started {
             let _ = self.events.send(e);
+        }
+        if let Some(gate) = self.shared.gate() {
+            // A held start is ready once a little is decoded past its gate.
+            let ahead = (self.written + (self.carry.len() / CH) as u64).saturating_sub(gate);
+            let eof = self.cur.as_ref().is_none_or(|t| t.eof);
+            if self.cue_wait.is_some() && (ahead >= self.dev_rate as u64 * 3 / 10 || eof) {
+                let id = self.cue_wait.take().unwrap_or_default();
+                let _ = self.events.send(Event::Cued { id });
+            }
+        } else if !self.gate_logged {
+            self.gate_logged = true;
+            let late = self.shared.gate_late.load(Ordering::Relaxed) / 1_000;
+            log::info!(
+                "{}: synced start, {} us late",
+                self.gate_id.as_deref().unwrap_or("?"),
+                late
+            );
         }
         let drained = self.carry.is_empty() && played >= self.written;
         let ended = self.cur.as_ref().is_none_or(|t| t.eof) && self.next.is_none();
@@ -904,7 +1123,11 @@ impl Worker {
 fn load(resolver: &Arc<Resolver>, id: &str, events: Sender<Event>) -> Result<Loaded> {
     let t0 = Instant::now();
     if crate::radio::is_station(id) {
-        let src = crate::radio::live::open(id, Some(events))?;
+        // Listening along: the host's relayed bytes, not a connection of our own.
+        let src = match crate::radio::relay::take_relay(id) {
+            Some(r) => crate::radio::relay::open_relay(id, r, None)?,
+            None => crate::radio::live::open(id, Some(events))?,
+        };
         log::info!(
             "{id}: live {} ready in {} ms ({} bytes buffered)",
             src.quality,
