@@ -36,8 +36,9 @@ pub enum Repeat {
 
 pub struct Player<E = Engine> {
     pub engine: E,
+    /// The list as the user made it (edits included), whatever the play order.
     queue: Vec<String>,
-    /// Play order: indices into `queue` (shuffled or not).
+    /// Play order: a permutation of `queue`'s indices (in order unless shuffled).
     order: Vec<usize>,
     /// Position in `order`.
     at: usize,
@@ -129,14 +130,20 @@ impl<E: Playback> Player<E> {
         }
     }
 
-    /// Inserts tracks right after the current one ("play next").
+    /// Inserts tracks right after the current one ("play next"), in the list too, so they
+    /// stay there when shuffle goes off.
     pub fn insert_next(&mut self, ids: Vec<String>) {
         if self.order.is_empty() {
             return self.play_queue(ids, 0);
         }
-        let first = self.queue.len();
+        let first = self.order[self.at] + 1;
         let n = ids.len();
-        self.queue.extend(ids);
+        self.queue.splice(first..first, ids);
+        for i in &mut self.order {
+            if *i >= first {
+                *i += n;
+            }
+        }
         let at = self.at + 1;
         self.order.splice(at..at, first..first + n);
         self.update_next();
@@ -153,7 +160,6 @@ impl<E: Playback> Player<E> {
         self.update_next();
     }
 
-    /// Plays the track at `pos` in play order.
     /// Keeps the current song playing and makes `ids` everything after it (autoplay).
     pub fn replace_rest(&mut self, ids: Vec<String>) {
         let Some(cur) = self.current().map(str::to_string) else {
@@ -166,6 +172,7 @@ impl<E: Playback> Player<E> {
         self.update_next();
     }
 
+    /// Plays the track at `pos` in play order.
     pub fn jump(&mut self, pos: usize) {
         if pos < self.order.len() {
             self.at = pos;
@@ -178,21 +185,34 @@ impl<E: Playback> Player<E> {
         if pos >= self.order.len() || pos == self.at {
             return;
         }
-        self.order.remove(pos);
+        let gone = self.order.remove(pos);
+        self.queue.remove(gone);
+        for i in &mut self.order {
+            if *i > gone {
+                *i -= 1;
+            }
+        }
         if pos < self.at {
             self.at -= 1;
         }
         self.update_next();
     }
 
-    /// Moves the track at play-order position `from` to `to`.
+    /// Moves the track at play-order position `from` to `to`: in the list itself, or while
+    /// shuffled only in the play order (shuffle off brings back the list as it was).
     pub fn move_item(&mut self, from: usize, to: usize) {
         let n = self.order.len();
         if from >= n || to >= n || from == to {
             return;
         }
-        let item = self.order.remove(from);
-        self.order.insert(to, item);
+        if self.shuffle {
+            let item = self.order.remove(from);
+            self.order.insert(to, item);
+        } else {
+            // In order, play position and list index are the same.
+            let id = self.queue.remove(from);
+            self.queue.insert(to, id);
+        }
         self.at = if self.at == from {
             to
         } else if from < self.at && to >= self.at {
@@ -576,7 +596,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "M1"]
     fn edits_survive_shuffle_on_and_off() {
         let mut p = player("a b c d e", 0);
         p.remove(2);
@@ -590,7 +609,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "M1"]
     fn edits_while_shuffled_stay_after_shuffle_off() {
         let mut p = player("a b c d e f", 0);
         p.set_shuffle(true);
@@ -605,6 +623,18 @@ mod tests {
             .collect();
         assert_eq!(p.up_next().0, want);
         assert_eq!(p.queue().len(), 6);
+    }
+
+    #[test]
+    fn a_move_while_shuffled_changes_only_the_play_order() {
+        let mut p = player("a b c d", 0);
+        p.set_shuffle(true);
+        let moved = p.up_next().0[3].to_string();
+        p.move_item(3, 1);
+        assert_eq!(p.up_next().0[1], moved);
+        assert_eq!(next(&p).as_deref(), Some(moved.as_str()));
+        p.set_shuffle(false);
+        assert_eq!(shown(&p), "[a] b c d");
     }
 
     #[test]
