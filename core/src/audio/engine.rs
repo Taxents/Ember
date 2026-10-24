@@ -1240,6 +1240,18 @@ impl Worker {
     }
 }
 
+/// A refreshed URL may only continue the same file: another format (or a re-encode) spliced
+/// in mid-download would be garbage.
+fn same_file(itag: u32, len: Option<u64>, fresh: &crate::yt::StreamInfo) -> Result<()> {
+    if fresh.itag == itag && (len.is_none() || fresh.content_length == len) {
+        return Ok(());
+    }
+    Err(Error::Unavailable(format!(
+        "the stream changed (itag {itag} became {}, {:?} bytes became {:?})",
+        fresh.itag, len, fresh.content_length
+    )))
+}
+
 /// Resolve, open the stream and parse headers: everything up to the first decodable packet.
 fn load(
     resolver: &Arc<Resolver>,
@@ -1269,9 +1281,12 @@ fn load(
     let t_resolve = t0.elapsed();
     let r = resolver.clone();
     let vid = id.to_string();
+    let (itag, len) = (info.itag, info.content_length);
     let refresh = Box::new(move || {
         r.invalidate(&vid);
-        r.refresh(&vid).map(|i| i.url)
+        let fresh = r.refresh(&vid)?;
+        same_file(itag, len, &fresh)?;
+        Ok(fresh.url)
     });
     let stream = match HttpStream::open_with(
         info.url.clone(),
@@ -1472,6 +1487,24 @@ mod tests {
         fn loads(&self) -> Vec<String> {
             self.loads.lock().unwrap().clone()
         }
+    }
+
+    #[test]
+    fn a_refreshed_url_must_be_the_same_file() {
+        let info = |itag, len| crate::yt::StreamInfo {
+            video_id: "a".into(),
+            url: "https://example.invalid/".into(),
+            itag,
+            mime: "audio/webm".into(),
+            content_length: len,
+            duration_ms: None,
+            sample_rate: None,
+            expires_at: 0,
+        };
+        assert!(same_file(251, Some(100), &info(251, Some(100))).is_ok());
+        assert!(same_file(251, Some(100), &info(140, Some(100))).is_err());
+        assert!(same_file(251, Some(100), &info(251, Some(101))).is_err());
+        assert!(same_file(251, None, &info(251, Some(101))).is_ok());
     }
 
     #[test]

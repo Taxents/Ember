@@ -15,6 +15,8 @@ pub struct Behaviour {
     pub stall_after: Option<u64>,
     /// Close each response's connection after this many of its body bytes.
     pub drop_after: Option<u64>,
+    /// Answer 403 (an expired URL) to every request after this many.
+    pub refuse_after: Option<u64>,
 }
 
 pub struct Server {
@@ -42,6 +44,7 @@ pub fn serve(data: Vec<u8>, b: Behaviour) -> Server {
     let data = Arc::new(data);
     let stop = Arc::new(AtomicBool::new(false));
     let sent = Arc::new(AtomicU64::new(0));
+    let requests = Arc::new(AtomicU64::new(0));
     let b = Arc::new(b);
     listener.set_nonblocking(true).unwrap();
     {
@@ -50,10 +53,15 @@ pub fn serve(data: Vec<u8>, b: Behaviour) -> Server {
             while !stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((s, _)) => {
-                        let (data, stop, sent, b) =
-                            (data.clone(), stop.clone(), sent.clone(), b.clone());
+                        let (data, stop, sent, b, requests) = (
+                            data.clone(),
+                            stop.clone(),
+                            sent.clone(),
+                            b.clone(),
+                            requests.clone(),
+                        );
                         std::thread::spawn(move || {
-                            let _ = connection(s, &data, &b, &stop, &sent);
+                            let _ = connection(s, &data, &b, &stop, &sent, &requests);
                         });
                     }
                     Err(_) => std::thread::sleep(Duration::from_millis(5)),
@@ -75,6 +83,7 @@ fn connection(
     b: &Behaviour,
     stop: &AtomicBool,
     sent: &AtomicU64,
+    requests: &AtomicU64,
 ) -> std::io::Result<()> {
     s.set_nonblocking(false)?;
     let mut r = BufReader::new(s.try_clone()?);
@@ -99,6 +108,12 @@ fn connection(
                 let z: usize = z.parse().unwrap_or(data.len() - 1);
                 range = Some((a, z.min(data.len() - 1)));
             }
+        }
+        if b.refuse_after
+            .is_some_and(|n| requests.fetch_add(1, Ordering::Relaxed) >= n)
+        {
+            write!(w, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")?;
+            continue;
         }
         let (a, z) = range.unwrap_or((0, data.len() - 1));
         write!(

@@ -121,6 +121,7 @@ impl HttpStream {
             url,
             refresh,
             len: len_hint,
+            len_confirmed: false,
             published: 0,
         };
         // The first request runs here, so `open` returns with the length known and the first
@@ -273,6 +274,8 @@ struct Fetcher {
     url: String,
     refresh: Refresh,
     len: Option<u64>,
+    /// The server said the length (the hint may be off until then).
+    len_confirmed: bool,
     /// Units published so far: a request that brought any is progress, whatever ended it.
     published: u64,
 }
@@ -284,6 +287,8 @@ enum Fetch {
     /// A reader wants a different place; start a new request.
     Redirected,
     Failed(String),
+    /// The URL now serves a file of another length: never mix two files.
+    Changed(u64),
 }
 
 impl Fetcher {
@@ -302,6 +307,7 @@ impl Fetcher {
                 }
                 Fetch::Refused(code) => return Err(Error::Unavailable(format!("HTTP {code}"))),
                 Fetch::Failed(e) => return Err(Error::Net(e)),
+                Fetch::Changed(len) => return Err(changed(len)),
             }
         }
     }
@@ -334,6 +340,7 @@ impl Fetcher {
                 Fetch::Refused(code) => {
                     return self.fail(Error::Unavailable(format!("stream refused (HTTP {code})")));
                 }
+                Fetch::Changed(len) => return self.fail(changed(len)),
                 Fetch::Failed(e) => {
                     failures += 1;
                     if failures > 4 {
@@ -389,17 +396,20 @@ impl Fetcher {
         if status != 206 {
             return Fetch::Failed(format!("HTTP {status}"));
         }
-        if self.len.is_none() {
-            let total = resp
-                .headers()
-                .get("content-range")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.rsplit('/').next())
-                .and_then(|v| v.parse::<u64>().ok());
-            match total {
-                Some(t) if t > 0 => self.len = Some(t),
-                _ => return Fetch::Failed("no Content-Range length".into()),
+        let total = resp
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit('/').next())
+            .and_then(|v| v.parse::<u64>().ok());
+        match (total, self.len) {
+            (Some(t), Some(len)) if t != len && self.len_confirmed => return Fetch::Changed(t),
+            (Some(t), _) if t > 0 => {
+                self.len = Some(t);
+                self.len_confirmed = true;
             }
+            (_, Some(_)) => {}
+            _ => return Fetch::Failed("no Content-Range length".into()),
         }
         let len = self.len.unwrap();
         {
@@ -445,6 +455,10 @@ impl Fetcher {
         }
         Fetch::Done
     }
+}
+
+fn changed(len: u64) -> Error {
+    Error::Unavailable(format!("the stream changed (now {len} bytes)"))
 }
 
 #[cfg(test)]
@@ -539,6 +553,37 @@ mod tests {
             "{:?}",
             t.elapsed()
         );
+    }
+
+    #[test]
+    fn a_new_url_serving_another_file_fails_instead_of_mixing_them() {
+        // The first URL stops working after its first answer; the new one is another file.
+        let other = testserver::serve(testserver::file(3 << 20), Behaviour::default());
+        let s = testserver::serve(
+            testserver::file(2 << 20),
+            Behaviour {
+                refuse_after: Some(1),
+                ..Default::default()
+            },
+        );
+        let new = other.url.clone();
+        let refresh = Box::new(move || Ok(new.clone()));
+        let mut st = HttpStream::open(s.url.clone(), None, refresh).unwrap();
+        let mut got = Vec::new();
+        let e = st.read_to_end(&mut got).unwrap_err();
+        assert!(e.to_string().contains("stream changed"), "{e}");
+        assert!(got.len() < 2 << 20);
+    }
+
+    #[test]
+    fn a_wrong_length_hint_gives_way_to_the_server() {
+        let s = testserver::serve(testserver::file(1 << 20), Behaviour::default());
+        let refresh = Box::new(|| Err(Error::Net("no new URL".into())));
+        let mut st = HttpStream::open(s.url.clone(), Some(5 << 20), refresh).unwrap();
+        assert_eq!(st.len(), 1 << 20);
+        let mut got = Vec::new();
+        st.read_to_end(&mut got).unwrap();
+        assert!(got == *s.data);
     }
 
     #[test]
