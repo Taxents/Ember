@@ -17,8 +17,9 @@
 //!   the host takes it back in from the next song start.
 //! * What a listener sends is trusted no further than it must be: songs are taken by id (the
 //!   host looks up the rest itself), queue edits name the song meant and the queue version they
-//!   were made on, the restarts a listener can cause are rate-limited, and the host times the
-//!   round trips it waits on itself (see `together`).
+//!   were made on, the restarts and requests a listener can cause are rate-limited, what they
+//!   can add to the queue is capped, and the host times the round trips it waits on itself
+//!   (see `together`).
 //!
 //! [`Player::follower`]: music_core::player::Player::follower
 
@@ -29,7 +30,7 @@ use music_core::radio::{self, relay};
 use music_core::yt::model::Track;
 use serde::{Deserialize, Serialize};
 use slint::{ComponentHandle, ModelRc, SharedString, TimerMode, VecModel};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -52,10 +53,23 @@ const QUEUE_WINDOW: usize = 200;
 const RESYNC_EVERY: Duration = Duration::from_secs(10);
 /// A start heard later than this is reported to the host.
 const LATE: Duration = Duration::from_millis(30);
-/// Songs new to the host that it looks up, at most, per request.
-const LOOKUPS: usize = 2 * QUEUE_WINDOW;
-/// Network events reach the UI thread in batches, at most this often.
+/// Songs new to the host waiting to be looked up, at most; more are left as they are.
+const LOOKUPS: usize = 2000;
+/// Songs looked up per round trip to the UI thread.
+const LOOKUP_CHUNK: usize = 8;
+/// Songs taken from one listener request, at most.
+const MAX_IDS: usize = 500;
+/// The longest a listener can make the queue by adding to it.
+const MAX_QUEUE: usize = 5000;
+/// Requests a listener can make at once, and how many more a second after that.
+const REQUEST_BURST: f64 = 20.0;
+const REQUEST_RATE: f64 = 2.0;
+/// Network events reach the UI thread in batches, at most this often…
 const BATCH_EVERY: Duration = Duration::from_millis(16);
+/// …of at most this many, one at a time (the next waits until the last was handled).
+const BATCH_MAX: usize = 256;
+/// What a station new to the host is called until it's looked up.
+const SOME_STATION: &str = "Radio station";
 
 /// Tells sessions apart, so events of one that ended are dropped.
 static SESSIONS: AtomicU64 = AtomicU64::new(0);
@@ -196,6 +210,35 @@ struct Member {
     issued: Option<u64>,
     /// When it last had itself started again.
     resynced: Option<Instant>,
+    /// What it may still ask for.
+    asks: Allowance,
+}
+
+/// A request budget: [`REQUEST_BURST`] at once, refilled at [`REQUEST_RATE`] a second.
+struct Allowance {
+    left: f64,
+    at: Instant,
+}
+
+impl Allowance {
+    fn new(now: Instant) -> Self {
+        Self {
+            left: REQUEST_BURST,
+            at: now,
+        }
+    }
+
+    /// Spends one request, if there is one left.
+    fn take(&mut self, now: Instant) -> bool {
+        let refill = now.saturating_duration_since(self.at).as_secs_f64() * REQUEST_RATE;
+        self.left = (self.left + refill).min(REQUEST_BURST);
+        self.at = now;
+        let ok = self.left >= 1.0;
+        if ok {
+            self.left -= 1.0;
+        }
+        ok
+    }
 }
 
 /// A start everyone gets ready for.
@@ -224,8 +267,12 @@ pub struct Hosting {
     window_from: usize,
     /// The queue's version, as last sent.
     ver: u64,
-    /// Songs listeners added that are being looked up.
+    /// Songs listeners added that are waiting to be looked up or being looked up.
     looking_up: HashSet<String>,
+    /// Those waiting, in order.
+    backlog: VecDeque<String>,
+    /// A lookup is under way.
+    lookup_busy: bool,
 }
 
 pub struct Listening {
@@ -302,8 +349,10 @@ fn place(order: &[&str], from: usize, ver: u64, at: usize, id: &str, seen: u64) 
     (seen == ver && order.get(pos) == Some(&id)).then_some(pos)
 }
 
-/// Delivers a session's network events to the UI thread until it ends: in batches, at most one
-/// hand-over per [`BATCH_EVERY`], each dropped once `session` is no longer the one running.
+/// Delivers a session's network events to the UI thread until it ends: in batches of at most
+/// [`BATCH_MAX`], at most one per [`BATCH_EVERY`] and one at a time, each dropped once
+/// `session` is no longer the one running. Waiting for the UI leaves the rest in the bounded
+/// channel, which slows the network side down rather than piling work onto the UI thread.
 fn forward<E: Send + 'static>(
     rx: crossbeam_channel::Receiver<E>,
     session: u64,
@@ -312,6 +361,7 @@ fn forward<E: Send + 'static>(
     std::thread::Builder::new()
         .name("together-events".into())
         .spawn(move || {
+            let (done_tx, done) = crossbeam_channel::bounded::<()>(1);
             let mut last: Option<Instant> = None;
             while let Ok(first) = rx.recv() {
                 if let Some(wait) =
@@ -320,9 +370,10 @@ fn forward<E: Send + 'static>(
                     std::thread::sleep(wait);
                 }
                 let mut batch = vec![first];
-                batch.extend(rx.try_iter().take(together::EVENTS));
+                batch.extend(rx.try_iter().take(BATCH_MAX - 1));
                 last = Some(Instant::now());
-                let _ = slint::invoke_from_event_loop(move || {
+                let done_tx = done_tx.clone();
+                let sent = slint::invoke_from_event_loop(move || {
                     with(|a| {
                         for e in batch {
                             if a.together_session() != Some(session) {
@@ -331,10 +382,30 @@ fn forward<E: Send + 'static>(
                             f(a, e);
                         }
                     });
+                    let _ = done_tx.try_send(());
                 });
+                if sent.is_err() {
+                    break; // the event loop is gone
+                }
+                // Bounded, in case the UI never gets to it (it is quitting).
+                let _ = done.recv_timeout(Duration::from_secs(1));
             }
         })
         .expect("spawn");
+}
+
+/// A song or station new to the host, until it's looked up.
+fn placeholder(id: String) -> Track {
+    let title = if radio::is_station(&id) {
+        SOME_STATION.to_string()
+    } else {
+        String::new()
+    };
+    Track {
+        video_id: id,
+        title,
+        ..Default::default()
+    }
 }
 
 impl App {
@@ -455,6 +526,8 @@ impl App {
             window_from: 0,
             ver: 0,
             looking_up: HashSet::new(),
+            backlog: VecDeque::new(),
+            lookup_busy: false,
         })));
         self.together_copy_code(&code);
         self.together_status("Invite code copied");
@@ -627,6 +700,7 @@ impl App {
                     synced: false,
                     issued: None,
                     resynced: None,
+                    asks: Allowance::new(Instant::now()),
                 });
                 self.send_members();
                 self.send_queue(Some(peer));
@@ -695,6 +769,10 @@ impl App {
                         );
                     }
                     Up::Request(r) => {
+                        if !m.asks.take(Instant::now()) {
+                            log::info!("together: {} is asking too fast", m.name);
+                            return;
+                        }
                         let name = m.name.clone();
                         self.do_request(peer, r, &name);
                     }
@@ -983,13 +1061,22 @@ impl App {
                 if !tracks.is_empty() {
                     self.play_list(tracks, start, shuffle);
                 }
-                // Placeholders until they're looked up (the queue shows their ids meanwhile).
-                for id in &new {
+                // Song placeholders until they're looked up (the queue shows their ids
+                // meanwhile); stations keep theirs, a better name than their ids.
+                for id in new.iter().filter(|id| !radio::is_station(id)) {
                     self.known.remove(id);
                 }
                 self.look_up(new);
             }
             Ask::Add { ids, next } => {
+                let room = MAX_QUEUE.saturating_sub(self.player.up_next().0.len());
+                if ids.len() > room {
+                    log::info!(
+                        "together: {name} added {} songs, room for {room}",
+                        ids.len()
+                    );
+                }
+                let ids: Vec<String> = ids.into_iter().take(room).collect();
                 let (tracks, new) = self.guest_tracks(ids, name);
                 let ids: Vec<String> = tracks.into_iter().map(|t| t.video_id).collect();
                 if ids.is_empty() {
@@ -1039,13 +1126,15 @@ impl App {
         self.send_queue(Some(peer));
     }
 
-    /// The songs a listener named, as the host knows them, noting who added them. Only their
-    /// ids are taken; songs new here get placeholders (their ids, also returned) to look up.
+    /// The songs a listener named (the first [`MAX_IDS`]), as the host knows them, noting who
+    /// added them. Only their ids are taken; songs new here get placeholders (their ids, also
+    /// returned) to look up, and stations new here are kept as [`SOME_STATION`] meanwhile.
     fn guest_tracks(&mut self, ids: Vec<String>, name: &str) -> (Vec<Track>, Vec<String>) {
         let mut new = Vec::new();
         let tracks: Vec<Track> = ids
             .into_iter()
             .filter(|id| playable_id(id))
+            .take(MAX_IDS)
             .map(|id| {
                 if let Some(t) = self.known.get(&id) {
                     return t.clone();
@@ -1054,10 +1143,11 @@ impl App {
                     return t;
                 }
                 new.push(id.clone());
-                Track {
-                    video_id: id,
-                    ..Default::default()
+                let t = placeholder(id);
+                if radio::is_station(&t.video_id) {
+                    self.known.insert(t.video_id.clone(), t.clone());
                 }
+                t
             })
             .collect();
         if let Some(Session::Hosting(h)) = &mut self.together {
@@ -1068,41 +1158,62 @@ impl App {
         (tracks, new)
     }
 
-    /// Looks up songs listeners added that are new here, a few at a time, and shows them.
+    /// Queues songs and stations listeners added that are new here to be looked up (up to
+    /// [`LOOKUPS`] waiting), and starts on them.
     fn look_up(&mut self, ids: Vec<String>) {
         let Some(Session::Hosting(h)) = &mut self.together else {
             return;
         };
-        let ids: Vec<String> = ids
-            .into_iter()
-            .filter(|id| !radio::is_station(id) && h.looking_up.insert(id.clone()))
-            .take(LOOKUPS)
-            .collect();
-        if ids.is_empty() {
+        for id in ids {
+            if h.looking_up.len() >= LOOKUPS {
+                log::info!("together: too many songs to look up, the rest stay as they are");
+                break;
+            }
+            if h.looking_up.insert(id.clone()) {
+                h.backlog.push_back(id);
+            }
+        }
+        self.next_lookup();
+    }
+
+    /// Looks up the next few waiting, one lookup at a time; [`App::looked_up`] goes on.
+    fn next_lookup(&mut self) {
+        let Some(Session::Hosting(h)) = &mut self.together else {
+            return;
+        };
+        if h.lookup_busy || h.backlog.is_empty() {
             return;
         }
+        let n = h.backlog.len().min(LOOKUP_CHUNK);
+        let asked: Vec<String> = h.backlog.drain(..n).collect();
+        h.lookup_busy = true;
         let (client, session) = (self.client.clone(), h.session);
         crate::workers::spawn(move || {
-            for chunk in ids.chunks(8) {
-                let found: Vec<Track> = chunk
-                    .iter()
-                    .filter_map(|id| {
+            let found: Vec<Track> = asked
+                .iter()
+                .filter_map(|id| match radio::channel_of(id) {
+                    Some(c) => radio::station(c).ok().map(|st| crate::radio::track(&st)),
+                    None => {
                         let w = client.watch_next(Some(id), None, None).ok()?;
                         w.tracks.into_iter().find(|t| t.video_id == *id)
-                    })
-                    .collect();
-                let asked = chunk.to_vec();
-                let _ = slint::invoke_from_event_loop(move || {
-                    with(|a| a.looked_up(session, asked, found));
-                });
-            }
+                    }
+                })
+                .collect();
+            let _ = slint::invoke_from_event_loop(move || {
+                with(|a| a.looked_up(session, asked, found));
+            });
         });
     }
 
     fn looked_up(&mut self, session: u64, asked: Vec<String>, found: Vec<Track>) {
         let changed = !found.is_empty();
         for t in found {
-            self.known.entry(t.video_id.clone()).or_insert(t);
+            // A station replaces its placeholder; a song the host has since met stays as is.
+            if radio::is_station(&t.video_id) {
+                self.known.insert(t.video_id.clone(), t);
+            } else {
+                self.known.entry(t.video_id.clone()).or_insert(t);
+            }
         }
         if let Some(Session::Hosting(h)) = &mut self.together
             && h.session == session
@@ -1110,9 +1221,11 @@ impl App {
             for id in &asked {
                 h.looking_up.remove(id);
             }
+            h.lookup_busy = false;
             if changed {
                 self.queue_changed();
             }
+            self.next_lookup();
         }
     }
 
@@ -1329,6 +1442,29 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listener_asking_too_fast_is_held_back() {
+        let t0 = Instant::now();
+        let mut a = Allowance::new(t0);
+        assert!((0..REQUEST_BURST as usize).all(|_| a.take(t0)));
+        assert!(!a.take(t0), "the burst is spent");
+        assert!(
+            a.take(t0 + Duration::from_millis(500)),
+            "one more after half a second"
+        );
+        assert!(!a.take(t0 + Duration::from_millis(500)));
+        // A long quiet spell refills only up to the burst.
+        let later = t0 + Duration::from_secs(3600);
+        assert!((0..REQUEST_BURST as usize).all(|_| a.take(later)));
+        assert!(!a.take(later));
+    }
+
+    #[test]
+    fn stations_new_here_get_a_name_meanwhile() {
+        assert_eq!(placeholder("radio:hcx4T119".into()).title, SOME_STATION);
+        assert_eq!(placeholder("dQw4w9WgXcQ".into()).title, "");
+    }
 
     #[test]
     fn a_slow_listener_delays_a_start_by_at_most_two_seconds() {
