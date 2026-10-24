@@ -139,6 +139,8 @@ enum Cmd {
     Resume,
     Seek(u64),
     Stop,
+    /// A track became audible before the decoder noticed: say so now.
+    Announce,
     Loaded {
         generation: u64,
         next: bool,
@@ -292,9 +294,9 @@ impl Engine {
         self.shared.underruns.load(Ordering::Relaxed)
     }
 
-    /// What is audible right now.
+    /// What is heard right now (the device's latency taken off what was handed to it).
     pub fn position(&self) -> Option<Position> {
-        position(&self.shared, &self.timeline)
+        position(&self.shared, &self.timeline, Some(&self.cmd))
     }
 
     /// A handle that reads the position from another thread (a video kept in step with the
@@ -303,6 +305,7 @@ impl Engine {
         Clock {
             shared: self.shared.clone(),
             timeline: self.timeline.clone(),
+            cmd: self.cmd.clone(),
         }
     }
 }
@@ -312,19 +315,47 @@ impl Engine {
 pub struct Clock {
     shared: Arc<Shared>,
     timeline: Arc<Mutex<Timeline>>,
+    cmd: Sender<Cmd>,
 }
 
 impl Clock {
     pub fn position(&self) -> Option<Position> {
-        position(&self.shared, &self.timeline)
+        position(&self.shared, &self.timeline, Some(&self.cmd))
     }
 }
 
-fn position(shared: &Shared, timeline: &Mutex<Timeline>) -> Option<Position> {
-    let tl = timeline.lock().unwrap();
+/// The ring frame heard now: what was taken from the ring, less what the device still holds
+/// (from the callback's anchor). Paused, what was taken is all heard by now.
+fn heard(shared: &Shared, rate: u32) -> u64 {
     let played = shared.played.load(Ordering::Relaxed);
-    let m = tl.audible(played)?;
-    let frames = played - m.at + m.offset;
+    if shared.paused.load(Ordering::Relaxed) {
+        return played;
+    }
+    let Some((frame, ns)) = shared.anchor() else {
+        return played;
+    };
+    let ahead = ns.saturating_sub(clock::now_ns()) as u128 * rate as u128 / 1_000_000_000;
+    frame.saturating_sub(ahead as u64).min(played)
+}
+
+/// What is heard now. `cmd`: wake the decoder when that is a track it hasn't announced yet.
+fn position(
+    shared: &Shared,
+    timeline: &Mutex<Timeline>,
+    cmd: Option<&Sender<Cmd>>,
+) -> Option<Position> {
+    let mut tl = timeline.lock().unwrap();
+    let heard = heard(shared, tl.rate);
+    if let Some(cmd) = cmd
+        && !tl.nudged
+        && tl.marks.iter().any(|m| !m.announced && m.at <= heard)
+    {
+        tl.nudged = true;
+        let _ = cmd.send(Cmd::Announce);
+    }
+    // Before the first mark (just after a seek or start): the place it starts from.
+    let m = tl.audible(heard).or(tl.marks.front())?;
+    let frames = heard.saturating_sub(m.at) + m.offset;
     Some(Position {
         id: m.id.clone(),
         ms: frames * 1000 / tl.rate.max(1) as u64,
@@ -370,6 +401,8 @@ struct Mark {
 struct Timeline {
     marks: VecDeque<Mark>,
     rate: u32,
+    /// The decoder was asked to announce (see [`Cmd::Announce`]); cleared when it has.
+    nudged: bool,
 }
 
 impl Timeline {
@@ -670,6 +703,8 @@ impl Worker {
                 }
             }
             Cmd::Seek(ms) => self.seek(ms),
+            // The loop announces after every command.
+            Cmd::Announce => {}
             Cmd::Stop => {
                 self.generation += 1;
                 self.flush();
@@ -1060,10 +1095,13 @@ impl Worker {
         let mut started = Vec::new();
         {
             let mut tl = self.timeline.lock().unwrap();
+            // Tracks start when they are heard, not when the device takes them.
+            let heard = heard(&self.shared, tl.rate);
+            tl.nudged = false;
             for m in tl
                 .marks
                 .iter_mut()
-                .filter(|m| !m.announced && m.at <= played)
+                .filter(|m| !m.announced && m.at <= heard)
             {
                 m.announced = true;
                 started.push(Event::Started {
@@ -1072,13 +1110,13 @@ impl Worker {
                 });
             }
             // Keep only the audible mark and those after it.
-            while tl.marks.len() > 1 && tl.marks[1].at <= played {
+            while tl.marks.len() > 1 && tl.marks[1].at <= heard {
                 tl.marks.pop_front();
             }
             // Once the decoding track is audible, the previous one can't be sought back to.
             if let (Some(cur), Some(front)) = (&self.cur, tl.marks.front())
                 && front.id == cur.id
-                && front.at <= played
+                && front.at <= heard
             {
                 self.prev = None;
             }
@@ -1160,16 +1198,8 @@ impl Worker {
         self.reopen_at = None;
         // Stop the old stream first so the position read below is final.
         self.output = None;
-        let played = self.shared.played.load(Ordering::Relaxed);
-        let resume = {
-            let tl = self.timeline.lock().unwrap();
-            tl.audible(played).map(|m| {
-                (
-                    m.id.clone(),
-                    (played - m.at + m.offset) * 1000 / tl.rate.max(1) as u64,
-                )
-            })
-        };
+        // What the lost device held but never played is played again.
+        let resume = position(&self.shared, &self.timeline, None).map(|p| (p.id, p.ms));
         let rebuilt = match self.open_output() {
             Ok(r) => r,
             Err(e) => {
@@ -1418,7 +1448,7 @@ mod tests {
         }
 
         fn position(&self) -> Option<Position> {
-            position(&self.w.shared, &self.w.timeline)
+            position(&self.w.shared, &self.w.timeline, None)
         }
 
         /// Events since the last call, as short strings.
@@ -1513,7 +1543,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut worst = 0;
                 while !stop.load(Ordering::Relaxed) {
-                    if let Some(p) = position(&shared, &timeline) {
+                    if let Some(p) = position(&shared, &timeline, None) {
                         worst = worst.max(p.ms);
                     }
                 }
@@ -1528,6 +1558,43 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let worst = reader.join().unwrap();
         assert!(worst <= 1010, "position jumped to {worst} ms");
+    }
+
+    #[test]
+    fn the_position_is_what_is_heard_not_what_the_device_took() {
+        let mut r = Rig::new();
+        r.cmd(Cmd::Play("a".into()));
+        r.play_out(500);
+        // The last callback said its frames are heard 100 ms from now.
+        let played = r.w.shared.played.load(Ordering::Relaxed);
+        r.w.shared.set_anchor(played, clock::now_ns() + 100_000_000);
+        let ms = r.position().unwrap().ms;
+        assert!((398..=400).contains(&ms), "{ms}");
+        // Paused, the device plays out what it has.
+        r.cmd(Cmd::Pause);
+        assert_eq!(r.position().unwrap().ms, 500);
+    }
+
+    #[test]
+    fn a_track_heard_before_the_decoder_wakes_is_announced_at_once() {
+        let mut r = Rig::new();
+        r.track("a", |s| s.frames = RATE / 2);
+        r.cmd(Cmd::Play("a".into()));
+        r.cmd(Cmd::SetNext(Some("b".into())));
+        r.play_out(100);
+        assert_eq!(r.events(), ["started a"]);
+        // The device moves into b while the decoder sleeps.
+        r.consume(300);
+        r.consume(300);
+        let tx = r.w.cmd_tx.clone();
+        let p = position(&r.w.shared, &r.w.timeline, Some(&tx)).unwrap();
+        assert_eq!(p.id, "b");
+        // Asked once, however often the position is read.
+        let _ = position(&r.w.shared, &r.w.timeline, Some(&tx));
+        assert!(matches!(r.rx.try_recv(), Ok(Cmd::Announce)));
+        assert!(r.rx.try_recv().is_err());
+        r.cmd(Cmd::Announce);
+        assert_eq!(r.events(), ["started b"]);
     }
 
     #[test]

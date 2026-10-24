@@ -111,7 +111,7 @@ impl Shared {
         }
     }
 
-    fn set_anchor(&self, frame: u64, ns: u64) {
+    pub(crate) fn set_anchor(&self, frame: u64, ns: u64) {
         self.anchor_seq.fetch_add(1, Ordering::SeqCst);
         self.anchor_frame.store(frame, Ordering::SeqCst);
         self.anchor_ns.store(ns, Ordering::SeqCst);
