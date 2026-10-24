@@ -60,8 +60,13 @@ pub enum Event {
     },
     /// The last track ended and nothing follows.
     Finished,
-    /// A track couldn't be played.
-    Failed { id: String, error: Error },
+    /// A track couldn't be played. `handed_over`: it broke off while playing and the next
+    /// track takes over by itself (a `Started` for it follows); nothing needs to be done.
+    Failed {
+        id: String,
+        error: Error,
+        handed_over: bool,
+    },
     /// The output device changed or failed.
     Device(String),
     /// A live station said what it plays now (its ICY `StreamTitle`; empty: nothing said).
@@ -892,8 +897,16 @@ impl Worker {
     }
 
     fn fail(&mut self, id: String, error: Error) {
+        self.report(id, error, false);
+    }
+
+    fn report(&mut self, id: String, error: Error, handed_over: bool) {
         log::error!("{id}: {error}");
-        let _ = self.events.send(Event::Failed { id, error });
+        let _ = self.events.send(Event::Failed {
+            id,
+            error,
+            handed_over,
+        });
     }
 
     /// How long the loop may sleep; `None` = until the next command.
@@ -986,9 +999,12 @@ impl Worker {
                 Ok(m) => m,
                 Err(Error::WouldBlock) => return,
                 Err(e) => {
+                    // Ends here: what follows (opened or on its way) carries on gaplessly.
                     let id = t.id.clone();
                     t.eof = true;
-                    self.fail(id, e);
+                    let handed_over =
+                        self.next.is_some() || self.loading_next || self.next_id.is_some();
+                    self.report(id, e, handed_over);
                     continue;
                 }
             };
@@ -1400,6 +1416,11 @@ mod tests {
                 .map(|e| match e {
                     Event::Started { id, .. } => format!("started {id}"),
                     Event::Finished => "finished".into(),
+                    Event::Failed {
+                        id,
+                        handed_over: true,
+                        ..
+                    } => format!("failed {id}, handed over"),
                     Event::Failed { id, .. } => format!("failed {id}"),
                     e => format!("{e:?}"),
                 })
@@ -1588,6 +1609,35 @@ mod tests {
         r.cmd(Cmd::SetNext(None));
         r.play_out(2500);
         assert_eq!(r.events(), ["started a", "finished"]);
+    }
+
+    #[test]
+    fn an_error_while_playing_hands_over_to_the_next_track() {
+        let mut r = Rig::new();
+        // Past the first second, so it is decoded after the next track is known.
+        r.track("a", |s| s.fail_at = Some(RATE * 3 / 2));
+        r.cmd(Cmd::Play("a".into()));
+        r.cmd(Cmd::SetNext(Some("b".into())));
+        r.play_out(3500);
+        assert_eq!(
+            r.events(),
+            [
+                "started a",
+                "failed a, handed over",
+                "started b",
+                "finished"
+            ]
+        );
+        assert_eq!(r.loads(), ["a", "b"]);
+    }
+
+    #[test]
+    fn an_error_with_nothing_next_ends_playback() {
+        let mut r = Rig::new();
+        r.track("a", |s| s.fail_at = Some(RATE * 3 / 2));
+        r.cmd(Cmd::Play("a".into()));
+        r.play_out(2000);
+        assert_eq!(r.events(), ["started a", "failed a", "finished"]);
     }
 
     #[test]

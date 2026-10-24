@@ -290,6 +290,12 @@ impl<E: Playback> Player<E> {
                 self.update_next();
             }
             Event::Failed { .. } if self.follower => {}
+            // The next track took over by itself; its `Started` moves the queue on.
+            Event::Failed {
+                id,
+                handed_over: true,
+                ..
+            } => log::debug!("{id} broke off, the next track carries on"),
             Event::Failed { id, .. } if self.current() == Some(id.as_str()) => {
                 self.failures += 1;
                 if self.failures < self.order.len() {
@@ -456,6 +462,7 @@ mod tests {
         p.on_event(&Event::Failed {
             id: id.into(),
             error: Error::Media("test".into()),
+            handed_over: false,
         });
     }
 
@@ -577,6 +584,21 @@ mod tests {
         failed(&mut p, "a");
         assert_eq!(shown(&p), "a [b] c d");
         assert_eq!(played(&p), "a b");
+    }
+
+    #[test]
+    fn a_track_that_breaks_off_into_the_next_one_needs_no_new_load() {
+        let mut p = player("a b c", 0);
+        started(&mut p, "a");
+        p.on_event(&Event::Failed {
+            id: "a".into(),
+            error: Error::Media("test".into()),
+            handed_over: true,
+        });
+        assert_eq!(played(&p), "a");
+        started(&mut p, "b");
+        assert_eq!(shown(&p), "a [b] c");
+        assert_eq!(played(&p), "a");
     }
 
     #[test]
