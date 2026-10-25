@@ -10,7 +10,11 @@ pub const BANDS: [f64; 10] = [
     31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
 ];
 pub const MAX_DB: f32 = 12.0;
+/// The peaks' width: about an octave, so neighbours meet.
 const Q: f64 = 1.41;
+/// The shelves' slope: the steepest without a dip before the step. A peak's Q here sinks the
+/// band just inside a boosted shelf (14 kHz under a treble boost), which sounds muffled.
+const SHELF_Q: f64 = std::f64::consts::FRAC_1_SQRT_2;
 const CH: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -59,6 +63,16 @@ fn kind(i: usize) -> usize {
     }
 }
 
+/// Where band `i`'s filter is centred. A shelf's centre is where it's half way up, so the
+/// shelves sit half an octave inside their bands: full gain at the frequency on the slider.
+fn centre(i: usize) -> f64 {
+    match kind(i) {
+        0 => BANDS[i] * std::f64::consts::SQRT_2,
+        2 => BANDS[i] / std::f64::consts::SQRT_2,
+        _ => BANDS[i],
+    }
+}
+
 /// The gain of all bands together at `freq`, dB.
 fn response_db(gains: &[f32; 10], freq: f64) -> f64 {
     let w = 2.0 * std::f64::consts::PI * freq / CURVE_RATE;
@@ -67,7 +81,7 @@ fn response_db(gains: &[f32; 10], freq: f64) -> f64 {
         .enumerate()
         .filter(|(_, g)| **g != 0.0)
         .map(|(i, g)| {
-            let [b0, b1, b2, a1, a2] = coeffs(kind(i), BANDS[i], *g as f64, CURVE_RATE);
+            let [b0, b1, b2, a1, a2] = coeffs(kind(i), centre(i), *g as f64, CURVE_RATE);
             let mag2 = |c0: f64, c1: f64, c2: f64| {
                 let re = c0 + c1 * w.cos() + c2 * (2.0 * w).cos();
                 let im = c1 * w.sin() + c2 * (2.0 * w).sin();
@@ -92,7 +106,7 @@ fn coeffs(kind: usize, freq: f64, db: f64, rate: f64) -> [f64; 5] {
     let a = 10f64.powf(db / 40.0);
     let w0 = 2.0 * std::f64::consts::PI * (freq / rate).min(0.49);
     let (sin, cos) = w0.sin_cos();
-    let alpha = sin / (2.0 * Q);
+    let alpha = sin / (2.0 * if kind == 1 { Q } else { SHELF_Q });
     let (b0, b1, b2, a0, a1, a2) = match kind {
         0 => {
             let k = 2.0 * a.sqrt() * alpha;
@@ -257,7 +271,7 @@ impl Eq {
             let (on, pre_db, gains) = shared.snapshot();
             let mut next = self.bank;
             for (i, (f, g)) in next.filters.iter_mut().zip(gains).enumerate() {
-                f.retune(&Biquad::design(kind(i), BANDS[i], g as f64, self.rate));
+                f.retune(&Biquad::design(kind(i), centre(i), g as f64, self.rate));
                 next.active[i] = g != 0.0;
             }
             next.pre = 10f32.powf(pre_db / 20.0);
@@ -352,7 +366,7 @@ mod tests {
             gains: EqSettings::preset("bass").unwrap(),
             ..single
         };
-        assert!(bass.preamp_db() < -6.5, "{}", bass.preamp_db());
+        assert!(bass.preamp_db() < -6.0, "{}", bass.preamp_db());
         assert!(peak_db(&bass.gains) + (bass.preamp_db() as f64) < 0.01);
         // Cuts need next to none (only the shelves' small overshoot).
         let cut = EqSettings {
@@ -386,6 +400,20 @@ mod tests {
         eq.process(&shared, &mut buf[2..]);
         let peak = buf[48000..].iter().fold(0f32, |m, s| m.max(s.abs()));
         assert!(peak <= 1.01, "peak {peak} at {loudest:.0} Hz");
+    }
+
+    #[test]
+    fn a_boosted_shelf_has_no_dip_before_it() {
+        // Treble: the shelf's boost starts where the 8 kHz peak's leaves off, without the
+        // sunken stretch a peak's Q gives a shelf.
+        let gains = EqSettings::preset("treble").unwrap();
+        let at = |f: f64| response_db(&gains, f);
+        assert!(at(14000.0) > 3.0, "14 kHz {:.1} dB", at(14000.0));
+        assert!(at(12000.0) > 3.0, "12 kHz {:.1} dB", at(12000.0));
+        // And bass reaches its low end.
+        let gains = EqSettings::preset("bass").unwrap();
+        let at = |f: f64| response_db(&gains, f);
+        assert!(at(40.0) > 4.5, "40 Hz {:.1} dB", at(40.0));
     }
 
     #[test]

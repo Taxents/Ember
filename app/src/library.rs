@@ -861,7 +861,18 @@ impl App {
             move || client.create_playlist(&name, "", &ids),
             move |r| {
                 with(|a| match r {
-                    Ok(_) => {
+                    Ok(id) => {
+                        // In the sidebar at once: YouTube's list takes a while to have it.
+                        let id = format!("VL{}", id.trim_start_matches("VL"));
+                        let card = PlaylistCard {
+                            id: id.clone(),
+                            title: made.clone(),
+                            ..Default::default()
+                        };
+                        a.library_wish.retain(|(w, _)| *w != id);
+                        a.library_wish.push((id, Some(card)));
+                        let all = a.playlists.iter().chain(&a.hidden_lists).cloned().collect();
+                        a.set_playlists(all);
                         a.load_playlists();
                         a.notify(format!("Created '{made}'"));
                     }

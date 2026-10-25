@@ -553,7 +553,7 @@ fn like_entry(liked: bool) -> MenuEntry {
     }
 }
 
-/// Library, Add to playlist and radio entries for a song.
+/// Remove from library (when it's in it), Add to playlist and radio entries for a song.
 fn song_entries(t: &Track) -> Vec<MenuEntry> {
     let entry = |id: &str, label: &str, icon: &str| MenuEntry {
         id: id.into(),
@@ -562,10 +562,8 @@ fn song_entries(t: &Track) -> Vec<MenuEntry> {
         danger: false,
     };
     let mut v = Vec::new();
-    match &t.library {
-        Some(l) if l.saved => v.push(entry("libremove", "Remove from library", "check")),
-        Some(_) => v.push(entry("libadd", "Add to library", "plus")),
-        None => {}
+    if t.library.as_ref().is_some_and(|l| l.saved) {
+        v.push(entry("libremove", "Remove from library", "check"));
     }
     v.push(entry("add-to", "Add to playlist…", "queue"));
     v.push(entry("radio", "Start radio", "radio"));

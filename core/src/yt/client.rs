@@ -492,14 +492,29 @@ impl Client {
 
     /// Appends tracks. Without `force`, ones the playlist already has are skipped and listed in
     /// `Added::skipped` (so the app can offer "Add anyway"); with it they're added again, like
-    /// the website's "Add anyway".
+    /// the website's "Add anyway". The playlist is read first: YouTube's own dedupe doesn't
+    /// reliably say what it skipped.
     pub fn add_to_playlist_checked(
         &self,
         playlist_id: &str,
         video_ids: &[String],
         force: bool,
     ) -> Result<Added> {
-        let actions: Vec<Value> = video_ids
+        let (fresh, mut skipped): (Vec<String>, Vec<String>) = if force {
+            (video_ids.to_vec(), Vec::new())
+        } else {
+            let have: std::collections::HashSet<String> = self
+                .playlist_all(playlist_id, 10_000)?
+                .tracks
+                .into_iter()
+                .map(|t| t.video_id)
+                .collect();
+            video_ids.iter().cloned().partition(|id| !have.contains(id))
+        };
+        if fresh.is_empty() {
+            return Ok(Added { skipped });
+        }
+        let actions: Vec<Value> = fresh
             .iter()
             .map(|v| {
                 let mut a = json!({ "action": "ACTION_ADD_VIDEO", "addedVideoId": v });
@@ -510,13 +525,11 @@ impl Client {
             })
             .collect();
         let v = self.edit_playlist_raw(playlist_id, actions)?;
-        Ok(Added {
-            skipped: if force {
-                Vec::new()
-            } else {
-                parse::skipped_adds(&v, video_ids)
-            },
-        })
+        if !force {
+            // Anything YouTube skipped besides (added meanwhile elsewhere).
+            skipped.extend(parse::skipped_adds(&v, &fresh));
+        }
+        Ok(Added { skipped })
     }
 
     /// Removes tracks; they need the `set_video_id` from the playlist's own listing.
