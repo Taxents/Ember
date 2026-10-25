@@ -496,6 +496,8 @@ component Sidebar inherits Rectangle {
             property <bool> ready: Ui.update-ready != "";
             property <bool> busy: Ui.update-progress != "";
             property <bool> failed: Ui.update-error != "";
+            // Its row's height: left to the layout, it would take the sidebar's spare room.
+            height: root.collapsed ? 40px : 36px;
             border-radius: 8px;
             background: Theme.amber.with-alpha(0.14);
             // Collapsed, it's just the icon: restart when ready, else Settings says the rest.
