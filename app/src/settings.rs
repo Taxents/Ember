@@ -30,6 +30,8 @@ pub struct Settings {
     pub together_name: String,
     /// Lyrics are also looked up on Unison and LRCLIB, which are sent the song's details.
     pub lyrics_third_party: bool,
+    /// Discord shows what's playing ("Listening to Ember").
+    pub discord: bool,
 }
 
 impl Default for Settings {
@@ -47,6 +49,7 @@ impl Default for Settings {
             playlist_order: Vec::new(),
             together_name: default_name(),
             lyrics_third_party: true,
+            discord: true,
         }
     }
 }

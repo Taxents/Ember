@@ -185,6 +185,30 @@ export component SettingsPage inherits Rectangle {
             }
 
             SettingsHeading {
+                text: "DISCORD";
+            }
+
+            SettingRow {
+                title: "Show what you're listening to on Discord";
+                note: "The song, its artists and cover, as \"Listening to Ember\"";
+                PillButton {
+                    text: Ui.discord ? "On" : "Off";
+                    primary: Ui.discord;
+                    accessible-role: switch;
+                    accessible-checkable: true;
+                    accessible-checked: Ui.discord;
+                    clicked => {
+                        Ui.discord = !Ui.discord;
+                        Ui.discord-changed(Ui.discord);
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 24px;
+            }
+
+            SettingsHeading {
                 text: "SIDEBAR";
             }
 

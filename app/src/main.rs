@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod discord;
 mod images;
 mod library;
 mod listen;
@@ -545,6 +546,14 @@ fn wire(ui: &AppWindow) {
             a.save_later();
         });
     });
+    g.on_discord_changed(|on| {
+        discord::set_enabled(on);
+        with(|a| {
+            a.settings.discord = on;
+            a.save_later();
+            a.tick();
+        });
+    });
     g.on_open_data_folder(|| {
         let _ = std::process::Command::new("explorer.exe")
             .arg(music_core::paths::config_dir())
@@ -765,6 +774,8 @@ impl App {
             self.settings.lyrics_third_party,
             std::sync::atomic::Ordering::Relaxed,
         );
+        g.set_discord(self.settings.discord);
+        discord::set_enabled(self.settings.discord);
         g.set_panel_open(self.settings.panel_open);
         g.set_panel_tab(self.settings.panel_tab);
         self.set_volume(self.settings.volume);
