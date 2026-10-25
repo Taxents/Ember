@@ -256,7 +256,8 @@ fn fetch(client: &Client, r: &Route, hidden: &[String]) -> Result<Loaded> {
         }
         PageKind::Albums | PageKind::Artists | PageKind::AllPlaylists => {
             let f = match r.kind {
-                PageKind::Albums => client.library_albums()?,
+                // All of them, so any order covers the whole library.
+                PageKind::Albums => client.feed_all(client.library_albums()?, 10_000)?,
                 PageKind::Artists => client.library_artists()?,
                 _ => client.library_playlists()?,
             };

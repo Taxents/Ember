@@ -154,6 +154,8 @@ impl App {
         self.tracks_at = 0;
         self.main_len = 0;
         self.grid.clear();
+        self.grid_heads.clear();
+        self.albums.clear();
         self.grid_laid = (0, 0);
         self.more = None;
         self.loading_more = false;
@@ -325,7 +327,7 @@ impl App {
                 g.set_page(page);
                 self.page_rows.set_playable(true);
             }
-            self.push_row(RowRef::Title, RowKind::Title, TrackRow::default());
+            self.push_row(RowRef::Title, RowKind::Title, title_row(r.kind));
         }
         let (style, n) = if tracks {
             self.push_row(RowRef::Columns, RowKind::Columns, TrackRow::default());
@@ -389,7 +391,8 @@ impl App {
                     self.push_row(RowRef::Header, RowKind::Header, TrackRow::default());
                     self.header_images();
                 } else if l.title.is_some() {
-                    self.push_row(RowRef::Title, RowKind::Title, TrackRow::default());
+                    let kind = self.history[self.at].kind;
+                    self.push_row(RowRef::Title, RowKind::Title, title_row(kind));
                 }
                 if !l.tracks.is_empty() {
                     self.push_row(RowRef::Columns, RowKind::Columns, TrackRow::default());
@@ -397,7 +400,12 @@ impl App {
                 self.tracks_at = self.rows.len();
                 self.add_page_tracks(l.tracks);
                 self.add_blocks(l.blocks);
-                self.add_grid(l.grid);
+                if self.history[self.at].kind == PageKind::Albums {
+                    self.grid_at = self.rows.len();
+                    self.show_albums(l.grid);
+                } else {
+                    self.add_grid(l.grid);
+                }
             }
             Err(e) => {
                 log::warn!("page: {e}");
@@ -564,20 +572,23 @@ impl App {
         }
         let cols = self.columns.max(1);
         let (laid_cols, laid) = self.grid_laid;
-        // Lines as wide as `cols` square cards; a music video takes 16/9 of one.
+        // Lines as wide as `cols` square cards; a music video takes 16/9 of one. A heading
+        // starts a new line.
         let mut lines: Vec<(usize, usize)> = Vec::new();
         let (mut start, mut used) = (0, 0.0);
         for (i, item) in self.grid.iter().enumerate() {
             let w = card_units(matches!(item, Item::Track(t) if t.kind == TrackKind::Video));
-            if i > start && used + w > cols as f32 + 0.001 {
+            let head = self.grid_heads.iter().any(|(at, _)| *at == i);
+            if i > start && (head || used + w > cols as f32 + 0.001) {
                 lines.push((start, i));
                 (start, used) = (i, 0.0);
             }
             used += w;
         }
         lines.push((start, self.grid.len()));
-        // Lines laid out at this width that were already followed by another stay as they are.
-        let keep = if laid_cols == cols {
+        // Lines laid out at this width that were already followed by another stay as they are
+        // (all of them again when grouped, as headings sit between).
+        let keep = if laid_cols == cols && self.grid_heads.is_empty() {
             lines.iter().take_while(|l| l.1 < laid).count()
         } else {
             0
@@ -588,6 +599,13 @@ impl App {
             self.page_rows.remove(self.page_rows.row_count() - 1);
         }
         for &(start, end) in &lines[keep..] {
+            if let Some((_, h)) = self.grid_heads.iter().find(|(at, _)| *at == start) {
+                let row = TrackRow {
+                    title: h.as_str().into(),
+                    ..Default::default()
+                };
+                self.push_row(RowRef::Heading(None), RowKind::Heading, row);
+            }
             let mut cards: Vec<Card> = self.grid[start..end].iter().map(|i| self.card(i)).collect();
             place_cards(&mut cards);
             let row = TrackRow {
@@ -1340,4 +1358,12 @@ fn g_serial_bump(ui: &AppWindow) {
 
 fn fmt_ms(ms: u64) -> String {
     format!("{}:{:02}", ms / 60000, ms / 1000 % 60)
+}
+
+/// A page's title row: the Albums page's has its sort under the title.
+fn title_row(kind: PageKind) -> TrackRow {
+    TrackRow {
+        link: kind == PageKind::Albums,
+        ..Default::default()
+    }
 }

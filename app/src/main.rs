@@ -2,7 +2,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod albums;
 mod edits;
+mod genres;
 mod images;
 mod library;
 mod listen;
@@ -160,6 +162,11 @@ struct App {
     main_len: usize,
     /// The card grid, which is always last, from row `grid_at`; laid out for (columns, cards).
     grid: Vec<Item>,
+    /// Headings in the grid: the index of the card each one goes before (the Albums page,
+    /// grouped).
+    grid_heads: Vec<(usize, String)>,
+    /// The Albums page's albums in the library's own order, which `grid` holds sorted.
+    albums: Vec<Item>,
     /// Which page rows (and cards in them) show each artwork URL, so an arriving picture
     /// doesn't walk the whole page; rebuilt when its key (what it was built from) goes stale.
     art_index: HashMap<String, Vec<(usize, Option<usize>)>>,
@@ -321,6 +328,8 @@ fn main() {
         tracks_at: 0,
         main_len: 0,
         grid: Vec::new(),
+        grid_heads: Vec::new(),
+        albums: Vec::new(),
         grid_at: 0,
         grid_laid: (0, 0),
         columns: 5,
@@ -569,6 +578,9 @@ fn wire(ui: &AppWindow) {
     g.on_rename(|name| {
         with(|a| a.rename_playlist(name.to_string()));
     });
+    g.on_album_sort_picked(|i| {
+        with(|a| a.album_sort_picked(i as usize));
+    });
     g.on_autoplay_chip(|i| {
         with(|a| a.autoplay_chip(i as usize));
     });
@@ -777,6 +789,13 @@ impl App {
         );
         g.set_panel_open(self.settings.panel_open);
         g.set_panel_tab(self.settings.panel_tab);
+        g.set_album_sorts(ModelRc::new(VecModel::from(
+            albums::SORTS
+                .iter()
+                .map(|(_, l)| SharedString::from(*l))
+                .collect::<Vec<_>>(),
+        )));
+        g.set_album_sort(self.album_sort_index());
         self.set_volume(self.settings.volume);
         self.eq_changed();
 

@@ -144,7 +144,11 @@ fn loose(s: &str) -> String {
 /// GET JSON, at most one request a second to each host (MusicBrainz's rule). `Ok(None)` is a
 /// plain "not found". `key` goes in fanart.tv's `api-key` header, not the URL, so it stays out
 /// of logs and proxies.
-fn fetch(url: &str, query: &[(&str, &str)], key: Option<&str>) -> Result<Option<Value>, ()> {
+pub(crate) fn fetch(
+    url: &str,
+    query: &[(&str, &str)],
+    key: Option<&str>,
+) -> Result<Option<Value>, ()> {
     static LAST: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
     let host = url.split('/').nth(2).unwrap_or_default().to_string();
     // One request a second per host: this one's turn is booked, then waited for unlocked, so
@@ -176,7 +180,7 @@ fn fetch(url: &str, query: &[(&str, &str)], key: Option<&str>) -> Result<Option<
         200 => Ok(r.body_mut().read_json::<Value>().ok()),
         404 => Ok(None),
         c => {
-            log::debug!("logo lookup: HTTP {c}");
+            log::debug!("MusicBrainz/fanart.tv lookup: HTTP {c}");
             Err(())
         }
     }
