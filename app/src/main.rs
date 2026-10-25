@@ -19,6 +19,7 @@ mod queue_view;
 mod radio;
 mod rows;
 mod settings;
+mod suggest;
 mod toast;
 mod update;
 mod video;
@@ -179,6 +180,8 @@ struct App {
     loading_more: bool,
     /// The page ends with "237 tracks, 14 hours 3 minutes".
     summary: bool,
+    /// The songs recommended under a playlist.
+    suggested: suggest::Suggested,
     /// The banner, which is the list's first row.
     header: Option<pages::Header>,
     /// The artist's logo on the banner, once found.
@@ -337,6 +340,7 @@ fn main() {
         more: None,
         loading_more: false,
         summary: false,
+        suggested: Default::default(),
         header: None,
         logo_url: None,
         menu: None,
@@ -648,6 +652,12 @@ fn wire(ui: &AppWindow) {
     });
     g.on_card_shown(|row, i| {
         with(|a| a.card_shown(row.max(0) as usize, i.max(0) as usize));
+    });
+    g.on_suggestion_add(|row| {
+        with(|a| a.suggestion_add(row.max(0) as usize));
+    });
+    g.on_suggestions_refresh(|| {
+        with(|a| a.suggestions_refresh());
     });
     g.on_see_all(|row| {
         with(|a| a.see_all(row.max(0) as usize));

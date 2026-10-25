@@ -116,6 +116,9 @@ export struct TrackRow {
     cards: [Card],
     // Headings and shelves with "See all"; the Albums page's title, with its sort under it.
     link: bool,
+    // Recommended under your own playlist: its tracks can be added to it, its heading
+    // refreshed.
+    suggested: bool,
     // Page rows: the row's index on the page, and its place (set by Rust, which lays them out).
     index: int,
     y: length,
@@ -308,6 +311,8 @@ export global Ui {
     callback play-tracks(int); // a row, -1 to shuffle all, -2 to play all from the top
     callback open-album(int); // a row: open its track's album
     callback track-move(int, int); // row, and the row it goes before (your own playlists)
+    callback suggestion-add(int); // a recommended track's row: add it to your playlist
+    callback suggestions-refresh(); // a new set of recommendations
     in property <Collection> collection;
     // A song page of the playing music video: a 16:9 panel under its banner shows the picture
     // (`video-on`), with the newest frame once one is decoded. Rust makes the header row taller

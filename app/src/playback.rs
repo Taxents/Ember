@@ -70,16 +70,19 @@ impl App {
         };
         // Only a list meant to be played through (an album, a playlist, your library, an
         // artist's top songs) queues what's beside the song. Anywhere else (Home, search, a
-        // song page) it's the song, then its radio.
-        if !matches!(
-            self.history[self.at].kind,
-            PageKind::Album
-                | PageKind::Playlist
-                | PageKind::Radio
-                | PageKind::Liked
-                | PageKind::Songs
-                | PageKind::Artist
-        ) {
+        // song page, a playlist's recommendations) it's the song, then its radio.
+        let recommended = self.suggested.on_page && ti >= self.main_len;
+        if recommended
+            || !matches!(
+                self.history[self.at].kind,
+                PageKind::Album
+                    | PageKind::Playlist
+                    | PageKind::Radio
+                    | PageKind::Liked
+                    | PageKind::Songs
+                    | PageKind::Artist
+            )
+        {
             let t = self.page_tracks[ti].clone();
             // A music video found by search opens on its song page, the picture centred.
             let video =

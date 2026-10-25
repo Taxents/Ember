@@ -163,6 +163,7 @@ impl App {
         self.header = None;
         self.logo_url = None;
         self.extended = false;
+        self.suggested.on_page = false;
     }
 
     /// Song details pile up over a long session: past 5,000, keep only what the queue needs.
@@ -357,6 +358,7 @@ impl App {
         match res {
             Ok(l) => {
                 let empty = l.tracks.is_empty() && l.blocks.is_empty() && l.grid.is_empty();
+                let suggest = l.suggest.clone().filter(|_| !empty);
                 if empty {
                     page.subtitle = "Nothing here yet.".into();
                 }
@@ -406,6 +408,7 @@ impl App {
                 } else {
                     self.add_grid(l.grid);
                 }
+                self.suggest_start(suggest);
             }
             Err(e) => {
                 log::warn!("page: {e}");
@@ -454,11 +457,22 @@ impl App {
             if album_artist.as_deref() == Some(row.artist.as_str()) {
                 row.artist = SharedString::new();
             }
-            self.rows.insert(at, RowRef::Track(self.page_tracks.len()));
+            // The page's own tracks come first in `page_tracks`, before any headed list's.
+            let ti = self.main_len - 1;
+            if ti < self.page_tracks.len() {
+                for r in self.rows.iter_mut() {
+                    if let RowRef::Track(j) = r
+                        && *j >= ti
+                    {
+                        *j += 1;
+                    }
+                }
+            }
+            self.rows.insert(at, RowRef::Track(ti));
             self.art_index.clear();
             self.page_rows.insert(at, row);
-            self.page_tracks.push(t);
-            self.page_groups.push(0);
+            self.page_tracks.insert(ti, t);
+            self.page_groups.insert(ti, 0);
             at += 1;
         }
         // Only once the whole list is here, so the totals are right.
@@ -468,12 +482,14 @@ impl App {
             self.page_rows.insert(
                 at,
                 TrackRow {
-                    title: summary_line(&self.page_tracks).into(),
+                    title: summary_line(&self.page_tracks[..self.main_len]).into(),
                     kind: RowKind::Footer,
                     ..Default::default()
                 },
             );
         }
+        // Recommendations follow the whole list.
+        self.suggest_show();
     }
 
     pub(crate) fn add_blocks(&mut self, blocks: Vec<Block>) {

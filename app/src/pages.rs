@@ -85,6 +85,8 @@ pub struct Loaded {
     pub blocks: Vec<Block>,
     pub grid: Vec<Item>,
     pub more: Option<More>,
+    /// Playlists: where the songs recommended under it come from (fetched after the page).
+    pub suggest: Option<SuggestionsFrom>,
 }
 
 /// What a page shows, in short: a page fetched again is only laid out again when this differs.
@@ -326,6 +328,14 @@ fn fetch(client: &Client, r: &Route, hidden: &[String]) -> Result<Loaded> {
             } else {
                 p.thumbs
             };
+            let editable = p.owned && r.kind == PageKind::Playlist;
+            let suggest = (r.kind == PageKind::Playlist).then(|| match p.suggestions {
+                Some(c) if editable => SuggestionsFrom::Shelf(c),
+                _ => SuggestionsFrom::Radio {
+                    playlist_id: p.id.clone(),
+                    continuation: None,
+                },
+            });
             Loaded {
                 header: Some(Header {
                     label: "Playlist".into(),
@@ -338,7 +348,7 @@ fn fetch(client: &Client, r: &Route, hidden: &[String]) -> Result<Loaded> {
                     artists: Vec::new(),
                     thumbs,
                     album: false,
-                    editable: p.owned && r.kind == PageKind::Playlist,
+                    editable,
                     wide: false,
                     channel: None,
                     save: p.saved.map(|s| (p.id.clone(), s)),
@@ -348,6 +358,7 @@ fn fetch(client: &Client, r: &Route, hidden: &[String]) -> Result<Loaded> {
                 tracks: p.tracks,
                 more: p.continuation.map(More::Playlist),
                 summary: true,
+                suggest,
                 ..Default::default()
             }
         }

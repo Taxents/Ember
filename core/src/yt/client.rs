@@ -289,6 +289,34 @@ impl Client {
         Ok(p)
     }
 
+    /// Songs to suggest under a playlist: your own playlist's "Suggestions" shelf, or for
+    /// anyone else's, `SuggestionsFrom::Radio` (the radio built from it). Either may include
+    /// songs the playlist has already. `next` brings a fresh set.
+    pub fn playlist_suggestions(&self, from: &SuggestionsFrom) -> Result<Suggestions> {
+        Ok(match from {
+            SuggestionsFrom::Shelf(c) => {
+                parse::playlist_suggestions(&self.continue_on("browse", json!({}), c)?)
+            }
+            SuggestionsFrom::Radio {
+                playlist_id,
+                continuation,
+            } => {
+                let radio = format!("RDAMPL{}", playlist_id.trim_start_matches("VL"));
+                let w = match continuation {
+                    Some(c) => self.watch_next_more(None, Some(&radio), None, c)?,
+                    None => self.watch_next(None, Some(&radio), None)?,
+                };
+                Suggestions {
+                    next: w.continuation.map(|c| SuggestionsFrom::Radio {
+                        playlist_id: playlist_id.clone(),
+                        continuation: Some(c),
+                    }),
+                    tracks: w.tracks,
+                }
+            }
+        })
+    }
+
     /// Radio for a track ("start radio"), or the up-next list of a playlist when
     /// `playlist_id` is given.
     pub fn watch_next(

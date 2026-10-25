@@ -1076,8 +1076,30 @@ pub fn playlist(id: &str, v: &Value) -> PlaylistPage {
                 page.continuation = continuation(shelf, &shelf["contents"]);
             }
         }
+        // What follows the songs: on yours, the suggestions (on others', related playlists).
+        if page.owned && page.suggestions.is_none() {
+            page.suggestions = continuation(s, &Value::Null);
+        }
     }
     page
+}
+
+/// Your playlist's "Suggestions" shelf: first from the playlist page's continuation, then from
+/// its refresh token, which comes along each time.
+pub fn playlist_suggestions(v: &Value) -> Suggestions {
+    let c = &v["continuationContents"];
+    let shelf = arr(&c["sectionListContinuation"]["contents"])
+        .iter()
+        .map(|s| &s["musicShelfRenderer"])
+        .find(|s| s.is_object())
+        .unwrap_or(&c["musicShelfContinuation"]);
+    Suggestions {
+        tracks: tracks(&shelf["contents"]),
+        next: arr(&shelf["continuations"]).iter().find_map(|c| {
+            let t = c["reloadContinuationData"]["continuation"].as_str()?;
+            Some(SuggestionsFrom::Shelf(Continuation::Query(t.to_string())))
+        }),
+    }
 }
 
 fn tracks(list: &Value) -> Vec<Track> {
