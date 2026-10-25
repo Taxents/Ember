@@ -8,7 +8,6 @@ export enum PageKind {
     history,
     artists,
     albums,
-    songs,
     all-playlists,
     liked,
     playlist,
@@ -250,6 +249,11 @@ export global Ui {
     // "Show what you're listening to on Discord".
     in-out property <bool> discord: true;
     callback discord-changed(bool);
+
+    // "Listening history": plays are logged for the Artists page's stats, and clearing them.
+    in-out property <bool> listening-history: true;
+    callback listening-history-changed(bool);
+    callback clear-history();
     in property <image> account-photo;
     in property <[SidebarPlaylist]> playlists;
     callback sign-in();

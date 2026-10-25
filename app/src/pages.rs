@@ -2,7 +2,7 @@
 //! tracks, blocks (headed track lists and card shelves) and a card grid, which the app then lays
 //! out as rows.
 
-use crate::{Card, PageKind, Route};
+use crate::{Card, PageKind, Route, stats};
 use music_core::Result;
 use music_core::lyrics::{self, Lyrics};
 use music_core::yt::Client;
@@ -11,8 +11,6 @@ use music_core::yt::model::*;
 /// How the current page continues.
 #[derive(Clone)]
 pub enum More {
-    /// More of the page's own tracks, from a feed (Songs).
-    Tracks(Continuation),
     Playlist(Continuation),
     /// More cards for the grid.
     Grid(Continuation),
@@ -63,6 +61,13 @@ pub enum Block {
         tracks: Vec<Track>,
     },
     Shelf(Shelf),
+    /// A heading, then tracks that play together, each with its own count for the Plays
+    /// column (the Artists page: how often you played it).
+    Played {
+        title: String,
+        more: Option<BrowseRef>,
+        tracks: Vec<(Track, String)>,
+    },
     /// A song's lyrics beside its release date, credits and the artist's bio.
     Details {
         lyrics: Option<Lyrics>,
@@ -109,6 +114,13 @@ pub fn signature(l: &Loaded) -> u64 {
                 title.hash(&mut h);
                 for t in tracks {
                     track(t, &mut h);
+                }
+            }
+            Block::Played { title, tracks, .. } => {
+                title.hash(&mut h);
+                for (t, plays) in tracks {
+                    track(t, &mut h);
+                    plays.hash(&mut h);
                 }
             }
             Block::Shelf(s) => {
@@ -247,20 +259,10 @@ fn fetch(client: &Client, r: &Route, hidden: &[String]) -> Result<Loaded> {
             tracks: tracks_of(client.history()?.shelves.into_iter().flat_map(|s| s.items)),
             ..Default::default()
         },
-        PageKind::Songs => {
-            let f = client.library_songs()?;
-            Loaded {
-                title: Some(r.title.clone()),
-                more: f.continuation.clone().map(More::Tracks),
-                tracks: tracks_of(f.shelves.into_iter().flat_map(|s| s.items)),
-                ..Default::default()
-            }
-        }
-        PageKind::Albums | PageKind::Artists | PageKind::AllPlaylists => {
+        PageKind::Albums | PageKind::AllPlaylists => {
             let f = match r.kind {
                 // All of them, so any order covers the whole library.
                 PageKind::Albums => client.feed_all(client.library_albums()?, 10_000)?,
-                PageKind::Artists => client.library_artists()?,
                 _ => client.library_playlists()?,
             };
             Loaded {
@@ -373,13 +375,6 @@ pub fn load_more(client: &Client, m: More, hidden: &[String]) -> Result<(Extra, 
 
 fn fetch_more(client: &Client, m: More, hidden: &[String]) -> Result<(Extra, Option<More>)> {
     Ok(match m {
-        More::Tracks(c) => {
-            let f = client.feed_more(&c)?;
-            (
-                Extra::Tracks(tracks_of(f.shelves.into_iter().flat_map(|s| s.items))),
-                f.continuation.map(More::Tracks),
-            )
-        }
         More::Playlist(c) => {
             let (t, c) = client.playlist_more(&c)?;
             (Extra::Tracks(t), c.map(More::Playlist))
@@ -399,6 +394,220 @@ fn fetch_more(client: &Client, m: More, hidden: &[String]) -> Result<(Extra, Opt
             )
         }
     })
+}
+
+/// The Artists page: what you've listened to in Ember over the period in the route (the top
+/// artists and their songs, the songs and albums you played most), who's rising and fading this
+/// month, then the artists in your library. With `logging` off (Settings), it says nothing new
+/// is counted.
+pub fn artists(client: &Client, r: &Route, log: &stats::Log, logging: bool) -> Result<Loaded> {
+    let library = if client.signed_in() {
+        match client.library_artists() {
+            Ok(f) => Some(f),
+            // The stats are here all the same.
+            Err(e) if !log.plays.is_empty() => {
+                log::warn!("library artists: {e}");
+                None
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+    let period = stats::Period::from_id(&r.id);
+    let now = music_core::paths::unix_now();
+    let mut l = stats_page(log, period, now, library.as_ref());
+    l.title = Some(r.title.clone());
+    if !logging {
+        // Nothing yet, and nothing coming: no "songs add up here".
+        if log.plays.is_empty() {
+            l.blocks.clear();
+        }
+        l.blocks.insert(
+            0,
+            Block::Tracks {
+                title: "Listening history is off in Settings, so nothing new is counted.".into(),
+                more: None,
+                tracks: Vec::new(),
+            },
+        );
+    }
+    if let Some(f) = library {
+        let grid: Vec<Item> = f.shelves.into_iter().flat_map(|s| s.items).collect();
+        if !grid.is_empty() {
+            // A heading over the grid that follows.
+            l.blocks.push(Block::Tracks {
+                title: "In your library".into(),
+                more: None,
+                tracks: Vec::new(),
+            });
+        }
+        l.grid = grid;
+        l.more = f.continuation.map(More::Grid);
+    }
+    Ok(l)
+}
+
+/// The Artists page's stats, as of `now`. Artist cards take their picture from the library
+/// when it has one, else from the song of theirs you played most.
+fn stats_page(log: &stats::Log, period: stats::Period, now: u64, library: Option<&Feed>) -> Loaded {
+    use stats::{duration, plays};
+    let pictures: std::collections::HashMap<&str, &[Thumb]> = library
+        .into_iter()
+        .flat_map(|f| f.shelves.iter().flat_map(|s| &s.items))
+        .filter_map(|i| match i {
+            Item::Artist(a) if !a.thumbs.is_empty() => Some((a.id.as_str(), a.thumbs.as_slice())),
+            _ => None,
+        })
+        .collect();
+    // Only artists with a page to open get a card.
+    let artist = |t: &stats::Total, subtitle: String| -> Option<Item> {
+        let id = t.id.clone()?;
+        let thumbs = match pictures.get(id.as_str()) {
+            Some(th) => th.to_vec(),
+            None => log.songs[t.top_song].thumbs(),
+        };
+        Some(Item::Artist(ArtistCard {
+            id,
+            name: t.name.clone(),
+            subtitle,
+            thumbs,
+        }))
+    };
+    let shelf = |title: String, items: Vec<Item>| {
+        Block::Shelf(Shelf {
+            title,
+            items,
+            more: None,
+        })
+    };
+    let played = |totals: &[stats::Total], n: usize| -> Vec<(Track, String)> {
+        totals
+            .iter()
+            .take(n)
+            .map(|t| (log.songs[t.top_song].track(), t.plays.to_string()))
+            .collect()
+    };
+
+    let since = period.since(now);
+    let top = stats::top_artists(log, since, u64::MAX);
+    let mut b = Vec::new();
+    if top.is_empty() {
+        b.push(Block::Tracks {
+            title: if log.plays.is_empty() {
+                "Songs you play in Ember add up here, once 30 seconds of one is heard.".into()
+            } else {
+                format!("Nothing played {}.", period.phrase())
+            },
+            more: None,
+            tracks: Vec::new(),
+        });
+    } else {
+        let songs = stats::top_songs(log, since, u64::MAX);
+        let secs: u64 = songs.iter().map(|t| t.secs).sum();
+        let count: u32 = songs.iter().map(|t| t.plays).sum();
+        let items: Vec<Item> = top
+            .iter()
+            .filter_map(|t| artist(t, format!("{} · {}", duration(t.secs), plays(t.plays))))
+            .take(20)
+            .collect();
+        b.push(shelf(
+            // The period is the picker's: the heading says what it adds up to.
+            format!("Top artists · {} · {}", duration(secs), plays(count)),
+            items,
+        ));
+        // The top three, each with the songs of theirs you played most; "See all" opens them.
+        for t in top.iter().filter(|t| t.id.is_some()).take(3) {
+            let theirs = stats::songs_by(log, &t.key, since, u64::MAX);
+            b.push(Block::Played {
+                title: format!("{} · {}", t.name, duration(t.secs)),
+                more: t.id.clone().map(|id| BrowseRef {
+                    browse_id: id,
+                    params: None,
+                }),
+                tracks: played(&theirs, 5),
+            });
+        }
+        b.push(Block::Played {
+            title: "Most played".into(),
+            more: None,
+            tracks: played(&songs, 20),
+        });
+        let albums: Vec<Item> = stats::top_albums(log, since, u64::MAX)
+            .iter()
+            .filter_map(|t| {
+                let song = &log.songs[t.top_song];
+                let by = song
+                    .artists
+                    .first()
+                    .map(|a| a.0.as_str())
+                    .unwrap_or_default();
+                Some(Item::Album(AlbumCard {
+                    id: t.id.clone()?,
+                    title: t.name.clone(),
+                    // The card's line under the title.
+                    artists: vec![Named {
+                        name: format!("{by} · {}", plays(t.plays)),
+                        id: None,
+                    }],
+                    thumbs: song.thumbs(),
+                    ..Default::default()
+                }))
+            })
+            .take(20)
+            .collect();
+        if !albums.is_empty() {
+            b.push(shelf("Top albums".into(), albums));
+        }
+    }
+    // This month against the ones before, whatever the period.
+    let rising: Vec<Item> = stats::rising(log, now)
+        .iter()
+        .filter_map(|t| {
+            artist(
+                &t.total,
+                format!("{}, up from {}", duration(t.now), duration(t.before)),
+            )
+        })
+        .take(20)
+        .collect();
+    if !rising.is_empty() {
+        b.push(shelf("Rising this month".into(), rising));
+    }
+    let first = stats::first_heard(log);
+    let new: Vec<Item> = stats::new_artists(log, now)
+        .iter()
+        .filter_map(|t| {
+            let at = first.get(&t.key).copied().unwrap_or(t.first);
+            artist(t, format!("First heard {}", stats::date(at)))
+        })
+        .take(20)
+        .collect();
+    if !new.is_empty() {
+        b.push(shelf("New to you".into(), new));
+    }
+    let fading = stats::fading(log, now);
+    if !fading.is_empty() {
+        let last: std::collections::HashMap<String, u64> = stats::top_artists(log, 0, u64::MAX)
+            .into_iter()
+            .map(|t| (t.key, t.last))
+            .collect();
+        let items: Vec<Item> = fading
+            .iter()
+            .filter_map(|t| {
+                let at = last.get(&t.total.key).copied().unwrap_or(t.total.last);
+                artist(&t.total, format!("Last played {}", stats::date(at)))
+            })
+            .take(20)
+            .collect();
+        if !items.is_empty() {
+            b.push(shelf("Fading".into(), items));
+        }
+    }
+    Loaded {
+        blocks: b,
+        ..Default::default()
+    }
 }
 
 /// Home: YouTube's first pick as the hero, then every shelf as cards.

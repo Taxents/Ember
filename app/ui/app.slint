@@ -366,16 +366,6 @@ component Sidebar inherits Rectangle {
             }
         }
 
-        SideRow {
-            icon: "song";
-            label: "Songs";
-            collapsed: root.collapsed;
-            selected: Ui.page.kind == PageKind.songs;
-            clicked => {
-                Ui.navigate(PageKind.songs, "", "Songs");
-            }
-        }
-
         if !root.collapsed: SectionHeader {
             text: "Playlists";
             collapsible: true;

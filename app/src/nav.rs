@@ -10,6 +10,17 @@ impl App {
         if self.history.get(self.at) == Some(&r) {
             return self.reload();
         }
+        // The Artists page's period picker: the same page over another span, not a step to go
+        // Back through.
+        if r.kind == PageKind::Artists
+            && self
+                .history
+                .get(self.at)
+                .is_some_and(|h| h.kind == PageKind::Artists)
+        {
+            self.history[self.at] = r;
+            return self.load_page();
+        }
         if !self.history.is_empty() {
             self.history.truncate(self.at + 1);
             self.scrolls.retain(|&k, _| k < self.at);
@@ -73,12 +84,7 @@ impl App {
 
         let library = matches!(
             r.kind,
-            PageKind::History
-                | PageKind::Songs
-                | PageKind::Liked
-                | PageKind::Artists
-                | PageKind::Albums
-                | PageKind::AllPlaylists
+            PageKind::History | PageKind::Liked | PageKind::Albums | PageKind::AllPlaylists
         );
         let needs_sign_in = library && !self.client.signed_in();
         if r.kind == PageKind::Settings {
@@ -126,11 +132,15 @@ impl App {
         }
         let client = self.client.clone();
         let hidden = self.settings.hidden_playlists.clone();
+        let listens = self.listens.clone();
+        let logging = self.settings.listening_history;
         workers::run_urgent(
             move || {
                 let t = std::time::Instant::now();
                 let res = if r.kind == PageKind::Radio {
                     radio::load(&r)
+                } else if r.kind == PageKind::Artists {
+                    pages::artists(&client, &r, &listens, logging)
                 } else {
                     pages::load(&client, &r, &hidden)
                 };
@@ -262,11 +272,8 @@ impl App {
         use PageKind as K;
         let ui = self.ui();
         let g = ui.global::<Ui>();
-        let tracks = matches!(
-            r.kind,
-            K::Album | K::Playlist | K::Liked | K::Songs | K::History
-        );
-        let grid = matches!(r.kind, K::Albums | K::Artists | K::AllPlaylists);
+        let tracks = matches!(r.kind, K::Album | K::Playlist | K::Liked | K::History);
+        let grid = matches!(r.kind, K::Albums | K::AllPlaylists);
         if matches!(
             r.kind,
             K::Album | K::Playlist | K::Liked | K::Artist | K::Song
@@ -495,7 +502,25 @@ impl App {
     pub(crate) fn add_blocks(&mut self, blocks: Vec<Block>) {
         let current = self.player.current().map(str::to_string);
         for b in blocks {
+            // Played: the Plays column shows its own counts.
+            let (b, counts) = match b {
+                Block::Played {
+                    title,
+                    more,
+                    tracks,
+                } => {
+                    let (tracks, counts) = tracks.into_iter().unzip();
+                    let b = Block::Tracks {
+                        title,
+                        more,
+                        tracks,
+                    };
+                    (b, counts)
+                }
+                b => (b, Vec::new()),
+            };
             match b {
+                Block::Played { .. } => {}
                 Block::Tracks {
                     title,
                     more,
@@ -526,6 +551,9 @@ impl App {
                         );
                         row.number = n as i32 + 1;
                         row.wide = wide;
+                        if let Some(c) = counts.get(n) {
+                            row.plays = c.as_str().into();
+                        }
                         self.push_row(RowRef::Track(self.page_tracks.len()), RowKind::Track, row);
                         self.page_tracks.push(t);
                         self.page_groups.push(group);
@@ -1376,10 +1404,11 @@ fn fmt_ms(ms: u64) -> String {
     format!("{}:{:02}", ms / 60000, ms / 1000 % 60)
 }
 
-/// A page's title row: the Albums page's has its sort under the title.
+/// A page's title row: the Albums page's has its sort under the title, the Artists page's its
+/// period picker (`link`).
 fn title_row(kind: PageKind) -> TrackRow {
     TrackRow {
-        link: kind == PageKind::Albums,
+        link: matches!(kind, PageKind::Albums | PageKind::Artists),
         ..Default::default()
     }
 }

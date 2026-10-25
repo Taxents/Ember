@@ -1228,7 +1228,7 @@ export component PageView inherits Rectangle {
                     overflow: elide;
                 }
 
-                if row.link: HorizontalLayout {
+                if row.link && Ui.page.kind == PageKind.albums: HorizontalLayout {
                     spacing: 6px;
                     alignment: start;
                     height: 34px;
@@ -1255,6 +1255,24 @@ export component PageView inherits Rectangle {
                             clicked => {
                                 Ui.album-sort-picked(j);
                             }
+                        }
+                    }
+                }
+
+                // The Artists page: how far back its stats look.
+                if row.link && Ui.page.kind == PageKind.artists: HorizontalLayout {
+                    spacing: 10px;
+                    alignment: start;
+                    for p in [
+                        { id: "4w", label: "4 weeks" },
+                        { id: "6m", label: "6 months" },
+                        { id: "1y", label: "Year" },
+                        { id: "all", label: "All time" },
+                    ]: PillButton {
+                        text: p.label;
+                        primary: Ui.page.id == p.id || (Ui.page.id == "" && p.id == "4w");
+                        clicked => {
+                            Ui.navigate(PageKind.artists, p.id, "Artists");
                         }
                     }
                 }

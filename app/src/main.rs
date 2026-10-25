@@ -19,6 +19,7 @@ mod queue_view;
 mod radio;
 mod rows;
 mod settings;
+mod stats;
 mod suggest;
 mod toast;
 mod update;
@@ -270,6 +271,11 @@ struct App {
     toast: toast::Toast,
     /// The song playing and its length, until it's been heard long enough to count as played.
     play_report: Option<(String, Option<u64>)>,
+    /// What you've listened to in Ember (see `stats`), shared with the worker that builds the
+    /// Artists page.
+    listens: Arc<stats::Log>,
+    /// How long of the song playing has been heard so far, for the log.
+    hearing: Option<playback::Hearing>,
     /// Lyrics were shown this session (see [`App::lyrics_wanted`]).
     lyrics_opened: bool,
     /// A request failed on the network; `offline_timer` checks until one gets through.
@@ -391,6 +397,8 @@ fn main() {
         metrics_timer: Timer::default(),
         toast: Default::default(),
         play_report: None,
+        listens: Arc::new(stats::Log::load()),
+        hearing: None,
         lyrics_opened: false,
         offline: false,
         offline_timer: Timer::default(),
@@ -569,6 +577,23 @@ fn wire(ui: &AppWindow) {
             a.settings.discord = on;
             a.save_later();
             a.tick();
+        });
+    });
+    g.on_listening_history_changed(|on| {
+        with(|a| {
+            a.settings.listening_history = on;
+            if !on {
+                a.hearing = None;
+            }
+            a.forget_pages(PageKind::Artists);
+            a.save_later();
+        });
+    });
+    g.on_clear_history(|| {
+        with(|a| {
+            a.listens = Arc::new(stats::Log::default());
+            stats::Log::clear();
+            a.forget_pages(PageKind::Artists);
         });
     });
     g.on_open_data_folder(|| {
@@ -802,6 +827,7 @@ impl App {
         g.set_volume(self.settings.volume);
         g.set_sidebar_collapsed(self.settings.sidebar_collapsed);
         g.set_lyrics_third_party(self.settings.lyrics_third_party);
+        g.set_listening_history(self.settings.listening_history);
         pages::THIRD_PARTY_LYRICS.store(
             self.settings.lyrics_third_party,
             std::sync::atomic::Ordering::Relaxed,
@@ -905,6 +931,7 @@ impl App {
     }
 
     fn shutdown(&mut self) {
+        self.finish_hearing();
         // A change waiting on its toast's Undo goes through.
         self.close_toast();
         workers::finish_ordered(Duration::from_secs(3));

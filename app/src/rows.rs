@@ -298,7 +298,8 @@ fn height(r: &TrackRow, measured: Option<f32>, m: &Metrics) -> f32 {
     match r.kind {
         RowKind::Header => m.banner_h + 16.0 + if m.video { m.video_h() + 24.0 } else { 0.0 },
         RowKind::Title => {
-            // Play and Shuffle, or the Albums page's sort, under the title.
+            // Play and Shuffle, the Albums page's sort, or the Artists page's period picker,
+            // under the title.
             if m.playable || r.link { 176.0 } else { 124.0 }
         }
         RowKind::Heading => 60.0,

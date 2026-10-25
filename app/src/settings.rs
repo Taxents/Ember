@@ -36,6 +36,8 @@ pub struct Settings {
     pub autoplay_mode: String,
     /// Discord shows what's playing ("Listening to Ember").
     pub discord: bool,
+    /// Songs played are logged (on this PC only) for the Artists page's stats.
+    pub listening_history: bool,
 }
 
 impl Default for Settings {
@@ -56,6 +58,7 @@ impl Default for Settings {
             album_sort: Default::default(),
             autoplay_mode: String::new(),
             discord: true,
+            listening_history: true,
         }
     }
 }
