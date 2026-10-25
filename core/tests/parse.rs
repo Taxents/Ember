@@ -141,9 +141,12 @@ fn uploads() {
         );
     }
     let by_id = |id: &str| ts.iter().find(|t| t.video_id == id).unwrap();
-    // "Playboi Carti - Skeleton (Unreleased)": a song, split at the dash.
-    let s = by_id("r6Vgu5ViOMY");
+    // "Playboi Carti - Skeleton (Unreleased)": a song, as uploaded until the search page splits
+    // it at the dash.
+    let mut s = by_id("r6Vgu5ViOMY").clone();
     assert_eq!(s.kind, TrackKind::Song);
+    assert_eq!(s.artists[0].name, "zeuven");
+    music_core::yt::uploads::tidy(&mut s, &["Playboi Carti".into()]);
     assert_eq!(s.title, "Skeleton (Unreleased)");
     assert_eq!(s.artists[0].name, "Playboi Carti");
     assert_eq!(s.duration_ms, Some(184_000));

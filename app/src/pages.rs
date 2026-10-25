@@ -470,12 +470,32 @@ fn search(s: SearchResults, uploads: Vec<Track>) -> Loaded {
         })
         .chain(songs.iter().chain(&uploaded).map(|t| t.video_id.clone()))
         .collect();
-    for t in uploads {
+    // The artists YouTube Music found: which side of an upload's dash names the artist.
+    let mut known: Vec<String> = Vec::new();
+    for i in top.iter().chain(&artists).chain(&albums).chain(&videos) {
+        match i {
+            Item::Artist(a) => known.push(a.name.clone()),
+            Item::Album(a) => known.extend(a.artists.iter().map(|n| n.name.clone())),
+            Item::Track(t) if !t.upload => known.extend(t.artists.iter().map(|n| n.name.clone())),
+            _ => {}
+        }
+    }
+    known.extend(
+        songs
+            .iter()
+            .flat_map(|t| t.artists.iter().map(|n| n.name.clone())),
+    );
+    known.sort();
+    known.dedup();
+    for mut t in uploads {
         if !seen.insert(t.video_id.clone()) {
             continue;
         }
         match t.kind {
-            TrackKind::Song => uploaded.push(t),
+            TrackKind::Song => {
+                music_core::yt::uploads::tidy(&mut t, &known);
+                uploaded.push(t);
+            }
             TrackKind::Video => videos.push(Item::Track(t)),
         }
     }

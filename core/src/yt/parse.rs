@@ -102,11 +102,7 @@ fn sorted(mut t: Track, watch: &Value) -> Track {
             TrackKind::Video
         };
         if t.kind == TrackKind::Song {
-            let (title, artists) = uploads::split_title(&t.title, &channel);
-            // Without a dash the channel stays, with its link.
-            if title != t.title {
-                (t.title, t.artists) = (title, artists);
-            }
+            uploads::tidy(&mut t, &[]);
         }
     }
     t
@@ -860,7 +856,9 @@ fn top_card(r: &Value) -> Option<Item> {
 }
 
 /// A search on YouTube itself (client `WEB`): its videos as uploads, each scored as a song or a
-/// video. Shorts, playlists and channels are left out.
+/// video, titles as uploaded and the channel as the artist (the search page splits a song's
+/// title, knowing which artists the search found: [`uploads::tidy`]). Shorts, playlists and
+/// channels are left out.
 pub fn uploads(v: &Value) -> Vec<Track> {
     let lists = &v["contents"]["twoColumnSearchResultsRenderer"]["primaryContents"]["sectionListRenderer"]
         ["contents"];
@@ -880,9 +878,6 @@ pub fn uploads(v: &Value) -> Vec<Track> {
                 verified,
                 rank: Some(rank),
             });
-            if song {
-                (t.title, t.artists) = uploads::split_title(&t.title, &channel);
-            }
             t.kind = if song {
                 TrackKind::Song
             } else {

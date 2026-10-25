@@ -7,7 +7,7 @@
 //! version of a track counts for, a set or a compilation against, and a bare "mix" leaves it
 //! to the length.
 
-use super::model::Named;
+use super::model::{Named, Track};
 
 /// What an upload shows about itself.
 #[derive(Debug, Clone, Copy, Default)]
@@ -44,6 +44,20 @@ const SONG_WORDS: &[&str] = &[
     "og",
     "instrumental",
     "acapella",
+    "vocals",
+    "demo",
+    "extended",
+    "version",
+    "mastered",
+    "remastered",
+    "open verse",
+    "alt",
+    "alternate",
+    "v1",
+    "v2",
+    "v3",
+    "v4",
+    "v5",
 ];
 /// Weaker: a lyric video or a visualizer is still the song.
 const SONG_HINTS: &[&str] = &["lyrics", "lyric", "visualizer"];
@@ -122,8 +136,8 @@ pub fn score(c: &Clues) -> i32 {
         Some(481..=900) => -1,
         Some(_) => -5,
     };
-    // "Artist - Title".
-    if t.contains(" - ") || t.contains(" – ") {
+    // "Artist - Title", however it's spaced.
+    if dash(&t).is_some() {
         s += 1;
     }
     let words = SONG_WORDS.iter().filter(|w| has_word(&t, w)).count() as i32 * 2
@@ -192,30 +206,114 @@ fn top_list(t: &str) -> bool {
         .any(|(i, _)| t[i + 4..].starts_with(|c: char| c.is_ascii_digit()))
 }
 
-/// An upload's title as song and artists: "Artist - Song (Unreleased)" splits at the dash; with
-/// none, the channel is the artist.
-pub fn split_title(title: &str, channel: &str) -> (String, Vec<Named>) {
-    let named = |n: &str| Named {
-        name: n.trim().to_string(),
-        id: None,
-    };
-    let dash = title.split_once(" - ").or_else(|| title.split_once(" – "));
-    match dash {
-        Some((a, s)) if !a.trim().is_empty() && !s.trim().is_empty() => {
-            let artists = a
-                .split([',', '&'])
-                .flat_map(|p| p.split(" x "))
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .map(named)
-                .collect();
-            (s.trim().to_string(), artists)
+/// Where an upload's title splits into artist and song: the first `-`, `–` or `—` with a space
+/// on at least one side ("Artist - Song", "Song -Artist"), so "Jay-Z" stays whole. Its byte
+/// range, and whether it's spaced on both sides (the usual "Artist - Song").
+fn dash(t: &str) -> Option<(usize, usize, bool)> {
+    t.char_indices().find_map(|(i, c)| {
+        if !matches!(c, '-' | '–' | '—') {
+            return None;
         }
-        _ if channel.is_empty() => (title.to_string(), Vec::new()),
-        _ => (
-            title.to_string(),
-            vec![named(channel.trim_end_matches(" - Topic"))],
-        ),
+        let end = i + c.len_utf8();
+        let before = t[..i].ends_with(' ');
+        let after = t[end..].starts_with(' ');
+        let sides = !t[..i].trim().is_empty() && !t[end..].trim().is_empty();
+        ((before || after) && sides).then_some((i, end, before && after))
+    })
+}
+
+/// Lowercase letters and digits, single-spaced: for comparing names.
+fn norm(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// An upload's title as song and artists, when it shows them: split at its dash, the artist on
+/// whichever side names one of `known` (the artists a search found) or the channel, else on the
+/// left when the dash is spaced the usual way. Brackets on the artist's side belong to the song
+/// ("Song -Artist (Clear Vocals)"). `None` when it can't tell: the channel stays the artist.
+pub fn split_title(title: &str, channel: &str, known: &[String]) -> Option<(String, Vec<Named>)> {
+    let (i, end, spaced) = dash(title)?;
+    let (left, right) = (title[..i].trim(), title[end..].trim());
+    let channel = channel.trim_end_matches(" - Topic");
+    let names: Vec<String> = known
+        .iter()
+        .map(String::as_str)
+        .chain([channel])
+        .map(norm)
+        .filter(|n| n.len() >= 2)
+        .collect();
+    let bare = |side: &str| {
+        side.split(['(', '['])
+            .next()
+            .unwrap_or(side)
+            .trim()
+            .to_string()
+    };
+    let names_one = |side: &str| {
+        let side = norm(&bare(side));
+        names.iter().any(|n| has_word(&side, n))
+    };
+    // A known artist elsewhere in the title ("Song (feat. Artist) - Unreleased") says the left
+    // side isn't simply the artist.
+    let elsewhere = || {
+        let t = norm(title);
+        names.iter().any(|n| has_word(&t, n))
+    };
+    let artist_left = match (names_one(left), names_one(right)) {
+        (false, true) => false,
+        (true, _) => true,
+        _ if spaced && !elsewhere() => true,
+        _ => return None,
+    };
+    let (artist, song) = if artist_left {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let who = bare(artist);
+    // What follows the artist's name ("(Clear Vocals)") goes with the song.
+    let extra = artist[who.len()..].trim();
+    let song = if extra.is_empty() {
+        song.to_string()
+    } else {
+        format!("{song} {extra}")
+    };
+    let mut parts = vec![who];
+    for sep in [
+        ",", "&", " x ", " X ", " ft. ", " Ft. ", " ft ", " feat. ", " Feat. ", " feat ",
+    ] {
+        parts = parts
+            .iter()
+            .flat_map(|a| a.split(sep).map(str::to_string).collect::<Vec<_>>())
+            .collect();
+    }
+    let artists: Vec<Named> = parts
+        .iter()
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .map(|a| Named {
+            name: a.to_string(),
+            id: None,
+        })
+        .collect();
+    (!artists.is_empty() && !song.is_empty()).then_some((song, artists))
+}
+
+/// A song upload's title and artists from its title, when it shows them (see [`split_title`]).
+pub fn tidy(t: &mut Track, known: &[String]) {
+    let channel = t
+        .artists
+        .first()
+        .map(|a| a.name.clone())
+        .unwrap_or_default();
+    if let Some((title, artists)) = split_title(&t.title, &channel, known) {
+        (t.title, t.artists) = (title, artists);
     }
 }
 
@@ -305,6 +403,9 @@ mod tests {
         assert!(song("Artist - Track [VIP Mix]", 240));
         assert!(song("Artist - Track - Radio Mix", 200));
         assert!(!song("Some Song", 200));
+        assert!(song("Never See Me Again -Kanye West (Clear Vocals)", 260));
+        assert!(song("Never See Me Again (Final Version)", 260));
+        assert!(song("Artist - Song v2", 200));
     }
 
     #[test]
@@ -352,17 +453,73 @@ mod tests {
         assert!(!has_word("often", "ft"));
     }
 
+    fn split(title: &str, channel: &str, known: &[&str]) -> Option<(String, Vec<String>)> {
+        let known: Vec<String> = known.iter().map(|k| k.to_string()).collect();
+        split_title(title, channel, &known)
+            .map(|(t, a)| (t, a.into_iter().map(|n| n.name).collect()))
+    }
+
     #[test]
     fn titles_split_at_the_dash() {
-        let (t, a) = split_title("Playboi Carti - Skeleton (Unreleased)", "zeuven");
-        assert_eq!(t, "Skeleton (Unreleased)");
-        assert_eq!(a[0].name, "Playboi Carti");
-        let (_, a) = split_title("A x B & C - Song", "ch");
-        let names: Vec<_> = a.iter().map(|n| n.name.as_str()).collect();
-        assert_eq!(names, ["A", "B", "C"]);
-        let (t, a) = split_title("bando (prod. x)", "Artist - Topic");
-        assert_eq!(t, "bando (prod. x)");
-        assert_eq!(a[0].name, "Artist");
+        let (t, a) = split("Playboi Carti - Skeleton (Unreleased)", "zeuven", &[]).unwrap();
+        assert_eq!(
+            (t.as_str(), a[0].as_str()),
+            ("Skeleton (Unreleased)", "Playboi Carti")
+        );
+        let (_, a) = split("A x B & C - Song", "ch", &[]).unwrap();
+        assert_eq!(a, ["A", "B", "C"]);
+        let (_, a) = split("Kanye West ft. Jay-Z - Song", "ch", &[]).unwrap();
+        assert_eq!(a, ["Kanye West", "Jay-Z"]);
+        // No dash: nothing to go on.
+        assert_eq!(split("bando (prod. x)", "Artist - Topic", &[]), None);
+        // A hyphen inside a word isn't a dash.
+        assert_eq!(
+            split("Playboi Carti UNRELEASED-Molly(lyrics)", "ch", &[]),
+            None
+        );
+        assert_eq!(split("Jay-Z - Song", "x", &[]).unwrap().1, ["Jay-Z"]);
+    }
+
+    #[test]
+    fn messy_titles_find_the_artist() {
+        let want = Some((
+            "Never See Me Again (Clear Vocals)".to_string(),
+            vec!["Kanye West".to_string()],
+        ));
+        let t = "Never See Me Again -Kanye West (Clear Vocals)";
+        // A search for him found him: he's on the right, whatever the spacing.
+        assert_eq!(split(t, "uploader", &["Kanye West"]), want);
+        assert_eq!(
+            split(
+                "Never See Me Again - Kanye West (Clear Vocals)",
+                "x",
+                &["Kanye West"]
+            ),
+            want
+        );
+        // The channel is the artist.
+        assert_eq!(split(t, "Kanye West - Topic", &[]), want);
+        // Known on the left, any spacing.
+        let (s, a) = split("Kanye West- Never See Me Again", "x", &["kanye west"]).unwrap();
+        assert_eq!(
+            (s.as_str(), a[0].as_str()),
+            ("Never See Me Again", "Kanye West")
+        );
+        assert_eq!(
+            split("Song — Artist", "x", &["Artist"]).unwrap().1,
+            ["Artist"]
+        );
+        // Badly spaced and nothing known: left alone rather than guessed.
+        assert_eq!(split(t, "uploader", &[]), None);
+        // The artist only in a "feat.": the left side is the song, not the artist.
+        assert_eq!(
+            split(
+                "We Are Young (feat. Kanye West & JAY-Z) - Unreleased Watch The Throne II",
+                "x",
+                &["Kanye West"]
+            ),
+            None
+        );
     }
 
     #[test]
