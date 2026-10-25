@@ -114,7 +114,7 @@ export struct TrackRow {
     kind: RowKind,
     // Shelf and grid rows.
     cards: [Card],
-    // Headings and shelves with "See all".
+    // Headings and shelves with "See all"; the Albums page's title, with its sort under it.
     link: bool,
     // Page rows: the row's index on the page, and its place (set by Rust, which lays them out).
     index: int,
@@ -356,6 +356,10 @@ export global Ui {
     in property <int> queue-current;
     callback queue-jump(int);
     callback queue-remove(int);
+    // The library's Albums: how they're sorted and grouped, and the one picked.
+    in property <[string]> album-sorts;
+    in property <int> album-sort;
+    callback album-sort-picked(int);
     // Autoplay: the queue grows from one song by YouTube's radio, drawn from the picked choice.
     in property <[string]> autoplay-chips;
     in property <int> autoplay-picked: -1;

@@ -1194,6 +1194,37 @@ export component PageView inherits Rectangle {
                     overflow: elide;
                 }
 
+                if row.link: HorizontalLayout {
+                    spacing: 6px;
+                    alignment: start;
+                    height: 34px;
+                    for label[j] in Ui.album-sorts: Rectangle {
+                        width: sort-text.preferred-width + 28px;
+                        height: 34px;
+                        border-radius: 17px;
+                        background: Ui.album-sort == j ? Theme.ivory
+                            : sort-ta.has-hover ? #F1E5D224 : #F1E5D214;
+                        accessible-role: button;
+                        accessible-label: label;
+                        accessible-checked: Ui.album-sort == j;
+                        accessible-action-default => {
+                            Ui.album-sort-picked(j);
+                        }
+                        sort-text := Text {
+                            text: label;
+                            color: Ui.album-sort == j ? Theme.carbon : Theme.ivory;
+                            font-size: 13px;
+                            font-weight: 600;
+                        }
+                        sort-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                Ui.album-sort-picked(j);
+                            }
+                        }
+                    }
+                }
+
                 if Ui.page.playable: HorizontalLayout {
                     spacing: 10px;
                     alignment: start;
