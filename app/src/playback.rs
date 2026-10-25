@@ -468,9 +468,7 @@ impl App {
         if p.id != *id {
             return;
         }
-        let duration = p.duration_ms.or(*duration);
-        let enough = duration.map_or(30_000, |d| d.saturating_sub(2_000).clamp(1_000, 30_000));
-        if p.ms < enough {
+        if p.ms < heard_enough(p.duration_ms.or(*duration)) {
             return;
         }
         let id = id.clone();
@@ -484,6 +482,70 @@ impl App {
                 log::warn!("history: {e}");
             }
         });
+    }
+
+    /// A song started being heard: the one before goes into the listening log if enough of it
+    /// was. Live radio isn't logged.
+    pub(crate) fn start_hearing(&mut self, id: &str, duration_ms: Option<u64>) {
+        self.finish_hearing();
+        if !radio::is_station(id) {
+            self.hearing = Some(Hearing {
+                id: id.to_string(),
+                duration_ms,
+                heard_ms: 0,
+                last_ms: 0,
+                last_at: std::time::Instant::now(),
+                playing: false,
+            });
+        }
+    }
+
+    /// Adds what's been heard since the last look: the position moved on by no more than the
+    /// time passed (a seek forward isn't listening; a pause isn't either).
+    fn track_hearing(&mut self, pos: Option<&music_core::audio::Position>) {
+        let Some(h) = &mut self.hearing else { return };
+        let now = std::time::Instant::now();
+        match pos {
+            Some(p) if p.id == h.id => {
+                if p.duration_ms.is_some() {
+                    h.duration_ms = p.duration_ms;
+                }
+                let passed = now.duration_since(h.last_at).as_millis() as u64;
+                if h.playing && p.ms >= h.last_ms && p.ms - h.last_ms <= passed + 1_500 {
+                    h.heard_ms += p.ms - h.last_ms;
+                }
+                h.last_ms = p.ms;
+                h.playing = !p.paused;
+            }
+            // Loading or seeking: nothing heard meanwhile.
+            _ => h.playing = false,
+        }
+        h.last_at = now;
+    }
+
+    /// The song heard is over (another started, the queue ended, the app closes): into the log
+    /// if it was heard long enough to count as played, as for YouTube's history, signed in or
+    /// not.
+    pub(crate) fn finish_hearing(&mut self) {
+        let Some(mut h) = self.hearing.take() else {
+            return;
+        };
+        // Last seen playing: it played on since (a minimized window isn't looked at often), up to
+        // its end.
+        if h.playing {
+            let rest = h.duration_ms.map_or(0, |d| d.saturating_sub(h.last_ms));
+            h.heard_ms += (h.last_at.elapsed().as_millis() as u64).min(rest);
+        }
+        if h.heard_ms < heard_enough(h.duration_ms) {
+            return;
+        }
+        let Some(t) = self.known.get(&h.id) else {
+            return;
+        };
+        let secs = (h.heard_ms / 1000) as u32;
+        let at = music_core::paths::unix_now().saturating_sub(u64::from(secs));
+        Arc::make_mut(&mut self.listens).record(t, at, secs);
+        self.forget_pages(PageKind::Artists);
     }
 
     /// Quick skips are over: what's played now was chosen some other way.
@@ -555,6 +617,8 @@ impl App {
         self.together_engine(&e);
         match &e {
             Event::Started { id, duration_ms } => {
+                // Before anything looks at the position: the song before is over.
+                self.start_hearing(id, *duration_ms);
                 // Its length, kept with the song (and the saved queue, for the bar after a
                 // restart).
                 if let Some(d) = duration_ms
@@ -593,7 +657,10 @@ impl App {
                 // radio isn't YouTube's to know about.
                 self.play_report = (!station).then(|| (id.clone(), *duration_ms));
             }
-            Event::Finished => self.tick(),
+            Event::Finished => {
+                self.tick();
+                self.finish_hearing();
+            }
             Event::Failed { id, error, .. } => {
                 log::warn!("{id}: {error}");
                 if failed_now && radio::is_station(id) {
@@ -847,6 +914,7 @@ impl App {
             }
         }
         np.playing = playing;
+        self.track_hearing(pos.as_ref());
         self.report_play_when_heard(pos.as_ref());
         // Compared with what Windows was told, not with `np`: a new song sets `np` first.
         if self.reported_playing != Some(playing) {
@@ -939,4 +1007,21 @@ impl App {
 fn lyrics_on_screen(g: &Ui, page: &PageState, id: &str) -> bool {
     (g.get_panel_open() && g.get_panel_tab() == 0)
         || (page.kind == PageKind::Song && page.id.as_str() == id)
+}
+
+/// How much of a song must be heard for it to count as played: 30 s, or nearly the whole of a
+/// shorter one.
+fn heard_enough(duration_ms: Option<u64>) -> u64 {
+    duration_ms.map_or(30_000, |d| d.saturating_sub(2_000).clamp(1_000, 30_000))
+}
+
+/// The song playing, while it's heard.
+pub(crate) struct Hearing {
+    id: String,
+    duration_ms: Option<u64>,
+    heard_ms: u64,
+    /// Where it was and when, at the last look, and whether it was playing then.
+    last_ms: u64,
+    last_at: std::time::Instant,
+    playing: bool,
 }

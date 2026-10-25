@@ -498,7 +498,6 @@ impl App {
 
     /// Shows a song saved to the library (or not) everywhere it is here.
     pub(crate) fn mark_saved(&mut self, id: &str, save: bool) {
-        self.forget_pages(PageKind::Songs);
         let mark = |x: &mut Track| {
             if x.video_id == id
                 && let Some(l) = &mut x.library

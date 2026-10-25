@@ -10,6 +10,17 @@ impl App {
         if self.history.get(self.at) == Some(&r) {
             return self.reload();
         }
+        // The Artists page's period picker: the same page over another span, not a step to go
+        // Back through.
+        if r.kind == PageKind::Artists
+            && self
+                .history
+                .get(self.at)
+                .is_some_and(|h| h.kind == PageKind::Artists)
+        {
+            self.history[self.at] = r;
+            return self.load_page();
+        }
         if !self.history.is_empty() {
             self.history.truncate(self.at + 1);
             self.scrolls.retain(|&k, _| k < self.at);
@@ -73,12 +84,7 @@ impl App {
 
         let library = matches!(
             r.kind,
-            PageKind::History
-                | PageKind::Songs
-                | PageKind::Liked
-                | PageKind::Artists
-                | PageKind::Albums
-                | PageKind::AllPlaylists
+            PageKind::History | PageKind::Liked | PageKind::Albums | PageKind::AllPlaylists
         );
         let needs_sign_in = library && !self.client.signed_in();
         if r.kind == PageKind::Settings {
@@ -126,11 +132,14 @@ impl App {
         }
         let client = self.client.clone();
         let hidden = self.settings.hidden_playlists.clone();
+        let listens = self.listens.clone();
         workers::run_urgent(
             move || {
                 let t = std::time::Instant::now();
                 let res = if r.kind == PageKind::Radio {
                     radio::load(&r)
+                } else if r.kind == PageKind::Artists {
+                    pages::artists(&client, &r, &listens)
                 } else {
                     pages::load(&client, &r, &hidden)
                 };
@@ -259,11 +268,8 @@ impl App {
         use PageKind as K;
         let ui = self.ui();
         let g = ui.global::<Ui>();
-        let tracks = matches!(
-            r.kind,
-            K::Album | K::Playlist | K::Liked | K::Songs | K::History
-        );
-        let grid = matches!(r.kind, K::Albums | K::Artists | K::AllPlaylists);
+        let tracks = matches!(r.kind, K::Album | K::Playlist | K::Liked | K::History);
+        let grid = matches!(r.kind, K::Albums | K::AllPlaylists);
         if matches!(
             r.kind,
             K::Album | K::Playlist | K::Liked | K::Artist | K::Song
@@ -325,7 +331,7 @@ impl App {
                 g.set_page(page);
                 self.page_rows.set_playable(true);
             }
-            self.push_row(RowRef::Title, RowKind::Title, TrackRow::default());
+            self.push_row(RowRef::Title, RowKind::Title, title_row(r.kind));
         }
         let (style, n) = if tracks {
             self.push_row(RowRef::Columns, RowKind::Columns, TrackRow::default());
@@ -389,7 +395,8 @@ impl App {
                     self.push_row(RowRef::Header, RowKind::Header, TrackRow::default());
                     self.header_images();
                 } else if l.title.is_some() {
-                    self.push_row(RowRef::Title, RowKind::Title, TrackRow::default());
+                    let row = title_row(self.history[self.at].kind);
+                    self.push_row(RowRef::Title, RowKind::Title, row);
                 }
                 if !l.tracks.is_empty() {
                     self.push_row(RowRef::Columns, RowKind::Columns, TrackRow::default());
@@ -471,7 +478,25 @@ impl App {
     pub(crate) fn add_blocks(&mut self, blocks: Vec<Block>) {
         let current = self.player.current().map(str::to_string);
         for b in blocks {
+            // Played: the Plays column shows its own counts.
+            let (b, counts) = match b {
+                Block::Played {
+                    title,
+                    more,
+                    tracks,
+                } => {
+                    let (tracks, counts) = tracks.into_iter().unzip();
+                    let b = Block::Tracks {
+                        title,
+                        more,
+                        tracks,
+                    };
+                    (b, counts)
+                }
+                b => (b, Vec::new()),
+            };
             match b {
+                Block::Played { .. } => {}
                 Block::Tracks {
                     title,
                     more,
@@ -495,6 +520,9 @@ impl App {
                             false,
                         );
                         row.number = n as i32 + 1;
+                        if let Some(c) = counts.get(n) {
+                            row.plays = c.as_str().into();
+                        }
                         self.push_row(RowRef::Track(self.page_tracks.len()), RowKind::Track, row);
                         self.page_tracks.push(t);
                         self.page_groups.push(group);
@@ -1303,6 +1331,14 @@ impl App {
 }
 
 /// The whole count with thousands separators, as Apple Music's Plays column: "1,234,567".
+/// A page's title row. The Artists page's has its period picker under the title (`link`).
+fn title_row(kind: PageKind) -> TrackRow {
+    TrackRow {
+        link: kind == PageKind::Artists,
+        ..Default::default()
+    }
+}
+
 fn fmt_count(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);

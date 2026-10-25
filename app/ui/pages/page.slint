@@ -1189,6 +1189,24 @@ export component PageView inherits Rectangle {
                     overflow: elide;
                 }
 
+                // The Artists page: how far back its stats look.
+                if row.link: HorizontalLayout {
+                    spacing: 10px;
+                    alignment: start;
+                    for p in [
+                        { id: "4w", label: "4 weeks" },
+                        { id: "6m", label: "6 months" },
+                        { id: "1y", label: "Year" },
+                        { id: "all", label: "All time" },
+                    ]: PillButton {
+                        text: p.label;
+                        primary: Ui.page.id == p.id || (Ui.page.id == "" && p.id == "4w");
+                        clicked => {
+                            Ui.navigate(PageKind.artists, p.id, "Artists");
+                        }
+                    }
+                }
+
                 if Ui.page.playable: HorizontalLayout {
                     spacing: 10px;
                     alignment: start;

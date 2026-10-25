@@ -15,6 +15,7 @@ mod queue_view;
 mod radio;
 mod rows;
 mod settings;
+mod stats;
 mod toast;
 mod update;
 mod video;
@@ -256,6 +257,11 @@ struct App {
     toast: toast::Toast,
     /// The song playing and its length, until it's been heard long enough to count as played.
     play_report: Option<(String, Option<u64>)>,
+    /// What you've listened to in Ember (see `stats`), shared with the worker that builds the
+    /// Artists page.
+    listens: Arc<stats::Log>,
+    /// How long of the song playing has been heard so far, for the log.
+    hearing: Option<playback::Hearing>,
     /// Lyrics were shown this session (see [`App::lyrics_wanted`]).
     lyrics_opened: bool,
     /// A request failed on the network; `offline_timer` checks until one gets through.
@@ -373,6 +379,8 @@ fn main() {
         metrics_timer: Timer::default(),
         toast: Default::default(),
         play_report: None,
+        listens: Arc::new(stats::Log::load()),
+        hearing: None,
         lyrics_opened: false,
         offline: false,
         offline_timer: Timer::default(),
@@ -841,6 +849,7 @@ impl App {
     }
 
     fn shutdown(&mut self) {
+        self.finish_hearing();
         // A change waiting on its toast's Undo goes through.
         self.close_toast();
         workers::finish_ordered(Duration::from_secs(3));
