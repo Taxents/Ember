@@ -367,7 +367,7 @@ pub fn show(s: Status) {
                 Status::Downloading(v, pct) => {
                     g.set_update_error(none());
                     g.set_update_unverified(false);
-                    g.set_update_progress(format!("Downloading Ember {v}… {pct}%").into());
+                    g.set_update_progress(format!("Downloading {v}… {pct}%").into());
                     format!("Downloading Ember {v}")
                 }
                 Status::Ready(v) => {

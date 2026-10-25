@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const MEMORY_ITEMS: usize = 200;
+/// What the decoded images in memory may add up to (banners are large).
+const MEMORY_BYTES: usize = 96 << 20;
 const DISK_BYTES: u64 = 300 * 1024 * 1024;
 /// Image hosts fetched from (each also covers its subdomains). gstatic.com serves the fixed
 /// covers (Liked Music, Episodes for later).
@@ -73,9 +75,13 @@ pub fn allowed(url: &str) -> bool {
     })
 }
 
-/// A cache that drops the least recently used entry once it holds more than `cap`.
+/// A cache that drops the least recently used entries once it holds more than `cap` of them, or
+/// they weigh more than `budget` together.
 struct Lru<V> {
     cap: usize,
+    budget: usize,
+    weight: fn(&V) -> usize,
+    total: usize,
     map: HashMap<String, (V, u64)>,
     /// Last use → key; the first entry is the one to drop.
     order: BTreeMap<u64, String>,
@@ -83,9 +89,12 @@ struct Lru<V> {
 }
 
 impl<V: Clone> Lru<V> {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize, budget: usize, weight: fn(&V) -> usize) -> Self {
         Lru {
             cap,
+            budget,
+            weight,
+            total: 0,
             map: HashMap::new(),
             order: BTreeMap::new(),
             tick: 0,
@@ -109,21 +118,27 @@ impl<V: Clone> Lru<V> {
 
     fn insert(&mut self, key: String, v: V) {
         self.tick += 1;
-        if let Some((_, t)) = self.map.insert(key.clone(), (v, self.tick)) {
+        self.total += (self.weight)(&v);
+        if let Some((old, t)) = self.map.insert(key.clone(), (v, self.tick)) {
             self.order.remove(&t);
+            self.total -= (self.weight)(&old);
         }
         self.order.insert(self.tick, key);
-        while self.map.len() > self.cap {
+        // The newest entry always stays, however heavy.
+        while self.map.len() > self.cap || (self.total > self.budget && self.map.len() > 1) {
             let Some((_, k)) = self.order.pop_first() else {
                 break;
             };
-            self.map.remove(&k);
+            if let Some((old, _)) = self.map.remove(&k) {
+                self.total -= (self.weight)(&old);
+            }
         }
     }
 
     fn clear(&mut self) {
         self.map = HashMap::new();
         self.order.clear();
+        self.total = 0;
     }
 }
 
@@ -135,7 +150,10 @@ pub struct Images {
 impl Images {
     pub fn new() -> Self {
         Images {
-            mem: Lru::new(MEMORY_ITEMS),
+            mem: Lru::new(MEMORY_ITEMS, MEMORY_BYTES, |i: &Image| {
+                let s = i.size();
+                s.width as usize * s.height as usize * 4
+            }),
             pending: Default::default(),
         }
     }
@@ -437,7 +455,7 @@ mod tests {
 
     #[test]
     fn least_recently_used_goes() {
-        let mut c = Lru::new(2);
+        let mut c = Lru::new(2, usize::MAX, |_: &i32| 0);
         c.insert("a".into(), 1);
         c.insert("b".into(), 2);
         assert_eq!(c.get("a"), Some(1));
@@ -456,5 +474,23 @@ mod tests {
         c.insert("e".into(), 6);
         assert_eq!(c.peek("c"), None);
         assert_eq!(c.peek("d"), Some(5));
+    }
+
+    #[test]
+    fn heavy_entries_push_old_ones_out() {
+        let mut c = Lru::new(10, 100, |v: &usize| *v);
+        c.insert("a".into(), 40);
+        c.insert("b".into(), 40);
+        c.insert("c".into(), 40);
+        assert_eq!(c.peek("a"), None, "a went to keep the total under 100");
+        assert_eq!((c.total, c.map.len()), (80, 2));
+        // Replacing an entry counts its new weight, not both.
+        c.insert("c".into(), 10);
+        assert_eq!(c.total, 50);
+        // One entry heavier than the budget still stays (it's being shown).
+        c.insert("d".into(), 500);
+        assert_eq!((c.peek("d"), c.map.len(), c.total), (Some(500), 1, 500));
+        c.clear();
+        assert_eq!(c.total, 0);
     }
 }

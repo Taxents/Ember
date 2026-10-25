@@ -523,71 +523,75 @@ component Sidebar inherits Rectangle {
                 }
 
                 Icon {
-                    name: "check";
+                    name: banner.ready ? "check" : "download";
                     width: 16px;
                     height: 16px;
                     color: Theme.amber;
                 }
             }
-            if !root.collapsed: HorizontalLayout {
-                padding-left: 12px;
-                padding-right: 4px;
-                padding-top: 8px;
-                padding-bottom: 8px;
-                spacing: 10px;
-                Rectangle {
-                    width: 16px;
+            // One line, the whole of it the button: from this version to the new one, its
+            // download, or a restart into it.
+            if !root.collapsed: card := Rectangle {
+                height: 36px;
+                property <bool> can-act: !banner.busy && !Ui.update-unverified;
+                border-radius: 8px;
+                background: act.has-hover && self.can-act ? Theme.amber.with-alpha(0.08) : transparent;
+                function go() {
+                    if (!self.can-act) {
+                        return;
+                    }
+                    if (banner.ready) {
+                        Ui.restart-to-update();
+                    } else {
+                        Ui.update-install();
+                    }
+                }
+                accessible-role: button;
+                accessible-label: label.text;
+                accessible-action-default => {
+                    self.go();
+                }
+                act := TouchArea {
+                    mouse-cursor: card.can-act ? pointer : default;
+                    clicked => {
+                        card.go();
+                    }
+                }
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 4px;
+                    spacing: 8px;
                     Icon {
-                        y: 1px;
-                        name: "check";
+                        y: (parent.height - self.height) / 2;
+                        name: banner.ready ? "check" : "download";
                         width: 16px;
                         height: 16px;
                         color: Theme.amber;
                     }
-                }
 
-                VerticalLayout {
-                    spacing: 4px;
-                    alignment: center;
-                    Text {
-                        text: banner.ready ? "Ember " + Ui.update-ready + " is ready"
+                    label := Text {
+                        horizontal-stretch: 1;
+                        text: banner.ready ? "Restart to apply"
                             : banner.failed ? Ui.update-error
                             : banner.busy ? Ui.update-progress
-                            : "Ember " + Ui.update-available + " is available";
-                        color: Theme.ivory;
+                            : Ui.app-version + " → " + Ui.update-available;
+                        color: card.can-act ? Theme.amber : Theme.ivory;
                         font-size: 12px;
                         font-weight: 600;
+                        vertical-alignment: center;
                         overflow: elide;
                     }
 
-                    // The action, when there is one: install, try again, or restart.
-                    if !banner.busy && !Ui.update-unverified: Text {
-                        text: banner.ready ? "Restart to update" : banner.failed ? "Try again" : "Download and install";
-                        color: act.has-hover ? Theme.ivory : Theme.amber;
-                        font-size: 12px;
-                        font-weight: 600;
-                        overflow: elide;
-                        act := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => {
-                                if (banner.ready) {
-                                    Ui.restart-to-update();
-                                } else {
-                                    Ui.update-install();
-                                }
-                            }
+                    if !banner.ready && !banner.busy: IconButton {
+                        y: (parent.height - self.height) / 2;
+                        icon: "close";
+                        size: 24px;
+                        icon-size: 12px;
+                        tooltip: "Not now";
+                        clicked => {
+                            Ui.update-dismiss();
                         }
-                    }
-                }
-
-                if !banner.ready && !banner.busy: IconButton {
-                    y: 4px;
-                    icon: "close";
-                    size: 24px;
-                    icon-size: 12px;
-                    tooltip: "Not now";
-                    clicked => {
-                        Ui.update-dismiss();
                     }
                 }
             }
