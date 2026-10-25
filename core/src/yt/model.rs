@@ -80,6 +80,9 @@ pub struct Track {
     /// ([`super::uploads`]).
     #[serde(default)]
     pub upload: bool,
+    /// An upload's channel, kept when its title names the artist instead.
+    #[serde(default)]
+    pub channel: Option<Named>,
 }
 
 /// A song's place in the library, and the tokens that change it.

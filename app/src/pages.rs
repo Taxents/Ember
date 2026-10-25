@@ -175,8 +175,15 @@ pub fn route_for(r: &BrowseRef, title: &str) -> Route {
     }
 }
 
-/// Fetches a page (on a worker). `hidden` playlists are left out of All playlists.
+/// Fetches a page (on a worker), with your edits on its songs. `hidden` playlists are left out
+/// of All playlists.
 pub fn load(client: &Client, r: &Route, hidden: &[String]) -> Result<Loaded> {
+    let mut l = fetch(client, r, hidden)?;
+    crate::edits::apply_loaded(&mut l);
+    Ok(l)
+}
+
+fn fetch(client: &Client, r: &Route, hidden: &[String]) -> Result<Loaded> {
     Ok(match r.kind {
         PageKind::Home => home(client.home()?),
         PageKind::Explore => {
@@ -347,6 +354,12 @@ pub fn load(client: &Client, r: &Route, hidden: &[String]) -> Result<Loaded> {
 }
 
 pub fn load_more(client: &Client, m: More, hidden: &[String]) -> Result<(Extra, Option<More>)> {
+    let (mut extra, more) = fetch_more(client, m, hidden)?;
+    crate::edits::apply_extra(&mut extra);
+    Ok((extra, more))
+}
+
+fn fetch_more(client: &Client, m: More, hidden: &[String]) -> Result<(Extra, Option<More>)> {
     Ok(match m {
         More::Tracks(c) => {
             let f = client.feed_more(&c)?;
@@ -608,6 +621,7 @@ fn song(client: &Client, id: &str) -> Result<Loaded> {
     let Some(t) = w.tracks.iter().find(|t| t.video_id == id).cloned() else {
         return Err(music_core::Error::Unavailable("song not found".into()));
     };
+    let t = crate::edits::applied(t);
     let artist = t
         .artists
         .first()

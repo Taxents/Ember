@@ -260,6 +260,16 @@ export global Ui {
     // An artist name was clicked: a page row, -1 the banner, -2 the now-playing bar; and where.
     callback open-artist(int, Point);
     callback toggle-saved(); // the banner's album or playlist
+    // A song's title and artists being edited (your own names, kept on this PC). `edit-channel`
+    // is an upload's channel, whose every song can take the artists; empty for releases.
+    in-out property <bool> editing;
+    in property <string> edit-title;
+    in property <string> edit-artist;
+    in property <string> edit-channel;
+    in property <bool> edit-whole-channel;
+    in property <bool> edit-edited;
+    callback edit-save(string, string, bool); // title, artists, for the whole channel
+    callback edit-reset();
     // Your playlist's name is being edited on its banner; `rename` saves the new one.
     in-out property <bool> renaming;
     callback rename(string);

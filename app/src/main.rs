@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod edits;
 mod images;
 mod library;
 mod listen;
@@ -177,6 +178,8 @@ struct App {
     menu: Option<MenuTarget>,
     /// The song a queue row's menu was opened on.
     menu_queue_id: Option<String>,
+    /// The song "Edit song info" is open for.
+    editing: Option<Track>,
     /// The artists the open menu's "Go to" entries lead to.
     menu_artists: Vec<Named>,
     /// Where the menu opened, for a second menu in its place.
@@ -328,6 +331,7 @@ fn main() {
         logo_url: None,
         menu: None,
         menu_queue_id: None,
+        editing: None,
         menu_artists: Vec::new(),
         menu_at: Default::default(),
         autoplay: None,
@@ -553,6 +557,12 @@ fn wire(ui: &AppWindow) {
     g.on_create_playlist(|name| {
         with(|a| a.create_playlist(name.to_string()));
     });
+    g.on_edit_save(|title, artists, channel| {
+        with(|a| a.edit_saved(title.to_string(), artists.to_string(), channel));
+    });
+    g.on_edit_reset(|| {
+        with(|a| a.edit_reset());
+    });
     g.on_new_playlist(|| {
         with(|a| a.new_playlist(Vec::new()));
     });
@@ -774,7 +784,8 @@ impl App {
         if !q.tracks.is_empty() {
             let ids: Vec<String> = q.tracks.iter().map(|t| t.video_id.clone()).collect();
             for t in q.tracks {
-                self.known.insert(t.video_id.clone(), t);
+                self.known
+                    .insert(t.video_id.clone(), crate::edits::applied(t));
             }
             // Shuffled: the queue's own order back from where each song came from, so it plays
             // on in the same order and shuffle off goes back to the one before.

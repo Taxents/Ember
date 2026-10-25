@@ -1329,6 +1329,9 @@ component TogetherField inherits Rectangle {
     in property <bool> mono;
     callback edited(string);
     callback accepted(string);
+    public function take-focus() {
+        input.focus();
+    }
     height: 32px;
     border-radius: 8px;
     background: input.has-focus ? Theme.smoke : Theme.smoke.with-alpha(0.6);
@@ -1835,6 +1838,137 @@ component ToastView inherits Rectangle {
     }
 }
 
+// Your own title and artists for a song, over everything. Enter saves, Escape or a press
+// outside leaves it as it was.
+component EditSong inherits Rectangle {
+    in-out property <bool> whole: Ui.edit-whole-channel;
+    callback close();
+    width: 380px;
+    height: lay.preferred-height;
+    border-radius: 12px;
+    background: Theme.panel;
+    border-width: 1px;
+    border-color: Theme.smoke;
+    drop-shadow-blur: 30px;
+    drop-shadow-color: #000000a0;
+    TouchArea { } // keeps clicks inside from closing it
+    function save() {
+        Ui.edit-save(title.text, artist.text, root.whole);
+        root.close();
+    }
+
+    lay := VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+        Text {
+            text: "Edit song info";
+            color: Theme.ivory;
+            font-size: 15px;
+            font-weight: 700;
+        }
+
+        TogetherHeading {
+            text: "Title";
+        }
+
+        title := TogetherField {
+            text: Ui.edit-title;
+            placeholder: "Title";
+            init => {
+                self.take-focus();
+            }
+            accepted => {
+                root.save();
+            }
+        }
+
+        TogetherHeading {
+            text: "Artist";
+        }
+
+        artist := TogetherField {
+            text: Ui.edit-artist;
+            placeholder: "Artist, Artist";
+            accepted => {
+                root.save();
+            }
+        }
+
+        if Ui.edit-channel != "": Rectangle {
+            height: 22px;
+            accessible-role: checkbox;
+            accessible-checkable: true;
+            accessible-checked: root.whole;
+            accessible-label: "Every song from " + Ui.edit-channel;
+            accessible-action-default => {
+                root.whole = !root.whole;
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.whole = !root.whole;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle {
+                    width: 16px;
+                    height: 16px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 4px;
+                    background: root.whole ? Theme.amber : transparent;
+                    border-width: root.whole ? 0 : 1px;
+                    border-color: Theme.beige.with-alpha(0.6);
+                    if root.whole: Icon {
+                        name: "check";
+                        width: 12px;
+                        height: 12px;
+                        color: #120D0B;
+                    }
+                }
+
+                Text {
+                    text: "Every song from " + Ui.edit-channel;
+                    color: Theme.ivory;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            padding-top: 6px;
+            if Ui.edit-edited: TogetherButton {
+                text: "Reset";
+                clicked => {
+                    Ui.edit-reset();
+                    root.close();
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            TogetherButton {
+                text: "Cancel";
+                clicked => {
+                    root.close();
+                }
+            }
+
+            PillButton {
+                text: "Save";
+                clicked => {
+                    root.save();
+                }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Ember";
     icon: @image-url("../icons/ember-256.png");
@@ -2021,6 +2155,35 @@ export component AppWindow inherits Window {
         if Ui.together-open: TogetherPanel {
             x: parent.width - self.width - 16px;
             y: parent.height - bar.height - self.height - 8px;
+        }
+
+        if Ui.editing: Rectangle {
+            background: #00000080;
+            TouchArea {
+                clicked => {
+                    Ui.editing = false;
+                    keys.focus();
+                }
+            }
+
+            FocusScope {
+                key-pressed(e) => {
+                    if e.text == Key.Escape {
+                        Ui.editing = false;
+                        keys.focus();
+                        return accept;
+                    }
+                    reject
+                }
+                EditSong {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    close => {
+                        Ui.editing = false;
+                        keys.focus();
+                    }
+                }
+            }
         }
 
         // A press anywhere outside the menu closes it.

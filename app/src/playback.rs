@@ -148,7 +148,7 @@ impl App {
                         }
                         let ids = rest.iter().map(|t| t.video_id.clone()).collect();
                         for t in rest {
-                            a.known.insert(t.video_id.clone(), t);
+                            a.known.insert(t.video_id.clone(), crate::edits::applied(t));
                         }
                         a.player.append(ids);
                         a.queue_changed();
@@ -195,7 +195,8 @@ impl App {
         };
         let ids: Vec<String> = playable.iter().map(|t| t.video_id.clone()).collect();
         for t in playable {
-            self.known.insert(t.video_id.clone(), t);
+            self.known
+                .insert(t.video_id.clone(), crate::edits::applied(t));
         }
         self.resume_at = None;
         self.player.play_queue(ids, start);
@@ -323,7 +324,8 @@ impl App {
             .collect();
         let ids = rest.iter().map(|t| t.video_id.clone()).collect();
         for t in rest {
-            self.known.insert(t.video_id.clone(), t);
+            self.known
+                .insert(t.video_id.clone(), crate::edits::applied(t));
         }
         self.player.replace_rest(ids);
         self.queue_changed();
@@ -411,7 +413,8 @@ impl App {
                     return;
                 }
                 for t in tracks {
-                    self.known.insert(t.video_id.clone(), t);
+                    self.known
+                        .insert(t.video_id.clone(), crate::edits::applied(t));
                 }
                 if mode == Mode::Next {
                     self.player.insert_next(ids);

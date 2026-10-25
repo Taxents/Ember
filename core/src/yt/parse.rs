@@ -91,6 +91,7 @@ fn sorted(mut t: Track, watch: &Value) -> Track {
             .map(|a| a.name.clone())
             .unwrap_or_default();
         t.upload = true;
+        t.channel = t.artists.first().cloned();
         t.kind = if uploads::is_song(&uploads::Clues {
             title: &t.title,
             channel: &channel,
@@ -547,6 +548,7 @@ fn responsive(r: &Value) -> Option<Item> {
             not_interested: None,
             library: None,
             upload: false,
+            channel: None,
         },
         watch,
     )))
@@ -586,6 +588,7 @@ fn panel_track(r: &Value) -> Option<Track> {
             not_interested: None,
             library: None,
             upload: false,
+            channel: None,
         },
         watch,
     ))
@@ -908,6 +911,10 @@ fn upload(r: &Value) -> Option<(Track, String, bool)> {
         plays: parse_count(&text(&r["viewCountText"])),
         kind: TrackKind::Video,
         upload: true,
+        channel: Some(Named {
+            name: channel.clone(),
+            id: str_of(&owner["navigationEndpoint"]["browseEndpoint"]["browseId"]),
+        }),
         ..Default::default()
     };
     Some((t, channel, verified)).filter(|(t, ..)| !t.title.is_empty())

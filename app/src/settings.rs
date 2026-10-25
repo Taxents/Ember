@@ -77,14 +77,14 @@ pub struct SavedQueue {
     pub shuffled_from: Vec<usize>,
 }
 
-fn load<T: for<'a> Deserialize<'a> + Default>(name: &str) -> T {
+pub(crate) fn load<T: for<'a> Deserialize<'a> + Default>(name: &str) -> T {
     std::fs::read(config_dir().join(name))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-fn save<T: Serialize>(name: &str, v: &T) {
+pub(crate) fn save<T: Serialize>(name: &str, v: &T) {
     let json = serde_json::to_vec(v).expect("json");
     if let Err(e) = write_atomic(&config_dir().join(name), &json) {
         log::warn!("saving {name}: {e}");

@@ -231,7 +231,7 @@ impl App {
                             return;
                         }
                         let id = t.video_id.clone();
-                        self.known.insert(id.clone(), t);
+                        self.known.insert(id.clone(), crate::edits::applied(t));
                         if choice == "next" {
                             self.player.insert_next(vec![id]);
                         } else {
@@ -460,6 +460,7 @@ impl App {
             "radio" => self.play_item(Item::Track(t), Mode::Play),
             "link" => self.copy_link(&Item::Track(t)),
             "libadd" | "libremove" => self.save_song(&t, choice == "libadd"),
+            "edit" => self.edit_song(t),
             "add-to" => {
                 // Your own playlists, else every one.
                 let mut mine: Vec<usize> = (0..self.playlists.len())
@@ -568,6 +569,7 @@ fn song_entries(t: &Track) -> Vec<MenuEntry> {
     }
     v.push(entry("add-to", "Add to playlist…", "queue"));
     v.push(entry("radio", "Start radio", "radio"));
+    v.push(entry("edit", "Edit song info…", "edit"));
     v
 }
 

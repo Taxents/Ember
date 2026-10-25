@@ -268,6 +268,8 @@ pub fn split_title(title: &str, channel: &str, known: &[String]) -> Option<(Stri
     let artist_left = match (names_one(left), names_one(right)) {
         (false, true) => false,
         (true, _) => true,
+        // A quoted side is the song: `Artist -"Song"(prod. X)`.
+        _ if quoted(right) != quoted(left) => quoted(right),
         _ if spaced && !elsewhere() => true,
         _ => return None,
     };
@@ -279,8 +281,9 @@ pub fn split_title(title: &str, channel: &str, known: &[String]) -> Option<(Stri
     let who = bare(artist);
     // What follows the artist's name ("(Clear Vocals)") goes with the song.
     let extra = artist[who.len()..].trim();
+    let song = unquoted(song);
     let song = if extra.is_empty() {
-        song.to_string()
+        song
     } else {
         format!("{song} {extra}")
     };
@@ -303,6 +306,32 @@ pub fn split_title(title: &str, channel: &str, known: &[String]) -> Option<(Stri
         })
         .collect();
     (!artists.is_empty() && !song.is_empty()).then_some((song, artists))
+}
+
+const QUOTES: [char; 3] = ['"', '“', '”'];
+
+fn quoted(side: &str) -> bool {
+    let mut c = side.chars();
+    c.next().is_some_and(|q| QUOTES.contains(&q)) && c.as_str().contains(QUOTES)
+}
+
+/// `"Song"(prod. X)` → `Song (prod. X)`.
+fn unquoted(side: &str) -> String {
+    if !quoted(side) {
+        return side.to_string();
+    }
+    let inner = &side[side.chars().next().map_or(0, char::len_utf8)..];
+    let Some(close) = inner.find(QUOTES) else {
+        return side.to_string();
+    };
+    let (name, rest) = (
+        inner[..close].trim(),
+        inner[close..].chars().skip(1).collect::<String>(),
+    );
+    match rest.trim() {
+        "" => name.to_string(),
+        rest => format!("{name} {rest}"),
+    }
 }
 
 /// A song upload's title and artists from its title, when it shows them (see [`split_title`]).
@@ -509,6 +538,14 @@ mod tests {
             split("Song — Artist", "x", &["Artist"]).unwrap().1,
             ["Artist"]
         );
+        // A quoted song: the other side is the artist, and the quotes go.
+        let (s, a) = split("Artist -\"Song\"(prod. blabla)", "x", &[]).unwrap();
+        assert_eq!(
+            (s.as_str(), a[0].as_str()),
+            ("Song (prod. blabla)", "Artist")
+        );
+        let (s, a) = split("“Song” - Artist", "x", &[]).unwrap();
+        assert_eq!((s.as_str(), a[0].as_str()), ("Song", "Artist"));
         // Badly spaced and nothing known: left alone rather than guessed.
         assert_eq!(split(t, "uploader", &[]), None);
         // The artist only in a "feat.": the left side is the song, not the artist.

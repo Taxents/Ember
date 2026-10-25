@@ -1145,7 +1145,8 @@ impl App {
                 new.push(id.clone());
                 let t = placeholder(id);
                 if radio::is_station(&t.video_id) {
-                    self.known.insert(t.video_id.clone(), t.clone());
+                    self.known
+                        .insert(t.video_id.clone(), crate::edits::applied(t.clone()));
                 }
                 t
             })
@@ -1210,7 +1211,8 @@ impl App {
         for t in found {
             // A station replaces its placeholder; a song the host has since met stays as is.
             if radio::is_station(&t.video_id) {
-                self.known.insert(t.video_id.clone(), t);
+                self.known
+                    .insert(t.video_id.clone(), crate::edits::applied(t));
             } else {
                 self.known.entry(t.video_id.clone()).or_insert(t);
             }
@@ -1303,7 +1305,8 @@ impl App {
                 // Songs the host is still looking up come bare: what's known here stays.
                 for t in tracks {
                     if !t.title.is_empty() || !self.known.contains_key(&t.video_id) {
-                        self.known.insert(t.video_id.clone(), t);
+                        self.known
+                            .insert(t.video_id.clone(), crate::edits::applied(t));
                     }
                 }
                 self.player.repeat = repeat_of(repeat);
