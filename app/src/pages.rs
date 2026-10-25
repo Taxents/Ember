@@ -471,12 +471,8 @@ fn stats_page(log: &stats::Log, period: stats::Period, now: u64, library: Option
             .take(20)
             .collect();
         b.push(shelf(
-            format!(
-                "{} of listening {} · {}",
-                duration(secs),
-                period.phrase(),
-                plays(count)
-            ),
+            // The period is the picker's: the heading says what it adds up to.
+            format!("Top artists · {} · {}", duration(secs), plays(count)),
             items,
         ));
         // The top three, each with the songs of theirs you played most; "See all" opens them.
@@ -527,12 +523,10 @@ fn stats_page(log: &stats::Log, period: stats::Period, now: u64, library: Option
     let rising: Vec<Item> = stats::rising(log, now)
         .iter()
         .filter_map(|t| {
-            let sub = format!(
-                "{} this month, from {}",
-                duration(t.now),
-                duration(t.before)
-            );
-            artist(&t.total, sub)
+            artist(
+                &t.total,
+                format!("{}, up from {}", duration(t.now), duration(t.before)),
+            )
         })
         .take(20)
         .collect();
