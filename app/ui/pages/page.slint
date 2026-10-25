@@ -465,8 +465,8 @@ export component CollectionRow inherits Rectangle {
     property <bool> wide: root.album || root.track.wide;
     // The play button and the album link have their own touch areas; the row counts as hovered
     // over them too, so nothing flickers as the mouse crosses them.
-    property <bool> hovered: ta.has-hover || play-ta.has-hover || album-ta.has-hover;
-    property <bool> dragging: Ui.collection.editable && ta.pressed && abs(ta.mouse-y - ta.pressed-y) > 4px;
+    property <bool> hovered: ta.has-hover || play-ta.has-hover || album-ta.has-hover || add-ta.has-hover;
+    property <bool> dragging: Ui.collection.editable && !root.track.suggested && ta.pressed && abs(ta.mouse-y - ta.pressed-y) > 4px;
     // Title and album share what the fixed columns leave, 3:2 (title alone on albums).
     property <length> fixed: 12px + 16px + 30px + (root.album ? 0px : 44px + 14px) + 84px + 44px + 4 * 14px;
     property <length> flex: max(0px, root.width - root.fixed);
@@ -651,13 +651,45 @@ export component CollectionRow inherits Rectangle {
             }
         }
 
-        Text {
+        // A recommendation for your own playlist: its add button where the plays go.
+        Rectangle {
             width: 84px;
-            text: root.track.plays;
-            color: Theme.beige;
-            font-size: 12px;
-            horizontal-alignment: right;
-            vertical-alignment: center;
+            if !root.track.suggested: Text {
+                width: 100%;
+                text: root.track.plays;
+                color: Theme.beige;
+                font-size: 12px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                x: parent.width - self.width;
+                width: 30px;
+                height: 30px;
+                visible: root.track.suggested;
+                accessible-role: button;
+                accessible-label: "Add " + root.track.title + " to this playlist";
+                accessible-action-default => {
+                    Ui.suggestion-add(root.index);
+                }
+                border-radius: 15px;
+                background: add-ta.has-hover ? Theme.hover : transparent;
+                border-width: 1px;
+                border-color: add-ta.has-hover ? Theme.ivory : Theme.beige.with-alpha(0.5);
+                Icon {
+                    name: "plus";
+                    width: 14px;
+                    height: 14px;
+                    color: add-ta.has-hover ? Theme.ivory : Theme.beige;
+                }
+                add-ta := TouchArea {
+                    enabled: root.track.suggested;
+                    mouse-cursor: pointer;
+                    clicked => {
+                        Ui.suggestion-add(root.index);
+                    }
+                }
+            }
         }
 
         Text {
@@ -1247,6 +1279,14 @@ export component PageView inherits Rectangle {
                     y: parent.height - self.height - 14px;
                     clicked => {
                         Ui.see-all(i);
+                    }
+                }
+                if row.suggested: SeeAll {
+                    text: "Refresh";
+                    x: parent.width - self.width - 34px;
+                    y: parent.height - self.height - 14px;
+                    clicked => {
+                        Ui.suggestions-refresh();
                     }
                 }
             }

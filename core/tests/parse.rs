@@ -271,6 +271,28 @@ fn radio() {
 }
 
 #[test]
+fn playlist_radio() {
+    // Others' playlists suggest from the radio built from them (`RDAMPL` + its id).
+    let w = parse::watch_next(&load("playlist_radio.json"));
+    assert!(w.tracks.len() >= 20, "{} tracks", w.tracks.len());
+    assert_eq!(
+        w.playlist_id.as_deref(),
+        Some("RDAMPLPL4fGSI1pDJn4wJiy11zqxdQZfrFdiKnC5")
+    );
+    assert!(matches!(w.continuation, Some(Continuation::Query(_))));
+    for t in &w.tracks {
+        assert_eq!(t.video_id.len(), 11);
+        assert!(!t.artists.is_empty(), "{t:?}");
+    }
+    // A playlist that isn't yours has no suggestions shelf of its own.
+    let p = parse::playlist(
+        "VLPL4fGSI1pDJn4wJiy11zqxdQZfrFdiKnC5",
+        &load("playlist.json"),
+    );
+    assert!(p.suggestions.is_none());
+}
+
+#[test]
 fn garbage_never_panics() {
     for v in [
         Value::Null,
@@ -284,6 +306,7 @@ fn garbage_never_panics() {
         parse::playlist("x", &v);
         parse::watch_next(&v);
         parse::suggestions(&v);
+        parse::playlist_suggestions(&v);
         assert!(parse::account(&v).is_none());
     }
 }
@@ -392,6 +415,36 @@ fn library_state() {
     if let Some(v) = private("playlist_other.json") {
         let p = parse::playlist("VLRDCLAK5uy_ls6pkxsVNi5b3e1B3qZnRDamY6siJ-nj8", &v);
         assert!(!p.owned && p.saved.is_some());
+    }
+}
+
+#[test]
+fn playlist_suggestions() {
+    // Your own playlist: its page leads to the "Suggestions" shelf, which refreshes itself.
+    let Some(v) = private("playlist_own.json") else {
+        return;
+    };
+    let p = parse::playlist("VLPL_0jiMVWFXwUg6ijRzqDM_HC9XJhMCSdZ", &v);
+    assert!(p.owned);
+    assert!(matches!(p.suggestions, Some(Continuation::Query(_))));
+    for name in [
+        "playlist_suggestions.json",
+        "playlist_suggestions_reload.json",
+    ] {
+        let s = parse::playlist_suggestions(&private(name).unwrap());
+        assert!(s.tracks.len() >= 5, "{name}: {} tracks", s.tracks.len());
+        for t in &s.tracks {
+            assert_eq!(t.video_id.len(), 11);
+            assert!(!t.title.is_empty() && !t.artists.is_empty(), "{t:?}");
+        }
+        assert!(
+            matches!(s.next, Some(SuggestionsFrom::Shelf(Continuation::Query(_)))),
+            "{name}: a fresh set"
+        );
+    }
+    // Others' playlists continue to related playlists, never suggested songs.
+    if let Some(v) = private("playlist_related.json") {
+        assert!(parse::playlist_suggestions(&v).tracks.is_empty());
     }
 }
 

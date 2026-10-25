@@ -819,7 +819,7 @@ impl App {
         if matches!(self.rows.get(footer), Some(RowRef::Footer))
             && let Some(mut r) = self.page_rows.row_data(footer)
         {
-            r.title = summary_line(&self.page_tracks).into();
+            r.title = summary_line(&self.page_tracks[..self.main_len]).into();
             self.page_rows.set_row_data(footer, r);
         }
         let playlist = self.history[self.at].id.clone();

@@ -258,6 +258,26 @@ pub struct PlaylistPage {
     pub owned: bool,
     /// In the library; `None` when it can't be saved (yours, or signed out).
     pub saved: Option<bool>,
+    /// Yours: where YouTube Music's suggestions for it come from.
+    pub suggestions: Option<Continuation>,
+}
+
+/// Songs suggested under a playlist, and where a fresh set comes from.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Suggestions {
+    pub tracks: Vec<Track>,
+    pub next: Option<SuggestionsFrom>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SuggestionsFrom {
+    /// Your own playlist's "Suggestions" shelf (`PlaylistPage::suggestions`, then its refresh).
+    Shelf(Continuation),
+    /// Anyone else's: the radio YouTube builds from the playlist, and how it continues.
+    Radio {
+        playlist_id: String,
+        continuation: Option<Continuation>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
