@@ -244,6 +244,9 @@ export global Ui {
     // "Improved lyrics": lyrics from Unison and LRCLIB too.
     in-out property <bool> lyrics-third-party: true;
     callback lyrics-third-party-changed(bool);
+    // "Show what you're listening to on Discord".
+    in-out property <bool> discord: true;
+    callback discord-changed(bool);
     in property <image> account-photo;
     in property <[SidebarPlaylist]> playlists;
     callback sign-in();

@@ -654,6 +654,7 @@ impl App {
             .cloned()
         else {
             g.set_np(NowPlaying::default());
+            self.discord_tick(&NowPlaying::default());
             return;
         };
         let px = self.px(BAR_ART);
@@ -906,6 +907,7 @@ impl App {
         };
         // The play button spins while it waits (not forever: 20 s, as the clock does).
         np.loading = waiting && waited < Duration::from_secs(20);
+        self.discord_tick(&np);
         g.set_np(np);
         if waiting && (3000..3250).contains(&waited.as_millis()) {
             log::warn!(

@@ -34,6 +34,8 @@ pub struct Settings {
     pub album_sort: crate::albums::AlbumSort,
     /// The autoplay choice last picked ("Familiar", "Discover"…), by its label.
     pub autoplay_mode: String,
+    /// Discord shows what's playing ("Listening to Ember").
+    pub discord: bool,
 }
 
 impl Default for Settings {
@@ -53,6 +55,7 @@ impl Default for Settings {
             lyrics_third_party: true,
             album_sort: Default::default(),
             autoplay_mode: String::new(),
+            discord: true,
         }
     }
 }

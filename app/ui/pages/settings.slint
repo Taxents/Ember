@@ -185,6 +185,29 @@ export component SettingsPage inherits Rectangle {
             }
 
             SettingsHeading {
+                text: "DISCORD";
+            }
+
+            SettingRow {
+                title: "Show on Discord";
+                PillButton {
+                    text: Ui.discord ? "On" : "Off";
+                    primary: Ui.discord;
+                    accessible-role: switch;
+                    accessible-checkable: true;
+                    accessible-checked: Ui.discord;
+                    clicked => {
+                        Ui.discord = !Ui.discord;
+                        Ui.discord-changed(Ui.discord);
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 24px;
+            }
+
+            SettingsHeading {
                 text: "SIDEBAR";
             }
 
