@@ -371,7 +371,7 @@ export component NowPlayingBar inherits Rectangle {
                 }
             }
 
-            if (Ui.together-state == 2 || Ui.together-state == 3) && Ui.together-members.length > 0: Rectangle {
+            if (Ui.together-state == 2 || Ui.together-state == 3) && Ui.together-members.length > 1: Rectangle {
                 x: together-btn.width - self.width + 1px;
                 y: together-btn.height / 2 - 17px;
                 height: 14px;

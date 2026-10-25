@@ -64,13 +64,19 @@ impl Default for Settings {
 }
 
 /// A Listen Along name that doesn't give away the Windows account's: "Ember listener 417".
-fn default_name() -> String {
+pub(crate) fn default_name() -> String {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos())
         % 900
         + 100;
     format!("Ember listener {n}")
+}
+
+/// Whether `name` is one `default_name` made up.
+pub(crate) fn is_default_name(name: &str) -> bool {
+    name.strip_prefix("Ember listener ")
+        .is_some_and(|n| n.len() == 3 && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The queue as it was, in play order.

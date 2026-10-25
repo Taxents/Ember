@@ -124,7 +124,7 @@ impl Log {
                 }
                 Ok(Line::Play(at, id, secs)) => {
                     if let Some(&song) = log.index.get(&id) {
-                        log.plays.push(Play { at, song, secs });
+                        log.push(Play { at, song, secs });
                     }
                 }
                 Err(_) => {}
@@ -151,7 +151,7 @@ impl Log {
             out.push('\n');
         }
         let song = self.put(s);
-        self.plays.push(Play { at, song, secs });
+        self.push(Play { at, song, secs });
         out += &serde_json::to_string(&Line::Play(at, t.video_id.clone(), secs)).expect("json");
         out.push('\n');
         out
@@ -182,6 +182,15 @@ impl Log {
         }
     }
 
+    /// A play, or the last one again heard for longer (logged once it counted, then when it
+    /// ended): same start, same song.
+    fn push(&mut self, p: Play) {
+        match self.plays.last_mut() {
+            Some(last) if last.at == p.at && last.song == p.song => last.secs = p.secs,
+            _ => self.plays.push(p),
+        }
+    }
+
     /// Keeps a song's details (the latest win), returning its index.
     fn put(&mut self, s: Song) -> usize {
         match self.index.get(&s.id) {
@@ -201,6 +210,8 @@ impl Log {
 /// How far back the Artists page looks.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Period {
+    Week,
+    TwoWeeks,
     Month,
     HalfYear,
     Year,
@@ -208,12 +219,21 @@ pub enum Period {
 }
 
 impl Period {
-    pub const EVERY: [Period; 4] = [Period::Month, Period::HalfYear, Period::Year, Period::All];
+    pub const EVERY: [Period; 6] = [
+        Period::Week,
+        Period::TwoWeeks,
+        Period::Month,
+        Period::HalfYear,
+        Period::Year,
+        Period::All,
+    ];
 
     /// As it goes in the page's route.
     pub fn id(self) -> &'static str {
         match self {
-            Period::Month => "4w",
+            Period::Week => "1w",
+            Period::TwoWeeks => "2w",
+            Period::Month => "1m",
             Period::HalfYear => "6m",
             Period::Year => "1y",
             Period::All => "all",
@@ -227,10 +247,12 @@ impl Period {
             .unwrap_or(Period::Month)
     }
 
-    /// "in the last 4 weeks".
+    /// "in the last month".
     pub fn phrase(self) -> &'static str {
         match self {
-            Period::Month => "in the last 4 weeks",
+            Period::Week => "in the last week",
+            Period::TwoWeeks => "in the last 2 weeks",
+            Period::Month => "in the last month",
             Period::HalfYear => "in the last 6 months",
             Period::Year => "in the last year",
             Period::All => "since you started listening in Ember",
@@ -240,7 +262,9 @@ impl Period {
     /// When it starts, as unix time.
     pub fn since(self, now: u64) -> u64 {
         match self {
-            Period::Month => now.saturating_sub(28 * DAY),
+            Period::Week => now.saturating_sub(7 * DAY),
+            Period::TwoWeeks => now.saturating_sub(14 * DAY),
+            Period::Month => now.saturating_sub(30 * DAY),
             Period::HalfYear => now.saturating_sub(182 * DAY),
             Period::Year => now.saturating_sub(365 * DAY),
             Period::All => 0,
@@ -554,6 +578,30 @@ mod tests {
     }
 
     #[test]
+    fn a_play_logged_when_it_counts_is_updated_when_it_ends() {
+        let mut log = Log::default();
+        let a = track("a", &[("Ada", "UCada")], None);
+        let mut text = log.add(&a, 100, 30);
+        text += &log.add(&a, 100, 185);
+        // The same song again later is another play.
+        text += &log.add(&a, 400, 40);
+        let want = vec![
+            Play {
+                at: 100,
+                song: 0,
+                secs: 185,
+            },
+            Play {
+                at: 400,
+                song: 0,
+                secs: 40,
+            },
+        ];
+        assert_eq!(log.plays, want);
+        assert_eq!(Log::parse(&text).plays, want);
+    }
+
+    #[test]
     fn the_file_reads_back_as_written() {
         let mut log = Log::default();
         let a = track("a", &[("Ada", "UCada")], Some("First"));
@@ -588,7 +636,7 @@ mod tests {
         play(&mut log, &a, 2, 3, 200);
         play(&mut log, &b, 3, 1, 100);
         play(&mut log, &c, 1, 5, 100);
-        // Long ago: outside the last 4 weeks.
+        // Long ago: outside the last month.
         play(&mut log, &c, 100, 10, 200);
 
         let since = Period::Month.since(NOW);

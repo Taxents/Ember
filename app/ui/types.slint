@@ -412,6 +412,8 @@ export global Ui {
     in property <[string]> together-members;
     // A status or error line ("Connecting…", "Invite code copied"), "" for none.
     in property <string> together-status;
+    // The invite code was just copied (the Copy button says so).
+    in-out property <bool> together-copied;
     // An invite code found on the clipboard when the popover opened, "" for none.
     in property <string> together-found;
     in-out property <string> together-name; // your display name (editable)

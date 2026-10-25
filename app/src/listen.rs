@@ -481,7 +481,7 @@ impl App {
         if self.together.is_some() {
             return;
         }
-        let link = match Host::<Up, Down>::start(&self.settings.together_name) {
+        let link = match Host::<Up, Down>::start(&self.together_name()) {
             Ok(h) => h,
             Err(e) => {
                 log::warn!("together: {e}");
@@ -530,7 +530,7 @@ impl App {
             lookup_busy: false,
         })));
         self.together_copy_code(&code);
-        self.together_status("Invite code copied");
+        self.together_copied();
         self.together_timer_on();
         self.show_together();
     }
@@ -542,7 +542,7 @@ impl App {
         let Some(code) = together::parse_code(code) else {
             return self.together_status("That isn't an invite code");
         };
-        let link = match Guest::<Up, Down>::join(&code, &self.settings.together_name) {
+        let link = match Guest::<Up, Down>::join(&code, &self.together_name()) {
             Ok(g) => g,
             Err(e) => {
                 log::warn!("together: {e}");
@@ -610,7 +610,7 @@ impl App {
         if let Some(Session::Hosting(h)) = &self.together {
             let code = h.link.code();
             self.together_copy_code(&code);
-            self.together_status("Invite code copied");
+            self.together_copied();
         }
     }
 
@@ -618,6 +618,14 @@ impl App {
         if let Some(hwnd) = self.hwnd {
             crate::win::copy_text(hwnd, code);
         }
+    }
+
+    /// The Copy button says "Copied" for a moment.
+    fn together_copied(&self) {
+        self.ui().global::<Ui>().set_together_copied(true);
+        slint::Timer::single_shot(Duration::from_millis(1500), || {
+            with(|a| a.ui().global::<Ui>().set_together_copied(false));
+        });
     }
 
     /// The panel opened: an invite code on the clipboard is offered.
@@ -633,8 +641,21 @@ impl App {
             .unwrap_or_default();
         let ui = self.ui();
         let g = ui.global::<Ui>();
+        g.set_together_copied(false);
         g.set_together_found(found.into());
-        g.set_together_name(self.settings.together_name.clone().into());
+        g.set_together_name(self.together_name().into());
+    }
+
+    /// The name friends see: the one you gave, else your YouTube account's, else the made-up
+    /// "Ember listener N" (which counts as not given once you're signed in).
+    pub(crate) fn together_name(&self) -> String {
+        let own = self.settings.together_name.trim();
+        let made_up = own.is_empty() || crate::settings::is_default_name(own);
+        match &self.account {
+            Some(acc) if made_up && !acc.name.trim().is_empty() => acc.name.trim().to_string(),
+            _ if own.is_empty() => crate::settings::default_name(),
+            _ => own.to_string(),
+        }
     }
 
     fn together_status(&self, s: &str) {
@@ -657,7 +678,7 @@ impl App {
             Some(Session::Hosting(h)) => (
                 2,
                 String::new(),
-                std::iter::once(format!("{} (you)", self.settings.together_name))
+                std::iter::once(format!("{} (you)", self.together_name()))
                     .chain(h.members.iter().map(|m| m.name.clone()))
                     .collect(),
             ),
@@ -948,7 +969,7 @@ impl App {
         let Some(Session::Hosting(h)) = &self.together else {
             return;
         };
-        let names = std::iter::once(format!("{} (host)", self.settings.together_name))
+        let names = std::iter::once(format!("{} (host)", self.together_name()))
             .chain(h.members.iter().map(|m| m.name.clone()))
             .collect();
         h.link.broadcast(&Down::Members(names));

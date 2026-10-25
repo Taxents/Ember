@@ -1365,9 +1365,10 @@ component TogetherButton inherits Rectangle {
     in property <bool> danger;
     in property <bool> enabled: true;
     callback clicked();
-    height: 28px;
+    // As tall as a field, so one beside it lines up.
+    height: 32px;
     min-width: label.preferred-width + 26px;
-    border-radius: 14px;
+    border-radius: 16px;
     opacity: enabled ? 1 : 0.45;
     background: danger ? (ta.pressed ? #E8806A40 : ta.has-hover && enabled ? #E8806A30 : #E8806A1C)
         : (ta.pressed ? #F1E5D214 : ta.has-hover && enabled ? #F1E5D224 : #F1E5D21A);
@@ -1474,13 +1475,6 @@ component TogetherPanel inherits Rectangle {
         // Off: start a session, or join one.
         if Ui.together-state == 0: VerticalLayout {
             spacing: 12px;
-            Text {
-                text: "Listen together with friends, in perfect sync. Start a session and send them the invite code.";
-                color: Theme.beige;
-                font-size: 12px;
-                wrap: word-wrap;
-            }
-
             VerticalLayout {
                 spacing: 6px;
                 TogetherHeading {
@@ -1576,7 +1570,6 @@ component TogetherPanel inherits Rectangle {
                 }
 
                 TogetherButton {
-                    y: 2px;
                     text: "Join";
                     enabled: code.text != "";
                     clicked => {
@@ -1681,18 +1674,11 @@ component TogetherPanel inherits Rectangle {
                     }
 
                     TogetherButton {
-                        y: 2px;
-                        text: "Copy";
+                        text: Ui.together-copied ? "Copied" : "Copy";
                         clicked => {
                             Ui.together-copy();
                         }
                     }
-                }
-
-                Text {
-                    text: "Friends paste this in Listen Along to join";
-                    color: Theme.dim;
-                    font-size: 11px;
                 }
             }
 
@@ -1730,13 +1716,6 @@ component TogetherPanel inherits Rectangle {
                     clicked => {
                         Ui.together-resync();
                     }
-                }
-
-                Text {
-                    text: "If you hear a delay";
-                    color: Theme.dim;
-                    font-size: 11px;
-                    vertical-alignment: center;
                 }
 
                 Rectangle { }

@@ -495,7 +495,7 @@ fn stats_page(log: &stats::Log, period: stats::Period, now: u64, library: Option
     if top.is_empty() {
         b.push(Block::Tracks {
             title: if log.plays.is_empty() {
-                "Songs you play in Ember add up here, once 30 seconds of one is heard.".into()
+                "No listening stats yet".into()
             } else {
                 format!("Nothing played {}.", period.phrase())
             },
@@ -504,18 +504,12 @@ fn stats_page(log: &stats::Log, period: stats::Period, now: u64, library: Option
         });
     } else {
         let songs = stats::top_songs(log, since, u64::MAX);
-        let secs: u64 = songs.iter().map(|t| t.secs).sum();
-        let count: u32 = songs.iter().map(|t| t.plays).sum();
         let items: Vec<Item> = top
             .iter()
             .filter_map(|t| artist(t, format!("{} · {}", duration(t.secs), plays(t.plays))))
             .take(20)
             .collect();
-        b.push(shelf(
-            // The period is the picker's: the heading says what it adds up to.
-            format!("Top artists · {} · {}", duration(secs), plays(count)),
-            items,
-        ));
+        b.push(shelf("Top artists".to_string(), items));
         // The top three, each with the songs of theirs you played most; "See all" opens them.
         for t in top.iter().filter(|t| t.id.is_some()).take(3) {
             let theirs = stats::songs_by(log, &t.key, since, u64::MAX);

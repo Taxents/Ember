@@ -514,6 +514,8 @@ impl App {
                 id: id.to_string(),
                 duration_ms,
                 heard_ms: 0,
+                started: music_core::paths::unix_now(),
+                logged: None,
                 last_ms: 0,
                 last_at: std::time::Instant::now(),
                 playing: false,
@@ -542,6 +544,32 @@ impl App {
             _ => h.playing = false,
         }
         h.last_at = now;
+        // Heard long enough: into the log now, not only when it ends, so a play counts even if
+        // the app is closed or killed before then.
+        if h.logged.is_none() && h.heard_ms >= heard_enough(h.duration_ms) {
+            self.log_heard();
+        }
+    }
+
+    /// Puts the song being heard into the log, or updates how long it was heard. The Artists
+    /// page shows it at once.
+    fn log_heard(&mut self) {
+        let Some(h) = &mut self.hearing else { return };
+        let secs = (h.heard_ms / 1000) as u32;
+        if h.logged.is_some_and(|s| s >= secs) {
+            return;
+        }
+        let Some(t) = self.known.get(&h.id) else {
+            return;
+        };
+        h.logged = Some(secs);
+        Arc::make_mut(&mut self.listens).record(t, h.started, secs);
+        self.forget_pages(PageKind::Artists);
+        // Open: laid out again where it's scrolled to.
+        if self.history[self.at].kind == PageKind::Artists {
+            self.scroll_wanted = Some(self.page_rows.scroll());
+            self.reload();
+        }
     }
 
     /// The song heard is over (another started, the queue ended, the app closes): into the log
@@ -560,13 +588,9 @@ impl App {
         if h.heard_ms < heard_enough(h.duration_ms) {
             return;
         }
-        let Some(t) = self.known.get(&h.id) else {
-            return;
-        };
-        let secs = (h.heard_ms / 1000) as u32;
-        let at = music_core::paths::unix_now().saturating_sub(u64::from(secs));
-        Arc::make_mut(&mut self.listens).record(t, at, secs);
-        self.forget_pages(PageKind::Artists);
+        self.hearing = Some(h);
+        self.log_heard();
+        self.hearing = None;
     }
 
     /// Quick skips are over: what's played now was chosen some other way.
@@ -1043,6 +1067,10 @@ pub(crate) struct Hearing {
     id: String,
     duration_ms: Option<u64>,
     heard_ms: u64,
+    /// When it started being heard (unix time): the play's time in the log.
+    started: u64,
+    /// In the log already (it was heard long enough), with this many seconds.
+    logged: Option<u32>,
     /// Where it was and when, at the last look, and whether it was playing then.
     last_ms: u64,
     last_at: std::time::Instant,
