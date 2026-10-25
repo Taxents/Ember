@@ -3,6 +3,7 @@
 //! and nothing here can panic on unexpected input: `serde_json::Value` indexing yields `Null`.
 
 use super::model::*;
+use super::uploads;
 use serde_json::Value;
 
 // ---- primitives ------------------------------------------------------------------------------
@@ -72,10 +73,43 @@ fn video_type(watch: &Value) -> Option<&str> {
 
 fn track_kind(watch: &Value) -> Option<TrackKind> {
     match video_type(watch) {
-        Some("MUSIC_VIDEO_TYPE_ATV") | None => Some(TrackKind::Song),
+        // Official audio uploaded by the label is the song, with a still picture.
+        Some("MUSIC_VIDEO_TYPE_ATV" | "MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC") | None => {
+            Some(TrackKind::Song)
+        }
         Some("MUSIC_VIDEO_TYPE_PODCAST_EPISODE") => None,
         Some(_) => Some(TrackKind::Video),
     }
+}
+
+/// A user upload YouTube Music lets in: scored as a song or a video, like YouTube's own.
+fn sorted(mut t: Track, watch: &Value) -> Track {
+    if video_type(watch) == Some("MUSIC_VIDEO_TYPE_UGC") {
+        let channel = t
+            .artists
+            .first()
+            .map(|a| a.name.clone())
+            .unwrap_or_default();
+        t.upload = true;
+        t.kind = if uploads::is_song(&uploads::Clues {
+            title: &t.title,
+            channel: &channel,
+            duration_ms: t.duration_ms,
+            ..Default::default()
+        }) {
+            TrackKind::Song
+        } else {
+            TrackKind::Video
+        };
+        if t.kind == TrackKind::Song {
+            let (title, artists) = uploads::split_title(&t.title, &channel);
+            // Without a dash the channel stays, with its link.
+            if title != t.title {
+                (t.title, t.artists) = (title, artists);
+            }
+        }
+    }
+    t
 }
 
 fn is_artist_page(pt: Option<&str>) -> bool {
@@ -375,16 +409,19 @@ fn two_row(r: &Value) -> Option<Item> {
         if artists.is_empty() {
             artists = plain_names(&sub_text);
         }
-        return Some(Item::Track(Track {
-            video_id: vid.to_string(),
-            title,
-            artists,
-            album: album_in(runs(sub)),
-            thumbs: th,
-            explicit: explicit(&r["subtitleBadges"]),
-            kind: track_kind(&ep["watchEndpoint"])?,
-            ..Default::default()
-        }));
+        return Some(Item::Track(sorted(
+            Track {
+                video_id: vid.to_string(),
+                title,
+                artists,
+                album: album_in(runs(sub)),
+                thumbs: th,
+                explicit: explicit(&r["subtitleBadges"]),
+                kind: track_kind(&ep["watchEndpoint"])?,
+                ..Default::default()
+            },
+            &ep["watchEndpoint"],
+        )));
     }
     let id = str_of(&ep["browseEndpoint"]["browseId"])?;
     match page_type(ep) {
@@ -496,23 +533,27 @@ fn responsive(r: &Value) -> Option<Item> {
         .chain(rest_text.iter())
         .flat_map(|s| s.split(SEP).map(str::to_string).collect::<Vec<_>>())
         .find_map(|p| parse_duration(&p));
-    Some(Item::Track(Track {
-        video_id,
-        title,
-        artists,
-        album: album_in(&rest_runs),
-        duration_ms,
-        thumbs: th,
-        explicit: explicit(&r["badges"]),
-        kind: track_kind(watch)?,
-        set_video_id: str_of(&r["playlistItemData"]["playlistSetVideoId"]),
-        like: like_status(&r["menu"]),
-        unavailable: r["musicItemRendererDisplayPolicy"]
-            == "MUSIC_ITEM_RENDERER_DISPLAY_POLICY_GREY_OUT",
-        plays: plays_in(rest_text.iter()),
-        not_interested: None,
-        library: None,
-    }))
+    Some(Item::Track(sorted(
+        Track {
+            video_id,
+            title,
+            artists,
+            album: album_in(&rest_runs),
+            duration_ms,
+            thumbs: th,
+            explicit: explicit(&r["badges"]),
+            kind: track_kind(watch)?,
+            set_video_id: str_of(&r["playlistItemData"]["playlistSetVideoId"]),
+            like: like_status(&r["menu"]),
+            unavailable: r["musicItemRendererDisplayPolicy"]
+                == "MUSIC_ITEM_RENDERER_DISPLAY_POLICY_GREY_OUT",
+            plays: plays_in(rest_text.iter()),
+            not_interested: None,
+            library: None,
+            upload: false,
+        },
+        watch,
+    )))
 }
 
 fn nav_button(r: &Value) -> Option<Item> {
@@ -532,22 +573,26 @@ fn panel_track(r: &Value) -> Option<Track> {
     if artists.is_empty() {
         artists = plain_names(&text(&r["shortBylineText"]));
     }
-    Some(Track {
-        video_id: str_of(&r["videoId"])?,
-        title: text(&r["title"]),
-        artists,
-        album: album_in(byline),
-        duration_ms: parse_duration(&text(&r["lengthText"])),
-        thumbs: thumbs(&r["thumbnail"]),
-        explicit: explicit(&r["badges"]),
-        kind: track_kind(watch)?,
-        set_video_id: str_of(&r["playlistSetVideoId"]),
-        like: None,
-        unavailable: false,
-        plays: plays_in([text(&r["longBylineText"])].iter()),
-        not_interested: None,
-        library: None,
-    })
+    Some(sorted(
+        Track {
+            video_id: str_of(&r["videoId"])?,
+            title: text(&r["title"]),
+            artists,
+            album: album_in(byline),
+            duration_ms: parse_duration(&text(&r["lengthText"])),
+            thumbs: thumbs(&r["thumbnail"]),
+            explicit: explicit(&r["badges"]),
+            kind: track_kind(watch)?,
+            set_video_id: str_of(&r["playlistSetVideoId"]),
+            like: None,
+            unavailable: false,
+            plays: plays_in([text(&r["longBylineText"])].iter()),
+            not_interested: None,
+            library: None,
+            upload: false,
+        },
+        watch,
+    ))
 }
 
 // ---- shelves and pages -----------------------------------------------------------------------
@@ -771,16 +816,19 @@ fn top_card(r: &Value) -> Option<Item> {
             artists = plain_names(&sub);
         }
         let duration_ms = sub.split(SEP).find_map(parse_duration);
-        return Some(Item::Track(Track {
-            video_id: vid.to_string(),
-            title,
-            artists,
-            album: album_in(runs(&r["subtitle"])),
-            duration_ms,
-            thumbs: th,
-            kind: track_kind(&tap["watchEndpoint"])?,
-            ..Default::default()
-        }));
+        return Some(Item::Track(sorted(
+            Track {
+                video_id: vid.to_string(),
+                title,
+                artists,
+                album: album_in(runs(&r["subtitle"])),
+                duration_ms,
+                thumbs: th,
+                kind: track_kind(&tap["watchEndpoint"])?,
+                ..Default::default()
+            },
+            &tap["watchEndpoint"],
+        )));
     }
     let id = str_of(&tap["browseEndpoint"]["browseId"])?;
     match page_type(tap) {
@@ -809,6 +857,65 @@ fn top_card(r: &Value) -> Option<Item> {
         })),
         _ => None,
     }
+}
+
+/// A search on YouTube itself (client `WEB`): its videos as uploads, each scored as a song or a
+/// video. Shorts, playlists and channels are left out.
+pub fn uploads(v: &Value) -> Vec<Track> {
+    let lists = &v["contents"]["twoColumnSearchResultsRenderer"]["primaryContents"]["sectionListRenderer"]
+        ["contents"];
+    let continued =
+        &v["onResponseReceivedCommands"][0]["appendContinuationItemsAction"]["continuationItems"];
+    arr(lists)
+        .iter()
+        .chain(arr(continued))
+        .flat_map(|s| arr(&s["itemSectionRenderer"]["contents"]))
+        .filter_map(|i| upload(&i["videoRenderer"]))
+        .enumerate()
+        .map(|(rank, (mut t, channel, verified))| {
+            let song = uploads::is_song(&uploads::Clues {
+                title: &t.title,
+                channel: &channel,
+                duration_ms: t.duration_ms,
+                verified,
+                rank: Some(rank),
+            });
+            if song {
+                (t.title, t.artists) = uploads::split_title(&t.title, &channel);
+            }
+            t.kind = if song {
+                TrackKind::Song
+            } else {
+                TrackKind::Video
+            };
+            t
+        })
+        .collect()
+}
+
+/// One `videoRenderer`, with its channel's name and whether it's a verified artist.
+fn upload(r: &Value) -> Option<(Track, String, bool)> {
+    let video_id = str_of(&r["videoId"])?;
+    let owner = &r["ownerText"]["runs"][0];
+    let channel = str_of(&owner["text"]).unwrap_or_default();
+    let verified = arr(&r["ownerBadges"])
+        .iter()
+        .any(|b| b["metadataBadgeRenderer"]["style"] == "BADGE_STYLE_TYPE_VERIFIED_ARTIST");
+    let t = Track {
+        video_id,
+        title: text(&r["title"]),
+        artists: vec![Named {
+            name: channel.clone(),
+            id: str_of(&owner["navigationEndpoint"]["browseEndpoint"]["browseId"]),
+        }],
+        duration_ms: parse_duration(&text(&r["lengthText"])),
+        thumbs: thumbs(&r["thumbnail"]),
+        plays: parse_count(&text(&r["viewCountText"])),
+        kind: TrackKind::Video,
+        upload: true,
+        ..Default::default()
+    };
+    Some((t, channel, verified)).filter(|(t, ..)| !t.title.is_empty())
 }
 
 pub fn suggestions(v: &Value) -> (Vec<String>, Vec<Item>) {

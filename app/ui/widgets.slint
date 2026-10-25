@@ -388,6 +388,24 @@ export component ExplicitBadge inherits Rectangle {
     }
 }
 
+// "Upload" beside the title of a song someone uploaded, not a release.
+export component UploadBadge inherits Rectangle {
+    width: label.preferred-width + 8px;
+    height: 15px;
+    y: 2px;
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: Theme.beige.with-alpha(0.55);
+    label := Text {
+        text: "Upload";
+        color: Theme.beige;
+        font-size: 9px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
 // An overlay scroll bar for a list: a slim pill that shows while you scroll or hover near it,
 // then fades away. Hovering widens it; dragging the thumb scrolls with no jump; clicking the
 // track jumps there. Put it on top of the list, bound to the list's content-y.

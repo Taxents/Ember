@@ -102,6 +102,11 @@ export struct TrackRow {
     plays: string,
     art: image,
     explicit: bool,
+    // Someone's upload, not a release.
+    upload: bool,
+    // In a list where nothing has an album: the title takes the album column too (and so does
+    // the list's column header).
+    wide: bool,
     current: bool,
     unavailable: bool,
     // Its place in the list, from 1.

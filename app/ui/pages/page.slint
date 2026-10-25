@@ -1,7 +1,7 @@
 // The page list: the collection header, track rows, shelves of cards, the grid and placeholders.
 
 import { RadioSearch } from "../radio.slint";
-import { Theme, Icon, IconButton, PillButton, Art, ScrollBar, ExplicitBadge, MiniVisualizer } from "../widgets.slint";
+import { Theme, Icon, IconButton, PillButton, Art, ScrollBar, ExplicitBadge, UploadBadge, MiniVisualizer } from "../widgets.slint";
 import { PageKind, RowKind, LyricLine, Card, TrackRow, Ui } from "../types.slint";
 
 // ---- pages --------------------------------------------------------------------------------
@@ -407,6 +407,8 @@ export component ColumnTitle inherits Text {
 
 // The titles over a track list's columns, laid out exactly as CollectionRow lays out a row.
 export component ColumnTitles inherits Rectangle {
+    // A list with no albums: the title gets the album column's room.
+    in property <bool> wide;
     property <bool> album: Ui.collection.album;
     property <length> fixed: 12px + 16px + 30px + (root.album ? 0px : 44px + 14px) + 84px + 44px + 4 * 14px;
     property <length> flex: max(0px, root.width - root.fixed);
@@ -426,13 +428,13 @@ export component ColumnTitles inherits Rectangle {
         }
 
         ColumnTitle {
-            width: root.album ? root.flex : root.flex * 0.6;
+            width: root.album || root.wide ? root.flex : root.flex * 0.6;
             text: "Title";
         }
 
         ColumnTitle {
-            width: root.album ? 0px : root.flex * 0.4;
-            text: root.album ? "" : "Album";
+            width: root.album || root.wide ? 0px : root.flex * 0.4;
+            text: root.album || root.wide ? "" : "Album";
         }
 
         ColumnTitle {
@@ -459,6 +461,8 @@ export component CollectionRow inherits Rectangle {
     callback activated();
     callback open-album();
     property <bool> album: Ui.collection.album;
+    // No album column: on albums, and in lists with no albums (uploads).
+    property <bool> wide: root.album || root.track.wide;
     // The play button and the album link have their own touch areas; the row counts as hovered
     // over them too, so nothing flickers as the mouse crosses them.
     property <bool> hovered: ta.has-hover || play-ta.has-hover || album-ta.has-hover;
@@ -586,7 +590,7 @@ export component CollectionRow inherits Rectangle {
 
         VerticalLayout {
             alignment: center;
-            width: root.album ? root.flex : root.flex * 0.6;
+            width: root.wide ? root.flex : root.flex * 0.6;
             spacing: 1px;
             HorizontalLayout {
                 spacing: 6px;
@@ -602,6 +606,7 @@ export component CollectionRow inherits Rectangle {
                 }
 
                 if root.track.explicit: ExplicitBadge { }
+                if root.track.upload: UploadBadge { }
             }
 
             if root.track.artist != "": row-artist := Text {
@@ -623,7 +628,7 @@ export component CollectionRow inherits Rectangle {
 
         // Empty and zero-width on albums.
         Rectangle {
-            width: root.album ? 0px : root.flex * 0.4;
+            width: root.wide ? 0px : root.flex * 0.4;
             album-ta := TouchArea {
                 x: 0;
                 width: min(parent.width, album-text.preferred-width);
@@ -1221,6 +1226,7 @@ export component PageView inherits Rectangle {
                 }
             }
             if row.kind == RowKind.columns: ColumnTitles {
+                wide: row.wide;
                 x: 24px;
                 width: parent.width - 48px;
             }

@@ -439,13 +439,26 @@ fn wire(ui: &AppWindow) {
         with(|a| a.go(1));
     });
     g.on_search(|q| {
-        with(|a| {
-            a.navigate(Route {
+        use music_core::yt::uploads::{Pasted, pasted};
+        // A pasted link opens what it points to.
+        let route = match pasted(&q) {
+            Some(Pasted::Video(id)) => Route {
+                kind: PageKind::Song,
+                id,
+                title: String::new(),
+            },
+            Some(Pasted::Playlist(id)) => Route {
+                kind: PageKind::Playlist,
+                id,
+                title: String::new(),
+            },
+            None => Route {
                 kind: PageKind::Search,
                 id: q.to_string(),
                 title: q.to_string(),
-            })
-        });
+            },
+        };
+        with(|a| a.navigate(route));
     });
     g.on_sign_in(|| {
         with(|a| a.sign_in());

@@ -213,10 +213,26 @@ pub fn load(client: &Client, r: &Route, hidden: &[String]) -> Result<Loaded> {
             }
         }
         PageKind::Song => song(client, &r.id)?,
-        PageKind::Search => Loaded {
-            title: Some(r.title.clone()),
-            ..search(client.search(&r.id, None)?)
-        },
+        PageKind::Search => {
+            // YouTube itself alongside, for the uploads YouTube Music leaves out; a failure
+            // there only loses those.
+            let (music, uploads) = std::thread::scope(|s| {
+                let uploads = s.spawn(|| {
+                    client.uploads(&r.id).unwrap_or_else(|e| {
+                        log::warn!("uploads search: {e}");
+                        Vec::new()
+                    })
+                });
+                (
+                    client.search(&r.id, None),
+                    uploads.join().unwrap_or_default(),
+                )
+            });
+            Loaded {
+                title: Some(r.title.clone()),
+                ..search(music?, uploads)
+            }
+        }
         PageKind::History => Loaded {
             title: Some(r.title.clone()),
             tracks: tracks_of(client.history()?.shelves.into_iter().flat_map(|s| s.items)),
@@ -426,21 +442,41 @@ fn home(f: Feed) -> Loaded {
     l
 }
 
-/// Search: the top results as cards, the songs as a list, then artists, albums, playlists and
-/// videos.
-fn search(s: SearchResults) -> Loaded {
+/// Search: the top results as cards, the songs as a list, then the uploads that score as songs
+/// (YouTube's own, and YouTube Music's), then artists, albums, playlists and videos.
+fn search(s: SearchResults, uploads: Vec<Track>) -> Loaded {
     let mut top: Vec<Item> = s.top.into_iter().collect();
-    let mut songs = Vec::new();
+    let (mut songs, mut uploaded) = (Vec::new(), Vec::new());
     let (mut artists, mut albums, mut playlists, mut videos) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for i in s.top_extra.into_iter().chain(s.items) {
         match i {
+            Item::Track(t) if t.kind == TrackKind::Song && t.upload => uploaded.push(t),
             Item::Track(t) if t.kind == TrackKind::Song => songs.push(t),
             Item::Track(_) => videos.push(i),
             Item::Artist(_) => artists.push(i),
             Item::Album(_) => albums.push(i),
             Item::Playlist(_) => playlists.push(i),
             Item::Link(_) => {}
+        }
+    }
+    // YouTube's uploads after YouTube Music's own, each video once.
+    let mut seen: std::collections::HashSet<String> = top
+        .iter()
+        .chain(&videos)
+        .filter_map(|i| match i {
+            Item::Track(t) => Some(t.video_id.clone()),
+            _ => None,
+        })
+        .chain(songs.iter().chain(&uploaded).map(|t| t.video_id.clone()))
+        .collect();
+    for t in uploads {
+        if !seen.insert(t.video_id.clone()) {
+            continue;
+        }
+        match t.kind {
+            TrackKind::Song => uploaded.push(t),
+            TrackKind::Video => videos.push(Item::Track(t)),
         }
     }
     // The best of each kind leads, after the top result.
@@ -468,6 +504,14 @@ fn search(s: SearchResults) -> Loaded {
             title: "Songs".into(),
             more: None,
             tracks: songs,
+        });
+    }
+    if !uploaded.is_empty() {
+        uploaded.truncate(12);
+        b.push(Block::Tracks {
+            title: "Songs from YouTube".into(),
+            more: None,
+            tracks: uploaded,
         });
     }
     for (title, items) in [

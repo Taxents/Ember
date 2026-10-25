@@ -76,6 +76,10 @@ pub struct Track {
     /// Saving the song to the library, when it can be (signed in).
     #[serde(default)]
     pub library: Option<Library>,
+    /// Someone's upload rather than a release: its kind is a guess from the title
+    /// ([`super::uploads`]).
+    #[serde(default)]
+    pub upload: bool,
 }
 
 /// A song's place in the library, and the tokens that change it.

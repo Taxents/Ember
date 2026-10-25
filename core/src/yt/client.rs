@@ -17,6 +17,9 @@ const API: &str = "https://music.youtube.com/youtubei/v1";
 const CLIENT_NAME: &str = "WEB_REMIX";
 const CLIENT_ID: &str = "67";
 pub const CLIENT_VERSION: &str = "1.20260707.12.00";
+/// YouTube's own search, for uploads YouTube Music leaves out.
+const WEB_SEARCH: &str = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false";
+const WEB_VERSION: &str = "2.20251020.01.00";
 /// The Android app, for timed lyrics.
 const ANDROID_VERSION: &str = "7.21.50";
 
@@ -207,6 +210,27 @@ impl Client {
             "search",
             search_body(query, filter),
             c,
+        )?))
+    }
+
+    /// The query on YouTube itself, videos only: uploads YouTube Music leaves out, each scored
+    /// as a song or a video. Always signed out (it's not this app's account to search with).
+    pub fn uploads(&self, query: &str) -> Result<Vec<Track>> {
+        let body = json!({
+            "context": {"client": {
+                "clientName": "WEB", "clientVersion": WEB_VERSION, "hl": "en",
+            }},
+            "query": query,
+            // The "Videos" type filter.
+            "params": "EgIQAQ==",
+        });
+        let headers = [
+            ("User-Agent", net::BROWSER_UA),
+            ("X-YouTube-Client-Name", "1"),
+            ("X-YouTube-Client-Version", WEB_VERSION),
+        ];
+        Ok(parse::uploads(&net::post_json(
+            WEB_SEARCH, &headers, &body,
         )?))
     }
 

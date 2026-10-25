@@ -484,9 +484,15 @@ impl App {
                         ..Default::default()
                     };
                     self.push_row(RowRef::Heading(more), RowKind::Heading, row);
+                    // Uploads have no album, and their titles run long: the title takes it all.
+                    let wide = tracks.iter().all(|t| t.album.is_none());
                     // No tracks: a heading over the grid that follows (Radio).
                     if !tracks.is_empty() {
-                        self.push_row(RowRef::Columns, RowKind::Columns, TrackRow::default());
+                        let row = TrackRow {
+                            wide,
+                            ..Default::default()
+                        };
+                        self.push_row(RowRef::Columns, RowKind::Columns, row);
                     }
                     for (n, t) in tracks.into_iter().enumerate() {
                         let mut row = self.row_for(
@@ -495,6 +501,7 @@ impl App {
                             false,
                         );
                         row.number = n as i32 + 1;
+                        row.wide = wide;
                         self.push_row(RowRef::Track(self.page_tracks.len()), RowKind::Track, row);
                         self.page_tracks.push(t);
                         self.page_groups.push(group);
@@ -667,6 +674,7 @@ impl App {
                 .unwrap_or_default()
                 .into(),
             explicit: t.explicit,
+            upload: t.upload,
             current,
             unavailable: t.unavailable,
             ..Default::default()

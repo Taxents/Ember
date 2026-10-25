@@ -130,6 +130,35 @@ fn search_songs() {
 }
 
 #[test]
+fn uploads() {
+    let ts = parse::uploads(&load("yt_search.json"));
+    assert!(ts.len() >= 15);
+    for t in &ts {
+        assert_eq!(t.video_id.len(), 11, "{t:?}");
+        assert!(
+            t.upload && !t.title.is_empty() && !t.thumbs.is_empty(),
+            "{t:?}"
+        );
+    }
+    let by_id = |id: &str| ts.iter().find(|t| t.video_id == id).unwrap();
+    // "Playboi Carti - Skeleton (Unreleased)": a song, split at the dash.
+    let s = by_id("r6Vgu5ViOMY");
+    assert_eq!(s.kind, TrackKind::Song);
+    assert_eq!(s.title, "Skeleton (Unreleased)");
+    assert_eq!(s.artists[0].name, "Playboi Carti");
+    assert_eq!(s.duration_ms, Some(184_000));
+    assert!(s.plays.unwrap() > 1_000_000);
+    // A 41-minute mix and an "(Official Music Video)" are videos, under the channel's name.
+    for id in ["kHeNrdGGvOQ", "sloMF8moHf0"] {
+        let v = by_id(id);
+        assert_eq!(v.kind, TrackKind::Video, "{v:?}");
+        assert!(v.artists[0].id.as_deref().unwrap().starts_with("UC"));
+    }
+    let songs = ts.iter().filter(|t| t.kind == TrackKind::Song).count();
+    assert!(songs >= 10 && songs < ts.len(), "{songs} of {}", ts.len());
+}
+
+#[test]
 fn suggestions() {
     let (words, items) = parse::suggestions(&load("suggestions.json"));
     assert!(!words.is_empty());
