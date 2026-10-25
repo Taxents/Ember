@@ -392,6 +392,19 @@ export component NowPlayingBar inherits Rectangle {
         }
 
         Rectangle {
+            width: 32px;
+            IconButton {
+                icon: "expand";
+                tooltip: "Full screen (F11)";
+                enabled: Ui.np.active;
+                icon-size: 17px;
+                clicked => {
+                    Ui.stage-toggle();
+                }
+            }
+        }
+
+        Rectangle {
             width: 2px;
         }
 

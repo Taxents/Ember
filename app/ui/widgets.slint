@@ -68,6 +68,9 @@ export component Icon inherits Path {
         : name == "close" ? "M 6.5 6.5 L 17.5 17.5 M 17.5 6.5 L 6.5 17.5"
         : name == "user" ? "M 12 4 A 4 4 0 1 0 12 12 A 4 4 0 1 0 12 4 Z M 4 21 A 8 8 0 0 1 20 21"
         : name == "handle" ? "M 6 9 L 18 9 M 6 15 L 18 15"
+        : name == "expand" ? "M 4 9 L 4 4 L 9 4 M 15 4 L 20 4 L 20 9 M 20 15 L 20 20 L 15 20 M 9 20 L 4 20 L 4 15"
+        : name == "collapse" ? "M 9 4 L 9 9 L 4 9 M 15 4 L 15 9 L 20 9 M 20 15 L 15 15 L 15 20 M 9 20 L 9 15 L 4 15"
+        : name == "display" ? "M 3 5 L 21 5 L 21 16 L 3 16 Z M 8 20 L 16 20 M 12 16 L 12 20"
         : "";
 }
 
@@ -78,6 +81,8 @@ export component IconButton inherits Rectangle {
     in property <string> icon;
     in property <bool> active;
     in property <bool> enabled: true;
+    // The lit colour (active, and the focus ring): amber, or the stage's colour from the cover.
+    in property <color> accent: Theme.amber;
     in property <length> size: 32px;
     in property <length> icon-size: 18px;
     in property <string> tooltip;
@@ -126,14 +131,14 @@ export component IconButton inherits Rectangle {
     if fs.has-focus: Rectangle {
         border-radius: root.border-radius;
         border-width: 2px;
-        border-color: Theme.amber;
+        border-color: root.accent;
     }
 
     Icon {
         name: root.icon;
         width: root.icon-size;
         height: root.icon-size;
-        color: root.active ? Theme.amber : ta.has-hover && root.enabled ? Theme.ivory : Theme.beige;
+        color: root.active ? root.accent : ta.has-hover && root.enabled ? Theme.ivory : Theme.beige;
     }
 
     // The name, after a moment's hover.
@@ -350,8 +355,8 @@ export component Art inherits Rectangle {
     }
 }
 
-// The playing song's mark in a track list: four bars following the music, bass on the left,
-// treble on the right (`levels`, 0..1). They rest low while paused.
+// The playing song's mark in a track list (and, larger, on the stage): four bars following the
+// music, bass on the left, treble on the right (`levels`, 0..1). They rest low while paused.
 export component MiniVisualizer inherits Rectangle {
     in property <bool> playing;
     in property <[float]> levels;
@@ -360,11 +365,11 @@ export component MiniVisualizer inherits Rectangle {
     height: 14px;
     for i in 4: Rectangle {
         property <float> level: root.playing ? 0.15 + 0.85 * root.levels[i] : [0.35, 0.6, 0.45, 0.3][i];
-        x: i * 3.5px;
-        width: 2.5px;
+        x: i * root.width / 4;
+        width: root.width * 0.18;
         height: max(2px, root.height * self.level);
         y: root.height - self.height;
-        border-radius: 1px;
+        border-radius: root.width / 14;
         background: root.bar-color;
         // Not animated: the levels already come smoothed ~30 times a second, and easing each
         // step would keep an animation running, redrawing the whole window every frame.

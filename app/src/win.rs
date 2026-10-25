@@ -25,7 +25,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, HICON, ICONINFO, IsIconic, RegisterWindowMessageW, SIZE_MAXIMIZED,
-    SIZE_MINIMIZED, SIZE_RESTORED, WM_COMMAND, WM_SIZE, WM_XBUTTONUP,
+    SIZE_MINIMIZED, SIZE_RESTORED, SPI_SETWORKAREA, WM_COMMAND, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_SETTINGCHANGE, WM_SIZE, WM_WINDOWPOSCHANGED, WM_XBUTTONUP,
 };
 use windows::core::{HSTRING, w};
 
@@ -44,6 +45,8 @@ pub enum Remote {
     Forward,
     /// The media flyout's seek bar was moved, to this many ms.
     Seek(u64),
+    /// On the stage: the window moved, or the displays or their work areas changed.
+    Displays,
 }
 
 /// Draw at the display's real resolution instead of letting Windows stretch a 96-DPI bitmap.
@@ -181,6 +184,18 @@ unsafe extern "system" fn subclass(
         },
         m if m != 0 && m == CREATED_MSG.load(std::sync::atomic::Ordering::Relaxed) => {
             add_buttons(hwnd)
+        }
+        // The stage keeps to its display's work area: told when that may have changed.
+        WM_DISPLAYCHANGE | WM_DPICHANGED | WM_WINDOWPOSCHANGED
+            if STAGED.load(std::sync::atomic::Ordering::Relaxed) =>
+        {
+            emit(Remote::Displays)
+        }
+        WM_SETTINGCHANGE
+            if wp.0 as u32 == SPI_SETWORKAREA.0
+                && STAGED.load(std::sync::atomic::Ordering::Relaxed) =>
+        {
+            emit(Remote::Displays)
         }
         _ => {}
     }
@@ -558,4 +573,196 @@ pub fn place(hwnd: HWND, x: i32, y: i32, w: i32, h: i32, maximized: bool) {
             let _ = ShowWindow(hwnd, SW_MAXIMIZE);
         }
     }
+}
+
+// ---- the stage ---------------------------------------------------------------------------------
+
+/// The window is the stage (borderless over a display's work area).
+static STAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A display: its device name (stable while it's connected) and its work area, the screen
+/// without the taskbar, in screen pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Display {
+    pub name: String,
+    pub work: windows::Win32::Foundation::RECT,
+    /// How many times a second it refreshes.
+    pub hz: u32,
+}
+
+fn display_of(m: windows::Win32::Graphics::Gdi::HMONITOR) -> Option<Display> {
+    use windows::Win32::Graphics::Gdi::{
+        DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, MONITORINFO,
+        MONITORINFOEXW,
+    };
+    let mut mi = MONITORINFOEXW::default();
+    mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    if !unsafe { GetMonitorInfoW(m, &mut mi as *mut _ as *mut MONITORINFO) }.as_bool() {
+        return None;
+    }
+    let n = mi
+        .szDevice
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(mi.szDevice.len());
+    let mut dm = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+        ..Default::default()
+    };
+    let read = unsafe {
+        EnumDisplaySettingsW(
+            windows::core::PCWSTR(mi.szDevice.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &mut dm,
+        )
+    };
+    // 0 and 1 mean the hardware's default rate.
+    let hz = if read.as_bool() && dm.dmDisplayFrequency > 1 {
+        dm.dmDisplayFrequency
+    } else {
+        60
+    };
+    Some(Display {
+        name: String::from_utf16_lossy(&mi.szDevice[..n]),
+        work: mi.monitorInfo.rcWork,
+        hz,
+    })
+}
+
+/// Every display, left to right.
+pub fn displays() -> Vec<Display> {
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
+    use windows::core::BOOL;
+    unsafe extern "system" fn each(m: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
+        let v = unsafe { &mut *(data.0 as *mut Vec<Display>) };
+        v.extend(display_of(m));
+        true.into()
+    }
+    let mut v: Vec<Display> = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(None, None, Some(each), LPARAM(&mut v as *mut _ as isize));
+    }
+    v.sort_by_key(|d| (d.work.left, d.work.top));
+    v
+}
+
+/// The display the window is (mostly) on.
+pub fn display_of_window(hwnd: HWND) -> Option<Display> {
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+    display_of(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })
+}
+
+/// How the window was before it became the stage.
+pub struct Windowed {
+    style: isize,
+    place: windows::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT,
+}
+
+/// Makes the window the stage: no frame or rounded corners, covering `work` (a display's work
+/// area, so the taskbar stays). Not exclusive full screen: other windows and the taskbar work as
+/// usual. Returns what [`leave_stage`] puts back.
+pub fn enter_stage(hwnd: HWND, work: windows::Win32::Foundation::RECT) -> Option<Windowed> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_STYLE, GetWindowLongPtrW, GetWindowPlacement, SW_SHOWNORMAL, SetWindowLongPtrW,
+        SetWindowPlacement, WINDOWPLACEMENT, WS_CAPTION, WS_MAXIMIZEBOX, WS_THICKFRAME,
+    };
+    let mut place = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetWindowPlacement(hwnd, &mut place) }.ok()?;
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
+    unsafe {
+        // Out of maximized (or minimized) first, in one step: no restore animation.
+        if place.showCmd != SW_SHOWNORMAL.0 as u32 {
+            let mut normal = place;
+            normal.showCmd = SW_SHOWNORMAL.0 as u32;
+            let _ = SetWindowPlacement(hwnd, &normal);
+        }
+        let frame = (WS_CAPTION | WS_THICKFRAME | WS_MAXIMIZEBOX).0 as isize;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style & !frame);
+    }
+    corners(hwnd, false);
+    STAGED.store(true, std::sync::atomic::Ordering::Relaxed);
+    fit_stage(hwnd, work);
+    Some(Windowed { style, place })
+}
+
+/// Puts the stage over `work` (another display's, or the same one changed).
+pub fn fit_stage(hwnd: HWND, work: windows::Win32::Foundation::RECT) {
+    use windows::Win32::UI::WindowsAndMessaging::{SWP_FRAMECHANGED, SWP_NOZORDER, SetWindowPos};
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            work.left,
+            work.top,
+            work.right - work.left,
+            work.bottom - work.top,
+            SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+    }
+}
+
+/// The window's rectangle on screen.
+pub fn window_rect(hwnd: HWND) -> Option<windows::Win32::Foundation::RECT> {
+    let mut r = Default::default();
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut r) }.ok()?;
+    Some(r)
+}
+
+/// The window as it was before [`enter_stage`]: frame, corners, place and size, maximized or not.
+pub fn leave_stage(hwnd: HWND, w: &Windowed) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_STYLE, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW,
+        SetWindowPlacement, SetWindowPos, WS_MAXIMIZE, WS_MINIMIZE,
+    };
+    STAGED.store(false, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        SetWindowLongPtrW(
+            hwnd,
+            GWL_STYLE,
+            w.style & !((WS_MAXIMIZE | WS_MINIMIZE).0 as isize),
+        );
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+        let _ = SetWindowPlacement(hwnd, &w.place);
+    }
+    corners(hwnd, true);
+}
+
+/// Windows 11's rounded corners and hairline border: on (windowed) or off (the stage).
+fn corners(hwnd: HWND, on: bool) {
+    // DWMWA_WINDOW_CORNER_PREFERENCE (default / don't round), DWMWA_BORDER_COLOR (default / none).
+    let corner: i32 = if on { 0 } else { 1 };
+    let border: u32 = if on { 0xFFFF_FFFF } else { 0xFFFF_FFFE };
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE(33), &corner as *const _ as _, 4);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE(34), &border as *const _ as _, 4);
+    }
+}
+
+/// Windows' "Animation effects" is off (Settings › Accessibility › Visual effects).
+pub fn reduced_motion() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    let mut on = windows::core::BOOL(1);
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut on as *mut _ as _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    ok.is_ok() && !on.as_bool()
 }

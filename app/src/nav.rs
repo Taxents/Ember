@@ -1232,6 +1232,7 @@ impl App {
             np.art = img.clone();
             g.set_np(np);
         }
+        self.stage_image(&url, &img);
         if let Some(h) = &self.header {
             let mut c = g.get_collection();
             let (cover, banner) = if h.wide {

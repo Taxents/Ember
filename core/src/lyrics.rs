@@ -39,6 +39,11 @@ pub struct Line {
     pub agent: u8,
     /// Background vocals, shown smaller under the line they belong to.
     pub background: bool,
+    /// The line in another language, and spelled in Latin letters, when the source has them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub translation: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub roman: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -521,7 +526,8 @@ fn stamp_ms(s: &str) -> Option<u64> {
 
 /// A minimal TTML reader for lyrics: `<p begin end ttm:agent>` lines, `<span begin end>` words
 /// or syllables (a space between spans ends a word), `ttm:role="x-bg"` background vocals, and
-/// the head's `ttm:agent`s for duets. Translations and romanisations are skipped.
+/// the head's `ttm:agent`s for duets. Inline translations and romanisations (`x-translation`,
+/// `x-roman` spans) are kept beside the line, not in it.
 pub fn parse_ttml(s: &str) -> Lyrics {
     let mut agents: Vec<(String, u8)> = Vec::new();
     let mut persons = 0u8;
@@ -532,8 +538,9 @@ pub fn parse_ttml(s: &str) -> Lyrics {
     let mut in_p = false;
     let mut main = Line::default();
     let mut bg = Line::default();
-    // Open spans, innermost last: (is background, is skipped, has its own time).
-    let mut spans: Vec<(bool, bool, bool)> = Vec::new();
+    // Open spans, innermost last: (is background, is skipped, has its own time, kept beside
+    // the line: 1 a translation, 2 a romanisation).
+    let mut spans: Vec<(bool, bool, bool, u8)> = Vec::new();
     let mut p_time = (0u64, 0u64);
 
     for tok in xml_tokens(s) {
@@ -578,11 +585,17 @@ pub fn parse_ttml(s: &str) -> Lyrics {
                 }
                 "span" if in_p && !closed => {
                     let role = attr(&attrs, "ttm:role").unwrap_or("");
-                    let (pbg, pskip) = spans.last().map_or((false, false), |s| (s.0, s.1));
+                    let (pbg, pskip, pside) =
+                        spans.last().map_or((false, false, 0), |s| (s.0, s.1, s.3));
                     let timed = attr(&attrs, "begin").is_some();
                     let is_bg = pbg || role == "x-bg";
-                    let skip = pskip || role == "x-translation" || role == "x-roman";
-                    spans.push((is_bg, skip, timed));
+                    let side = match role {
+                        "x-translation" => 1,
+                        "x-roman" => 2,
+                        _ => pside,
+                    };
+                    let skip = pskip || side != 0;
+                    spans.push((is_bg, skip, timed, side));
                     if timed && !skip {
                         word_timed = true;
                         let target = if is_bg { &mut bg } else { &mut main };
@@ -609,6 +622,8 @@ pub fn parse_ttml(s: &str) -> Lyrics {
                         if l.words.is_empty() {
                             continue;
                         }
+                        l.translation = l.translation.trim().to_string();
+                        l.roman = l.roman.trim().to_string();
                         if l.background {
                             l.start = l.words.iter().map(|w| w.start).min().unwrap_or(0);
                             l.end = l.words.iter().map(|w| w.end).max().unwrap_or(0);
@@ -619,12 +634,19 @@ pub fn parse_ttml(s: &str) -> Lyrics {
                 _ => {}
             },
             Tok::Text(t) if in_p => {
-                let (is_bg, skip, timed) = spans.last().copied().unwrap_or((false, false, false));
-                if skip {
-                    continue;
-                }
+                let (is_bg, skip, timed, side) =
+                    spans.last().copied().unwrap_or((false, false, false, 0));
                 let text = unescape(t);
                 let target = if is_bg { &mut bg } else { &mut main };
+                if skip {
+                    let beside = match side {
+                        1 => &mut target.translation,
+                        2 => &mut target.roman,
+                        _ => continue,
+                    };
+                    *beside += &collapse(&text);
+                    continue;
+                }
                 if timed {
                     // A timed span's own text.
                     if let Some(w) = target.words.last_mut() {
@@ -927,6 +949,8 @@ mod tests {
         );
         let w: Vec<_> = l.lines[0].words.iter().map(|w| w.text.as_str()).collect();
         assert_eq!(w, ["Now ", "es", "press", "o"]);
+        assert_eq!(l.lines[3].translation, "Tous");
+        assert_eq!(l.lines[0].translation, "");
     }
 
     #[test]

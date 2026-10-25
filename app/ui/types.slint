@@ -63,6 +63,65 @@ export struct LyricLine {
     gap: int,
 }
 
+// A piece of a stage word, sung from `start` to `end` (ms).
+export struct StageSyl {
+    text: string,
+    start: int,
+    end: int,
+}
+
+// A word on the stage, sung from `start` to `end` (ms). `space`: a gap follows it (not between
+// the characters of Chinese or Japanese, which run on).
+export struct StageWord {
+    text: string,
+    start: int,
+    end: int,
+    space: bool,
+    // Its pieces as the source timed them (syllables; letters, for a held word), each filling
+    // in its own time.
+    syls: [StageSyl],
+    // Held long enough to swell as it's sung.
+    held: bool,
+}
+
+// A line of the stage's lyrics: its words, when it's sung (`start` -1 when not synced), and what
+// goes with it. `group` is the main line a background line belongs to.
+export struct StageLine {
+    words: [StageWord],
+    start: int,
+    end: int,
+    group: int,
+    agent: int,
+    background: bool,
+    translation: string,
+    roman: string,
+}
+
+// How the stage looks for the song playing: its atmosphere (two slots, so a new one fades in
+// over the old), its light colours, and which way the room is lit (`layout` 0..3).
+export struct StageLook {
+    back-a: image,
+    back-b: image,
+    slot: int,
+    key: color,
+    fill: color,
+    accent: color,
+    deep: color,
+    layout: int,
+}
+
+// The music as light, ~30 times a second while playing (0..1 each): `bloom` slow and deep (the
+// bass), `body` the midrange, `air` the treble, `pulse` a beat landing, `energy` how lively the
+// song has been lately, and `phase` the slow drift of the lights (seconds of motion).
+export struct StageLight {
+    bloom: float,
+    body: float,
+    air: float,
+    pulse: float,
+    energy: float,
+    phase: float,
+}
+
 // "Written by" and who.
 export struct InfoLine {
     label: string,
@@ -388,6 +447,27 @@ export global Ui {
     callback autoplay-chip(int);
     callback radio-from-current(); // drop the playlist or album, keep the song, radio after it
     callback queue-move(int, int);
+
+    // The stage: the playing song filling a screen (its work area, the taskbar still showing),
+    // lyrics word by word over light from its artwork. `stage-toggle` asks Rust to open or close
+    // it; Rust sets `stage-open`. `stage-ms` is the position the lyrics follow.
+    in property <bool> stage-open;
+    callback stage-toggle();
+    // More than one display: the stage can move to the next.
+    in property <bool> stage-displays;
+    callback stage-next-display();
+    in property <[StageLine]> stage-lines;
+    // The lyrics are timed word by word (else line by line, and lines light as a whole).
+    in property <bool> stage-word-timed;
+    in property <int> stage-ms;
+    in property <image> stage-art;
+    in property <StageLook> stage-look;
+    in property <StageLight> stage-light;
+    // A soft white disc (the lights), a grain tile (over the light, against banding).
+    in property <image> stage-glow;
+    in property <image> stage-grain;
+    // Windows' "Animation effects" is off: the room holds still.
+    in property <bool> reduced-motion;
 
     // Equalizer
     in-out property <bool> eq-open;

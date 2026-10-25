@@ -5,19 +5,21 @@
 //! 30 times a second while the lyrics are on screen: words already sung in the accent, the word
 //! being sung filling left to right a character at a time, the rest in faded ivory.
 
-use crate::LyricLine;
+use crate::{LyricLine, StageLine, StageSyl, StageWord};
 use music_core::lyrics::{self, Line, Lyrics};
-use slint::{Color, Model, StyledText, VecModel};
+use slint::{Color, Model, ModelRc, StyledText, VecModel};
 use std::rc::Rc;
 
 /// Lines and words start this much early, so they land with the voice.
-const LEAD_MS: u64 = 150;
+pub(crate) const LEAD_MS: u64 = 150;
 
 /// The playing song's lyrics as shown, and where the singing is.
 pub struct Follow {
     pub id: String,
     pub lyrics: Lyrics,
     pub model: Rc<VecModel<LyricLine>>,
+    /// The same lines for the stage, word by word.
+    pub stage: Rc<VecModel<StageLine>>,
     /// The main line being sung (its row), -1 before the first or when not synced.
     pub line: i32,
     /// Rows drawn with a live fill, and the markup each has now.
@@ -31,10 +33,12 @@ pub struct Follow {
 impl Follow {
     pub fn new(id: String, lyrics: Lyrics) -> Self {
         let model = Rc::new(VecModel::from(rows(&lyrics)));
+        let stage = Rc::new(VecModel::from(stage_rows(&lyrics)));
         Follow {
             id,
             lyrics,
             model,
+            stage,
             line: -1,
             filled: Vec::new(),
             pause: None,
@@ -154,6 +158,128 @@ pub fn rows(l: &Lyrics) -> Vec<LyricLine> {
             }
         })
         .collect()
+}
+
+/// The stage's lines. Syllables are joined into words (a line wraps only between words);
+/// Chinese and Japanese pieces stay apart, with no gap after them, as they run on and wrap
+/// anywhere. Unsynced lyrics are a line of text each, untimed.
+pub fn stage_rows(l: &Lyrics) -> Vec<StageLine> {
+    let mut group = 0;
+    l.lines
+        .iter()
+        .enumerate()
+        .map(|(i, x)| {
+            if !x.background {
+                group = i;
+            }
+            let words: Vec<StageWord> = if l.synced() {
+                stage_words(x)
+            } else {
+                vec![StageWord {
+                    text: x.text().into(),
+                    start: -1,
+                    end: -1,
+                    space: false,
+                    syls: ModelRc::new(VecModel::from(vec![StageSyl {
+                        text: x.text().into(),
+                        start: -1,
+                        end: -1,
+                    }])),
+                    held: false,
+                }]
+            };
+            StageLine {
+                words: ModelRc::new(VecModel::from(words)),
+                start: if l.synced() { x.start as i32 } else { -1 },
+                end: if l.synced() { x.end as i32 } else { -1 },
+                group: group as i32,
+                agent: x.agent as i32,
+                background: x.background,
+                translation: x.translation.as_str().into(),
+                roman: x.roman.as_str().into(),
+            }
+        })
+        .collect()
+}
+
+/// A word held at least this long (ms) swells as it's sung, its letters lifting one by one.
+const HELD_MS: u64 = 1000;
+
+fn stage_words(line: &Line) -> Vec<StageWord> {
+    let ms = |t: u64| t.min(i32::MAX as u64) as i32;
+    let mut out: Vec<StageWord> = Vec::new();
+    // The word being joined: its syllables (text, start, end).
+    let mut open: Vec<(String, u64, u64)> = Vec::new();
+    for (k, w) in line.words.iter().enumerate() {
+        open.push((w.text.clone(), w.start, w.end.max(w.start)));
+        let last = k + 1 == line.words.len();
+        let cjk = w.text.chars().any(runs_on);
+        if !(w.text.ends_with(char::is_whitespace) || cjk || last) {
+            continue;
+        }
+        let syls = std::mem::take(&mut open);
+        let text: String = syls.iter().map(|s| s.0.as_str()).collect();
+        let word = text.trim();
+        if word.is_empty() {
+            continue;
+        }
+        let start = syls[0].1;
+        let end = syls.iter().map(|s| s.2).max().unwrap_or(start);
+        let held = !cjk && end - start >= HELD_MS && word.chars().count() <= 14;
+        // Trimmed like the word: the first piece's leading space, the last's trailing one.
+        let n = syls.len();
+        let mut pieces: Vec<StageSyl> = Vec::new();
+        for (i, (t, s, e)) in syls.into_iter().enumerate() {
+            let mut t = t.as_str();
+            if i == 0 {
+                t = t.trim_start();
+            }
+            if i + 1 == n {
+                t = t.trim_end();
+            }
+            if t.is_empty() {
+                continue;
+            }
+            if held {
+                // Letters, sharing the syllable's time, so a held vowel ripples through.
+                let c = t.chars().count() as u64;
+                for (j, ch) in t.chars().enumerate() {
+                    let j = j as u64;
+                    pieces.push(StageSyl {
+                        text: ch.to_string().into(),
+                        start: ms(s + (e - s) * j / c),
+                        end: ms(s + (e - s) * (j + 1) / c),
+                    });
+                }
+            } else {
+                pieces.push(StageSyl {
+                    text: t.into(),
+                    start: ms(s),
+                    end: ms(e),
+                });
+            }
+        }
+        out.push(StageWord {
+            text: word.into(),
+            start: ms(start),
+            end: ms(end),
+            space: !cjk || text.ends_with(char::is_whitespace),
+            syls: ModelRc::new(VecModel::from(pieces)),
+            held,
+        });
+    }
+    out
+}
+
+/// Writing that runs on without spaces between words (Chinese, Japanese).
+fn runs_on(c: char) -> bool {
+    matches!(c as u32, 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
+}
+
+/// The stage fills the words one by one: as the source timed them, or as estimated from the
+/// line's time (as the panel does).
+pub fn word_timed(l: &Lyrics) -> bool {
+    l.synced()
 }
 
 fn styled(markup: &str, text: &str) -> StyledText {
@@ -291,6 +417,55 @@ mod tests {
         assert_eq!(pause_at(&lines, 0, 11000), None);
         assert_eq!(pause_at(&lines, 1, 12100), None);
         assert_eq!(pause_at(&lines, 1, 16000).map(|p| p.0), Some(2));
+    }
+
+    #[test]
+    fn stage_joins_syllables_into_words() {
+        let line = Line {
+            start: 0,
+            end: 2000,
+            words: vec![
+                word(0, 500, "That's "),
+                word(500, 1000, "es"),
+                word(1000, 1500, "press"),
+                word(1500, 2000, "o!"),
+            ],
+            ..Default::default()
+        };
+        let words = stage_words(&line);
+        let w: Vec<_> = words
+            .iter()
+            .map(|w| (w.text.to_string(), w.start, w.end))
+            .collect();
+        assert_eq!(
+            w,
+            [("That's".into(), 0, 500), ("espresso!".into(), 500, 2000)]
+        );
+        // A short word keeps its one piece; the held one comes apart into timed letters.
+        assert!(!words[0].held);
+        assert_eq!(words[0].syls.row_count(), 1);
+        assert_eq!(words[0].syls.row_data(0).unwrap().text, "That's");
+        assert!(words[1].held);
+        let letters: Vec<_> = words[1]
+            .syls
+            .iter()
+            .map(|s| (s.text.to_string(), s.start))
+            .collect();
+        assert_eq!(letters.len(), 9);
+        assert_eq!(letters[0], ("e".into(), 500));
+        assert_eq!(letters[1], ("s".into(), 750));
+        assert_eq!(letters[2], ("p".into(), 1000));
+        let jp = Line {
+            words: vec![
+                word(0, 300, "夜"),
+                word(300, 600, "空"),
+                word(600, 900, "go"),
+            ],
+            ..Default::default()
+        };
+        let w = stage_words(&jp);
+        assert_eq!(w.len(), 3);
+        assert!(!w[0].space);
     }
 
     #[test]

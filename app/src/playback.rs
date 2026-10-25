@@ -774,6 +774,7 @@ impl App {
         };
         g.set_np(np);
         self.reported_playing = None;
+        self.stage_song();
         if let Some(m) = &self.media {
             let art_url = images::url_for(&t.thumbs, 300);
             let album = t.album.as_ref().map(|a| a.name.as_str()).unwrap_or("");
@@ -799,7 +800,8 @@ impl App {
         if !self.meter_timer.running() {
             return; // `tick` stopped it
         }
-        let write = drew || self.meter_ticks.is_multiple_of(2);
+        // Drawing every refresh, the stage shows the bars itself.
+        let write = (drew || self.meter_ticks.is_multiple_of(2)) && !self.stage_drawing();
         let raw = self.player.engine.levels();
         for (i, (peak, shown)) in self.meter.iter_mut().enumerate() {
             let v = raw[i];
@@ -813,6 +815,7 @@ impl App {
                 self.levels.set_row_data(i, *shown);
             }
         }
+        self.stage_meter(raw);
     }
 
     /// Fetches the playing song's lyrics for the panel, and lets a song page of it follow along.
@@ -835,6 +838,7 @@ impl App {
         let ui = self.ui();
         let g = ui.global::<Ui>();
         g.set_lyrics(ModelRc::default());
+        g.set_stage_lines(ModelRc::default());
         g.set_lyric_line(-1);
         g.set_lyric_pause_row(-1);
         g.set_lyrics_missing(false);
@@ -857,6 +861,8 @@ impl App {
                         Some(l) => {
                             let f = lyric_view::Follow::new(id, l);
                             g.set_lyrics(ModelRc::from(f.model.clone()));
+                            g.set_stage_lines(ModelRc::from(f.stage.clone()));
+                            g.set_stage_word_timed(lyric_view::word_timed(&f.lyrics));
                             g.set_lyrics_note(SharedString::default());
                             a.lyrics = Some(f);
                             a.lyrics_tick();
@@ -885,7 +891,7 @@ impl App {
     pub(crate) fn lyrics_wanted(&self) -> bool {
         let ui = self.ui();
         let g = ui.global::<Ui>();
-        self.lyrics_opened || (g.get_panel_open() && g.get_panel_tab() == 0)
+        self.lyrics_opened || (g.get_panel_open() && g.get_panel_tab() == 0) || g.get_stage_open()
     }
 
     /// Nothing known about the playing song's lyrics (they weren't asked for).
@@ -894,6 +900,7 @@ impl App {
         let ui = self.ui();
         let g = ui.global::<Ui>();
         g.set_lyrics(ModelRc::default());
+        g.set_stage_lines(ModelRc::default());
         g.set_lyric_line(-1);
         g.set_lyric_pause_row(-1);
         g.set_lyrics_missing(false);
@@ -917,6 +924,7 @@ impl App {
         };
         let ui = self.ui();
         let g = ui.global::<Ui>();
+        let drawing = self.stage_drawing();
         let Some(f) = self.lyrics.as_mut() else {
             return false;
         };
@@ -926,6 +934,9 @@ impl App {
         let (sung, todo) = (theme.get_amber(), theme.get_ivory().with_alpha(0.5));
         if let Some(line) = f.at(p.ms, visible, sung, todo) {
             g.set_lyric_line(line);
+        }
+        if g.get_stage_open() && !drawing {
+            g.set_stage_ms((p.ms + lyric_view::LEAD_MS).min(i32::MAX as u64) as i32);
         }
         let (row, through) = f.pause.map_or((-1, 0.0), |(r, k)| (r as i32, k));
         let drew = f.drew;
@@ -1022,6 +1033,7 @@ impl App {
                 });
         } else if !want && self.meter_timer.running() {
             self.meter_timer.stop();
+            self.stage_hold();
         }
     }
 
@@ -1046,14 +1058,17 @@ impl App {
             Remote::Minimized => self.minimize(),
             Remote::Restored => self.restore(),
             Remote::Seek(ms) => self.seek(ms),
+            Remote::Displays => self.stage_displays_changed(),
         }
     }
 }
 
 /// Lyrics for song `id` are showing: the panel's lyrics tab, or that song's page.
 fn lyrics_on_screen(g: &Ui, page: &PageState, id: &str) -> bool {
-    (g.get_panel_open() && g.get_panel_tab() == 0)
-        || (page.kind == PageKind::Song && page.id.as_str() == id)
+    // The stage draws its own lyrics, over (and instead of) the window's.
+    !g.get_stage_open()
+        && ((g.get_panel_open() && g.get_panel_tab() == 0)
+            || (page.kind == PageKind::Song && page.id.as_str() == id))
 }
 
 /// How much of a song must be heard for it to count as played: 30 s, or nearly the whole of a

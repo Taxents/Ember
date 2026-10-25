@@ -12,9 +12,11 @@ import { NowPlayingBar } from "player.slint";
 import { LyricRow, PageView } from "pages/page.slint";
 import { SettingsPage } from "pages/settings.slint";
 import { StatusPage } from "pages/status.slint";
+import { Stage } from "stage.slint";
 
 export { Theme }
 export { PageKind, RowKind, LyricLine, InfoLine, Card, SidebarPlaylist, TrackRow, MenuEntry, Collection, NowPlaying, PageState, Ui }
+export { StageWord, StageSyl, StageLine, StageLook, StageLight } from "types.slint";
 
 // ---- sidebar --------------------------------------------------------------------------------
 
@@ -1951,6 +1953,17 @@ export component AppWindow inherits Window {
     init => {
         Palette.color-scheme = ColorScheme.dark;
     }
+    // The shortcuts have the keys from the start (see `attach_window`).
+    public function focus-keys() {
+        keys.focus();
+    }
+    // On the stage, the keys go to the shortcuts, not a field left focused under it.
+    property <bool> staged: Ui.stage-open;
+    changed staged => {
+        if self.staged {
+            keys.focus();
+        }
+    }
     property <length> sidebar-w: Ui.sidebar-collapsed ? 60px : 228px;
     property <length> panel-w: Ui.panel-open ? 340px : 0px;
     animate sidebar-w { duration: 200ms; easing: ease-out; }
@@ -1967,8 +1980,27 @@ export component AppWindow inherits Window {
     }
 
     keys := FocusScope {
+        // The stage's keys come first, whatever has focus (a field that would take Esc for
+        // itself, say): F11 opens and closes it, Esc leaves it.
+        capture-key-pressed(e) => {
+            if (e.text == Key.F11) {
+                if Ui.stage-open || Ui.np.active {
+                    Ui.stage-toggle();
+                }
+                return accept;
+            }
+            if (Ui.stage-open && e.text == Key.Escape && !Ui.menu-open) {
+                Ui.stage-toggle();
+                return accept;
+            }
+            reject
+        }
         key-pressed(e) => {
-            if (e.modifiers.control && (e.text == "f" || e.text == "F")) {
+            // Any key brings up the stage's controls.
+            if (Ui.stage-open) {
+                stage.wake();
+            }
+            if (e.modifiers.control && (e.text == "f" || e.text == "F") && !Ui.stage-open) {
                 if (Ui.sidebar-collapsed) {
                     Ui.sidebar-collapsed = false;
                     Ui.sidebar-changed();
@@ -2043,7 +2075,7 @@ export component AppWindow inherits Window {
                 return accept;
             }
             // Ctrl+L opens the lyrics, or closes them when they're showing.
-            if (e.modifiers.control && (e.text == "l" || e.text == "L")) {
+            if (e.modifiers.control && (e.text == "l" || e.text == "L") && !Ui.stage-open) {
                 if (Ui.panel-open && Ui.panel-tab == 0) {
                     Ui.panel-open = false;
                 } else {
@@ -2057,6 +2089,8 @@ export component AppWindow inherits Window {
         }
 
         sidebar := Sidebar {
+            // Under the stage nothing of the window is drawn.
+            visible: !Ui.stage-open;
             searched => {
                 keys.focus();
             }
@@ -2072,6 +2106,7 @@ export component AppWindow inherits Window {
             y: 0;
             width: parent.width - sidebar-w - panel-w;
             height: parent.height - bar.height;
+            visible: !Ui.stage-open;
             property <bool> settings: Ui.page.kind == PageKind.settings;
             property <bool> has-rows: Ui.page-count > 0 && !self.settings;
             if has-rows: PageView { }
@@ -2089,6 +2124,7 @@ export component AppWindow inherits Window {
         }
 
         if panel-w > 0: RightPanel {
+            visible: !Ui.stage-open;
             x: parent.width - panel-w;
             y: 0;
             width: 340px;
@@ -2096,12 +2132,17 @@ export component AppWindow inherits Window {
         }
 
         bar := NowPlayingBar {
+            visible: !Ui.stage-open;
             y: parent.height - self.height;
         }
 
+        stage := Stage {
+            visible: Ui.stage-open;
+        }
+
         if Ui.toast-text != "": ToastView {
-            x: sidebar-w + (parent.width - sidebar-w - panel-w - self.width) / 2;
-            y: parent.height - bar.height - self.height - 16px;
+            x: Ui.stage-open ? (parent.width - self.width) / 2 : sidebar-w + (parent.width - sidebar-w - panel-w - self.width) / 2;
+            y: Ui.stage-open ? 24px : parent.height - bar.height - self.height - 16px;
         }
 
         if Ui.eq-open: TouchArea {

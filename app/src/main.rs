@@ -19,6 +19,7 @@ mod queue_view;
 mod radio;
 mod rows;
 mod settings;
+mod stage;
 mod stats;
 mod suggest;
 mod toast;
@@ -281,6 +282,8 @@ struct App {
     /// A request failed on the network; `offline_timer` checks until one gets through.
     offline: bool,
     offline_timer: Timer,
+    /// The stage (the song full screen), and what it needs while it's up.
+    stage: stage::Stage,
 }
 
 thread_local! {
@@ -402,6 +405,7 @@ fn main() {
         lyrics_opened: false,
         offline: false,
         offline_timer: Timer::default(),
+        stage: Default::default(),
     };
     APP.with(|a| *a.borrow_mut() = Some(app));
 
@@ -788,6 +792,12 @@ fn wire(ui: &AppWindow) {
             }
         });
     });
+    g.on_stage_toggle(|| {
+        with(|a| a.stage_toggle());
+    });
+    g.on_stage_next_display(|| {
+        with(|a| a.stage_next_display());
+    });
     g.on_sidebar_changed(|| {
         with(|a| {
             a.settings.sidebar_collapsed = a.ui().global::<Ui>().get_sidebar_collapsed();
@@ -903,6 +913,9 @@ impl App {
     fn attach_window(&mut self) {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let ui = self.ui();
+        // The shortcuts (F11 and the rest) have the keys from the start; focus given before the
+        // window existed doesn't hold.
+        ui.invoke_focus_keys();
         let handle = ui.window().window_handle();
         let Ok(h) = handle.window_handle() else {
             return;
@@ -931,6 +944,8 @@ impl App {
     }
 
     fn shutdown(&mut self) {
+        // Back to the window first: its place is what's remembered.
+        self.stage_close();
         self.finish_hearing();
         // A change waiting on its toast's Undo goes through.
         self.close_toast();

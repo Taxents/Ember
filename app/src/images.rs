@@ -251,7 +251,7 @@ pub fn wide_key(url: &str) -> String {
 
 /// The image decoded, from the disk cache or the network (then cached). A cached file that
 /// doesn't decode (cut short, say) is deleted and fetched again, once.
-fn decoded(url: &str) -> Option<image::RgbaImage> {
+pub(crate) fn decoded(url: &str) -> Option<image::RgbaImage> {
     let path = disk_path(url);
     if let Ok(b) = std::fs::read(&path) {
         // Read now: pruning goes by when a file was last used, not written.

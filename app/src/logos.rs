@@ -1,7 +1,8 @@
-//! Artist logos, shown in place of the name on artist pages. YouTube Music has none, so they come
-//! from fanart.tv (our project key, compiled in from `secrets.toml`), by the artist's MusicBrainz
-//! id: found through MusicBrainz's link to their YouTube channel, else an exact-name search.
-//! Never a namesake's guess: no logo beats a wrong one.
+//! Artist logos, shown in place of the name on artist pages, and wide artist photos behind the
+//! stage. YouTube Music has neither, so they come from fanart.tv (our project key, compiled in
+//! from `secrets.toml`), by the artist's MusicBrainz id: found through MusicBrainz's link to
+//! their YouTube channel, else an exact-name search. Never a namesake's guess: no picture beats
+//! a wrong one.
 
 use music_core::paths::{cache_dir, unix_now, write_atomic};
 use serde_json::Value;
@@ -20,31 +21,66 @@ const TTL: u64 = 30 * 86400;
 
 type Cache = HashMap<String, (Option<String>, u64)>;
 
-/// The answers so far, read from disk once.
-fn cache() -> std::sync::MutexGuard<'static, Option<Cache>> {
-    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
-    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if c.is_none() {
-        *c = Some(load());
+/// What's looked up per artist on fanart.tv: its cache file, the answers so far (read from disk
+/// once) and how the picture is picked from fanart.tv's answer.
+struct Kind {
+    file: &'static str,
+    cache: Mutex<Option<Cache>>,
+    pick: fn(&Value) -> Option<String>,
+}
+
+// v2: picked newest-first (v1 picked the most liked).
+static LOGO: Kind = Kind {
+    file: "logos-v2.json",
+    cache: Mutex::new(None),
+    pick: best_logo,
+};
+/// Wide photos of the artist, behind the stage.
+static BACKDROP: Kind = Kind {
+    file: "backdrops-v1.json",
+    cache: Mutex::new(None),
+    pick: best_backdrop,
+};
+
+impl Kind {
+    fn cache(&self) -> std::sync::MutexGuard<'_, Option<Cache>> {
+        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if c.is_none() {
+            *c = Some(load(self.file));
+        }
+        c
     }
-    c
 }
 
 /// The answer already known for an artist (`Some(None)`: known to have no logo), without
 /// asking anyone. Quick enough for the UI thread.
 pub fn known(name: &str, channel: Option<&str>) -> Option<Option<String>> {
-    if FANART_KEY.is_empty() {
-        return Some(None);
-    }
-    let key = channel.unwrap_or(name);
-    let c = cache();
-    let (url, at) = c.as_ref()?.get(key)?;
-    (unix_now().saturating_sub(*at) < TTL).then(|| url.clone())
+    known_in(&LOGO, name, channel)
 }
 
 /// The logo's URL for an artist, if there is one. Blocks (network); call on a worker.
 pub fn find(name: &str, channel: Option<&str>) -> Option<String> {
-    if let Some(answer) = known(name, channel) {
+    find_in(&LOGO, name, channel)
+}
+
+/// A wide photo of the artist (fanart.tv's `artistbackground`), if there is one, found the same
+/// sure way as logos. Blocks (network); call on a worker.
+pub fn backdrop(name: &str, channel: Option<&str>) -> Option<String> {
+    find_in(&BACKDROP, name, channel)
+}
+
+fn known_in(kind: &Kind, name: &str, channel: Option<&str>) -> Option<Option<String>> {
+    if FANART_KEY.is_empty() {
+        return Some(None);
+    }
+    let key = channel.unwrap_or(name);
+    let c = kind.cache();
+    let (url, at) = c.as_ref()?.get(key)?;
+    (unix_now().saturating_sub(*at) < TTL).then(|| url.clone())
+}
+
+fn find_in(kind: &Kind, name: &str, channel: Option<&str>) -> Option<String> {
+    if let Some(answer) = known_in(kind, name, channel) {
         return answer;
     }
     let key = channel.unwrap_or(name).to_string();
@@ -91,14 +127,14 @@ pub fn find(name: &str, channel: Option<&str>) -> Option<String> {
             &[],
             Some(FANART_KEY),
         )
-        .and_then(|v| best_logo(&v))
+        .and_then(|v| (kind.pick)(&v))
     });
     // A failed request is asked again next time; a real "none" is remembered.
     if !failed || url.is_some() {
-        let mut c = cache();
+        let mut c = kind.cache();
         let c = c.get_or_insert_with(HashMap::new);
         c.insert(key, (url.clone(), now));
-        save(c);
+        save(kind.file, c);
     }
     url
 }
@@ -132,6 +168,25 @@ fn best_logo(v: &Value) -> Option<String> {
             })
     };
     pick("hdmusiclogo").or_else(|| pick("musiclogo"))
+}
+
+/// The best liked of the artist's wide photos (with likes equal, the newest): unlike logos,
+/// photos vary a lot, and the liked ones are the good ones.
+fn best_backdrop(v: &Value) -> Option<String> {
+    let n = |l: &Value, k: &str| {
+        l[k].as_str()
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    v["artistbackground"]
+        .as_array()?
+        .iter()
+        .max_by_key(|l| (n(l, "likes"), n(l, "id")))
+        .and_then(|l| l["url"].as_str())
+        .map(|u| match u.strip_prefix("http://") {
+            Some(rest) => format!("https://{rest}"),
+            None => u.to_string(),
+        })
 }
 
 fn loose(s: &str) -> String {
@@ -186,20 +241,15 @@ pub(crate) fn fetch(
     }
 }
 
-fn path() -> std::path::PathBuf {
-    // v2: picked newest-first (v1 picked the most liked).
-    cache_dir().join("logos-v2.json")
-}
-
-fn load() -> Cache {
-    std::fs::read(path())
+fn load(file: &str) -> Cache {
+    std::fs::read(cache_dir().join(file))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-fn save(m: &Cache) {
+fn save(file: &str, m: &Cache) {
     if let Ok(b) = serde_json::to_vec(m) {
-        let _ = write_atomic(&path(), &b);
+        let _ = write_atomic(&cache_dir().join(file), &b);
     }
 }

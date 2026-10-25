@@ -1,0 +1,897 @@
+// The stage: the playing song filling a screen. Lyrics light word by word over a room lit by the
+// song's artwork: its colours fall from fixtures just out of view, breathing with the bass,
+// warming with the midrange and catching the treble along the ceiling. Controls come up when the
+// mouse moves and go away again; Esc leaves.
+//
+// Everything that moves is driven by Rust's ~30 Hz meter while the song plays (`Ui.stage-light`,
+// `Ui.stage-ms`), never `animation-tick()`, so a paused or idle stage draws nothing at all.
+
+import { Theme, Icon, IconButton, ValueBar, Art, MiniVisualizer } from "widgets.slint";
+import { Ui, Fmt, StageLine, StageWord, StageSyl, StageLight } from "types.slint";
+
+// Sung words, and the words of the line coming up while it's sung.
+global Ink {
+    out property <color> lit: #FFF8EE;
+    out property <color> rest: #F1E5D2;
+    // How strongly words waiting to be sung show.
+    out property <float> rest-alpha: 0.3;
+}
+
+// One soft pool of coloured light: the shared glow sprite, tinted, stretched to an ellipse
+// centred on (cx, cy).
+component Pool inherits Image {
+    in property <length> cx;
+    in property <length> cy;
+    in property <length> rw;
+    in property <length> rh;
+    in property <color> light;
+    // A new song's colours flow in rather than cut.
+    property <color> tint: root.light;
+    animate tint { duration: 1800ms; easing: ease-in-out; }
+    x: root.cx - root.rw / 2;
+    y: root.cy - root.rh / 2;
+    width: root.rw;
+    height: root.rh;
+    source: Ui.stage-glow;
+    image-fit: fill;
+    colorize: root.tint;
+}
+
+// A piece of a word (a syllable, or a letter of a held word), filling left to right with a soft
+// edge in its own time. In a held word each letter lifts as the singing reaches it, so the note
+// ripples through the word.
+component StageSylView inherits Rectangle {
+    in property <StageSyl> syl;
+    in property <bool> live;
+    in property <bool> timed;
+    in property <bool> held;
+    in property <length> size;
+    in property <int> weight;
+    in property <color> glow;
+    // The word's glow (0..1), for the bloom behind the letters.
+    in property <float> shine;
+    // How strongly its line shows (0..1): faded in the colours, as an element's opacity would
+    // draw the line offscreen every frame.
+    in property <float> fade: 1;
+    property <float> p: !root.live ? 0 : !root.timed ? 1 : clamp((Ui.stage-ms - root.syl.start) / max(1, root.syl.end - root.syl.start), 0, 1);
+    // The fill's soft edge, as a share of the piece: wide, so short ones never snap.
+    property <float> edge: 0.45;
+    property <color> lit: Ink.lit.with-alpha(root.fade);
+    property <color> rest: Ink.rest.with-alpha(Ink.rest-alpha * root.fade);
+    property <float> head: root.p * (1 + root.edge);
+    // Held: how far it has risen, eased in quickly and kept up while the word glows.
+    property <float> rise: root.held && !Ui.reduced-motion ? clamp(root.p * 2.2, 0, 1) * root.shine : 0;
+    width: txt.preferred-width;
+    height: txt.preferred-height;
+
+    // A faint bloom of the lit letters themselves, so the light seems to come from them.
+    if root.shine > 0.01: Rectangle {
+        y: txt.y;
+        for k in 4: Text {
+            x: root.size * 0.03 * cos(k * 90deg + 45deg);
+            y: root.size * 0.03 * sin(k * 90deg + 45deg);
+            text: root.syl.text;
+            font-size: root.size;
+            font-weight: root.weight;
+            letter-spacing: -0.02 * root.size;
+            color: root.glow;
+            opacity: (root.held ? 0.24 : 0.16) * root.shine * min(1, root.p * 3) * root.fade;
+        }
+    }
+
+    txt := Text {
+        x: 0;
+        y: -root.size * 0.07 * root.rise * (1 - 0.5 * root.rise);
+        width: self.preferred-width;
+        text: root.syl.text;
+        font-size: root.size;
+        font-weight: root.weight;
+        letter-spacing: -0.02 * root.size;
+        color: !root.live ? Theme.ivory.with-alpha(root.fade)
+            : root.p >= 1 ? root.lit
+            : root.p <= 0 ? root.rest
+            : @linear-gradient(90deg, root.lit 0%, root.lit clamp(root.head - root.edge, 0, 1) * 100%, root.rest clamp(root.head, 0, 1) * 100%, root.rest 100%);
+    }
+}
+
+// A word of the sung line. Word-timed, its syllables fill as they're sung, it rises a touch and
+// glows in the song's accent; a held word swells while it's held and settles after. The words
+// after it wait, faint.
+component StageWordView inherits Rectangle {
+    in property <StageWord> word;
+    // Its line is the one being sung.
+    in property <bool> live;
+    in property <bool> timed;
+    in property <length> size;
+    in property <int> weight: 800;
+    in property <color> glow;
+    in property <float> fade: 1;
+    // How far through it the singing is (0..1).
+    property <float> p: !root.live || !root.timed ? 0 : clamp((Ui.stage-ms - root.word.start) / max(1, root.word.end - root.word.start), 0, 1);
+    property <bool> singing: root.live && root.timed && root.p > 0 && root.p < 1;
+    property <float> shine: root.singing ? 1 : 0;
+    animate shine { duration: 420ms; easing: ease-out; }
+    property <bool> still: Ui.reduced-motion;
+    // Held: grows with the note (up to 7%), and eases back once it's let go.
+    property <float> swell: root.word.held && !root.still ? root.p * root.shine : 0;
+    width: pieces.preferred-width + (root.word.space ? root.size * 0.27 : 0px);
+    height: pieces.preferred-height;
+
+    Rectangle {
+        x: 0;
+        width: pieces.preferred-width;
+        height: root.height;
+        transform-scale: 1 + 0.07 * root.swell;
+        transform-origin: { x: pieces.preferred-width / 2, y: root.height * 0.62 };
+
+        // Its halo: the accent, very soft, behind the word while it's sung; stronger as a held
+        // word swells.
+        if root.shine > 0.01: Image {
+            x: -pieces.preferred-width * 0.3;
+            y: -root.height * 0.35;
+            width: pieces.preferred-width * 1.6;
+            height: root.height * 1.7;
+            source: Ui.stage-glow;
+            image-fit: fill;
+            colorize: root.glow;
+            opacity: (0.30 + 0.25 * root.swell) * root.shine * root.fade;
+        }
+
+        pieces := HorizontalLayout {
+            x: 0;
+            y: root.still || root.word.held ? 0 : -root.size * 0.05 * root.shine;
+            width: self.preferred-width;
+            alignment: start;
+            for s in root.word.syls: StageSylView {
+                syl: s;
+                live: root.live;
+                timed: root.timed;
+                held: root.word.held;
+                size: root.size;
+                weight: root.weight;
+                glow: root.glow;
+                shine: root.shine;
+                fade: root.fade;
+            }
+        }
+    }
+}
+
+// The three dots of an instrumental break, filling until the singing comes back, breathing with
+// the music's own slow drift.
+component Waiting inherits HorizontalLayout {
+    in property <length> size;
+    in property <bool> right;
+    in property <float> fade: 1;
+    alignment: root.right ? end : start;
+    spacing: root.size * 0.24;
+    for k in 3: Rectangle {
+        width: root.size * 0.24;
+        height: root.size * 0.24;
+        transform-scale: (Ui.lyric-pause > 0.94 ? 0.6 : 1) * (1 + 0.1 * sin(Ui.stage-light.phase * 80deg + k * 40deg));
+        border-radius: self.width / 2;
+        background: Ink.lit;
+        opacity: (0.22 + 0.78 * clamp(Ui.lyric-pause * 3 - k, 0, 1)) * root.fade;
+    }
+}
+
+// One line. The sung one is at full strength and full size; the rest stand back by distance
+// (ahead a little brighter than behind), so the song reads as a passage, not a subtitle.
+component StageLyric inherits Rectangle {
+    in property <StageLine> line;
+    in property <int> index;
+    in property <int> active;
+    in property <length> size;
+    in property <color> glow;
+    // Clicking a line goes there (only while the controls are up, so a click to wake them
+    // doesn't jump).
+    in property <bool> seekable;
+    out property <bool> waiting: Ui.lyric-pause-row >= 0 && root.index == Ui.lyric-pause-row;
+    out property <bool> live: root.active >= 0 && root.line.group == root.active && Ui.lyric-pause-row < 0;
+    // Lines from the sung one, signed: behind is negative.
+    property <int> away: root.active < 0 ? root.line.group + 1 : root.line.group - root.active;
+    property <length> s: root.line.background ? root.size * 0.6 : root.size;
+    property <float> strength: root.live ? 1
+        : root.waiting ? 0.62
+        : root.away < 0 ? [0.3, 0.17, 0.08][min(2, -root.away - 1)] * (root.away < -3 ? 0 : 1)
+        : root.away == 0 ? 0.42
+        : [0.48, 0.32, 0.2, 0.11, 0.05][min(4, root.away - 1)] * (root.away > 6 ? 0 : 1);
+    // Faded in its words' colours, not with `opacity`, which would draw it offscreen each frame.
+    in property <float> intro: 1;
+    property <float> settled: root.strength * (root.line.background ? 0.78 : 1) * (Ui.lyric-pause-row >= 0 && !root.waiting ? 0.7 : 1);
+    animate settled { duration: 520ms; easing: ease-in-out; }
+    property <float> fade: root.settled * root.intro;
+    height: col.preferred-height;
+    transform-scale: root.live || root.line.background ? 1 : 0.955;
+    transform-origin: { x: root.line.agent == 1 ? root.width : 0px, y: root.height / 2 };
+    animate transform-scale { duration: 700ms; easing: cubic-bezier(0.2, 0.9, 0.25, 1); }
+    // Where the column has put the lines. Each line follows it a beat behind the one before,
+    // those further down the most, so the passage drags up like a chain rather than a page.
+    in property <length> target;
+    property <length> trail: root.target;
+    animate trail {
+        duration: Ui.reduced-motion ? 0ms : 620ms + 40ms * clamp(root.away, 0, 5);
+        delay: Ui.reduced-motion ? 0ms : 55ms * clamp(root.away + 1, 0, 6);
+        easing: cubic-bezier(0.25, 0.9, 0.3, 1);
+    }
+
+    col := VerticalLayout {
+        y: root.trail - root.target;
+        spacing: root.s * 0.14;
+        padding-top: root.line.background ? 0px : root.size * 0.18;
+        padding-bottom: root.line.background ? 0px : root.size * 0.18;
+        if root.waiting: Waiting {
+            size: root.size;
+            fade: root.fade;
+            right: root.line.agent == 1;
+            height: root.size * 0.5;
+        }
+        FlexboxLayout {
+            alignment: root.line.agent == 1 ? end : start;
+            spacing-vertical: root.s * 0.04;
+            for w in root.line.words: StageWordView {
+                // Lines faded out entirely aren't drawn (they still take their place).
+                visible: root.fade > 0.004;
+                word: w;
+                fade: root.fade;
+                live: root.live;
+                timed: Ui.stage-word-timed;
+                size: root.s;
+                weight: root.line.background ? 700 : 800;
+                glow: root.glow;
+            }
+        }
+        if root.line.roman != "": Text {
+            text: root.line.roman;
+            font-size: root.s * 0.42;
+            font-weight: 600;
+            color: Theme.ivory.with-alpha(0.7 * root.fade);
+            wrap: word-wrap;
+            horizontal-alignment: root.line.agent == 1 ? right : left;
+        }
+        if root.line.translation != "": Text {
+            text: root.line.translation;
+            font-size: root.s * 0.42;
+            font-weight: 500;
+            color: Theme.beige.with-alpha(root.fade);
+            wrap: word-wrap;
+            horizontal-alignment: root.line.agent == 1 ? right : left;
+        }
+    }
+
+    TouchArea {
+        enabled: root.seekable && root.line.start >= 0;
+        mouse-cursor: self.enabled ? pointer : default;
+        clicked => {
+            Ui.seek(root.line.start);
+        }
+    }
+}
+
+// The controls, on dark glass along the bottom, laid out as the player bar is: the song on the
+// left, transport over the seek bar in the middle, like, display, full screen and volume on the
+// right.
+component StageControls inherits Rectangle {
+    out property <bool> busy: seek.dragging || vol.dragging || ta.has-hover;
+    // Lit in the cover's colour, which flows to a new song's with the room.
+    property <color> tint: Ui.stage-look.accent;
+    animate tint { duration: 1800ms; easing: ease-in-out; }
+    property <float> progress: Ui.np.duration-ms > 0 ? Ui.np.position-ms / Ui.np.duration-ms : 0;
+    property <length> centre-w: clamp(root.width * 0.38, 360px, 620px);
+    height: 84px;
+    border-radius: 22px;
+    background: #0B0807B8;
+    border-width: 1px;
+    border-color: #F1E5D21A;
+    drop-shadow-blur: 40px;
+    drop-shadow-color: #00000080;
+    // Holds the controls up while the mouse is over them (and keeps clicks off the stage).
+    ta := TouchArea { }
+
+    // Left: artwork and titles
+    HorizontalLayout {
+        x: 16px;
+        width: (root.width - root.centre-w) / 2 - 32px;
+        spacing: 12px;
+        alignment: start;
+        Rectangle {
+            width: 52px;
+            Art {
+                width: 52px;
+                height: 52px;
+                radius: 6px;
+                source: Ui.np.art;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: Ui.np.title;
+                color: Theme.ivory;
+                font-size: 13px;
+                font-weight: 600;
+                overflow: elide;
+            }
+
+            Text {
+                text: Ui.np.artist;
+                color: Theme.beige;
+                font-size: 12px;
+                overflow: elide;
+            }
+        }
+    }
+
+    // Centre: transport, and the seek bar between the times under it
+    VerticalLayout {
+        x: (root.width - root.centre-w) / 2;
+        width: root.centre-w;
+        alignment: center;
+        spacing: 4px;
+        HorizontalLayout {
+            alignment: center;
+            spacing: 14px;
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    accent: root.tint;
+                    icon: "shuffle";
+                    tooltip: Ui.shuffle ? "Shuffle on" : "Shuffle";
+                    toggle: true;
+                    active: Ui.shuffle;
+                    icon-size: 16px;
+                    clicked => {
+                        Ui.toggle-shuffle();
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    accent: root.tint;
+                    icon: "previous";
+                    tooltip: "Previous";
+                    icon-size: 18px;
+                    enabled: Ui.np.active;
+                    clicked => {
+                        Ui.previous();
+                    }
+                }
+            }
+
+            // Play/pause: the lit control
+            Rectangle {
+                width: 36px;
+                height: 36px;
+                border-radius: 18px;
+                background: pp.pressed ? root.tint.darker(0.15) : pp.has-hover ? root.tint.brighter(0.08) : root.tint;
+                drop-shadow-blur: 12px;
+                drop-shadow-color: root.tint.with-alpha(0.27);
+                accessible-role: button;
+                accessible-label: Ui.np.playing ? "Pause" : "Play";
+                accessible-action-default => {
+                    Ui.play-pause();
+                }
+                pp := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        Ui.play-pause();
+                    }
+                }
+
+                pp-focus := FocusScope {
+                    focus-on-click: false;
+                    key-pressed(e) => {
+                        if (e.text == " " || e.text == Key.Return) {
+                            Ui.play-pause();
+                            return accept;
+                        }
+                        reject
+                    }
+                }
+
+                if pp-focus.has-focus: Rectangle {
+                    border-radius: 18px;
+                    border-width: 2px;
+                    border-color: Theme.ivory;
+                }
+
+                Icon {
+                    name: Ui.np.playing ? "pause" : "play";
+                    width: 16px;
+                    height: 16px;
+                    x: Ui.np.playing ? 10px : 11px;
+                    color: Theme.carbon;
+                }
+            }
+
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    accent: root.tint;
+                    icon: "next";
+                    tooltip: "Next";
+                    icon-size: 18px;
+                    enabled: Ui.np.active;
+                    clicked => {
+                        Ui.next();
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 32px;
+                IconButton {
+                    accent: root.tint;
+                    icon: Ui.repeat == 2 ? "repeat-one" : "repeat";
+                    tooltip: Ui.repeat == 2 ? "Repeat one" : Ui.repeat == 1 ? "Repeat all" : "Repeat";
+                    toggle: true;
+                    active: Ui.repeat != 0;
+                    icon-size: 16px;
+                    clicked => {
+                        Ui.cycle-repeat();
+                    }
+                }
+            }
+        }
+
+        // Placed by hand: the times can't size a layout the seek bar's drag position depends on.
+        Rectangle {
+            height: 16px;
+            Text {
+                x: 0;
+                width: 40px;
+                text: Fmt.time(seek.dragging ? seek.drag-value * Ui.np.duration-ms : Ui.np.position-ms);
+                color: Theme.beige;
+                font-size: 11px;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+            }
+
+            seek := ValueBar {
+                x: 50px;
+                width: parent.width - 100px;
+                thickness: 3px;
+                label: "Position";
+                value-text: Fmt.time(Ui.np.position-ms) + " of " + Fmt.time(Ui.np.duration-ms);
+                step: Ui.np.duration-ms > 0 ? min(1, 5000 / Ui.np.duration-ms) : 0.05;
+                knob: Ui.np.active && !Ui.np-live;
+                fill: root.tint;
+                value: Ui.np-live ? 1 : root.progress;
+                released(v) => {
+                    if (Ui.np.duration-ms > 0 && !Ui.np-live) {
+                        Ui.seek(v * Ui.np.duration-ms);
+                    }
+                }
+            }
+
+            Text {
+                x: parent.width - 40px;
+                width: 40px;
+                text: Ui.np-live ? "LIVE" : Fmt.time(Ui.np.duration-ms);
+                color: Ui.np-live ? root.tint : Theme.beige;
+                font-size: 11px;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    // Right: like, the next display, full screen, volume
+    HorizontalLayout {
+        x: (root.width + root.centre-w) / 2 + 16px;
+        width: (root.width - root.centre-w) / 2 - 32px;
+        alignment: end;
+        spacing: 2px;
+        Rectangle {
+            width: 32px;
+            IconButton {
+                accent: root.tint;
+                icon: Ui.np.liked ? "heart-filled" : "heart";
+                tooltip: Ui.np.liked ? "Remove from liked" : "Like";
+                toggle: true;
+                active: Ui.np.liked;
+                enabled: Ui.np.active && Ui.signed-in;
+                icon-size: 17px;
+                clicked => {
+                    Ui.toggle-like();
+                }
+            }
+        }
+
+        Rectangle {
+            width: 12px;
+        }
+
+        if Ui.stage-displays: Rectangle {
+            width: 32px;
+            IconButton {
+                accent: root.tint;
+                icon: "display";
+                tooltip: "Move to the next display";
+                icon-size: 17px;
+                clicked => {
+                    Ui.stage-next-display();
+                }
+            }
+        }
+
+        Rectangle {
+            width: 32px;
+            IconButton {
+                accent: root.tint;
+                icon: "collapse";
+                tooltip: "Exit full screen (Esc)";
+                icon-size: 17px;
+                clicked => {
+                    Ui.stage-toggle();
+                }
+            }
+        }
+
+        Rectangle {
+            width: 2px;
+        }
+
+        Rectangle {
+            width: 28px;
+            IconButton {
+                accent: root.tint;
+                icon: Ui.volume <= 0.001 ? "mute" : "volume";
+                tooltip: Ui.volume <= 0.001 ? "Unmute (Ctrl+M)" : "Mute (Ctrl+M)";
+                x: (parent.width - self.width) / 2;
+                size: 28px;
+                icon-size: 17px;
+                clicked => {
+                    Ui.toggle-mute();
+                }
+            }
+        }
+
+        Rectangle {
+            width: 104px;
+            vol := ValueBar {
+                x: 8px;
+                width: 96px;
+                thickness: 4px;
+                label: "Volume";
+                value: Ui.volume;
+                fill: root.tint;
+                changed(v) => {
+                    Ui.volume = v;
+                    Ui.set-volume(v);
+                }
+            }
+        }
+    }
+}
+
+export component Stage inherits Rectangle {
+    background: #0B0807;
+    clip: true;
+    property <StageLight> light: Ui.stage-light;
+    property <float> motion: Ui.reduced-motion ? 0 : 1;
+    property <float> t: root.light.phase * root.motion;
+
+    // ---- the composition --------------------------------------------------------------------
+
+    property <bool> has-lyrics: Ui.stage-lines.length > 0;
+    property <bool> synced: root.has-lyrics && Ui.stage-lines[0].start >= 0;
+    property <bool> portrait: root.width < root.height * 1.15;
+    // Artwork and title on the left, lyrics on the right; no lyrics, the artwork takes the middle.
+    property <length> art-size: !root.has-lyrics ? min(root.height * 0.5, root.width * 0.36)
+        : root.portrait ? min(root.width * 0.24, root.height * 0.15)
+        : min(root.height * 0.42, root.width * 0.25);
+    property <length> art-x: !root.has-lyrics ? (root.width - root.art-size) / 2 : root.width * (root.portrait ? 0.08 : 0.075);
+    property <length> art-y: !root.has-lyrics ? (root.height - root.art-size) / 2 - root.height * 0.07
+        : root.portrait ? root.height * 0.07
+        : (root.height - root.art-size) / 2 - root.height * 0.05;
+    animate art-size, art-x, art-y { duration: 900ms; easing: cubic-bezier(0.2, 0.9, 0.25, 1); }
+    property <length> lyrics-x: root.portrait ? root.width * 0.08 : root.width * 0.4;
+    property <length> lyrics-w: root.portrait ? root.width * 0.84 : root.width * 0.52;
+    // Where the sung line sits.
+    property <length> anchor: root.height * (root.portrait ? 0.46 : 0.4);
+    property <length> lyric-size: clamp(min(root.height * 0.058, root.lyrics-w * 0.072), 30px, 78px);
+    property <length> title-size: clamp(root.height * 0.03, 18px, 34px);
+
+    // Which way the room is lit: the main light's corner, by `layout`.
+    property <int> layout: Ui.stage-look.layout;
+    property <float> kx: [0.1, 0.92, 0.04, 0.9][mod(root.layout, 4)];
+    property <float> ky: [0.92, 0.08, 0.42, 0.88][mod(root.layout, 4)];
+
+    // ---- the room -----------------------------------------------------------------------------
+
+    // The atmosphere: the artwork as a field of soft colour (and the artist, when there's a
+    // photo), in two slots so a new song's fades in over the old. It holds still: drifting a
+    // pixel or two a second, it would step from pixel to pixel rather than glide.
+    for k in 2: Image {
+        width: root.width;
+        height: root.height;
+        source: k == 0 ? Ui.stage-look.back-a : Ui.stage-look.back-b;
+        image-fit: cover;
+        opacity: Ui.stage-look.slot == k && self.source.width > 0 ? 1 : 0;
+        animate opacity { duration: 2200ms; easing: ease-in-out; }
+    }
+
+    // The fixtures: the main light from its corner, breathing with the bass and lifting a
+    // little as beats land; the fill opposite, warming with the midrange; the accent near the
+    // artwork; and a wide bounce off the floor.
+    Pool {
+        cx: root.width * (root.kx + 0.05 * sin(root.t * 9deg));
+        cy: root.height * (root.ky + 0.04 * cos(root.t * 7deg));
+        rw: root.width * (1.0 + 0.12 * root.light.bloom);
+        rh: self.rw * 0.78;
+        light: Ui.stage-look.key;
+        opacity: 0.36 + 0.28 * root.light.bloom + 0.1 * root.light.pulse;
+    }
+    Pool {
+        cx: root.width * (1 - root.kx + 0.06 * sin(root.t * 6deg + 120deg));
+        cy: root.height * (1 - root.ky + 0.05 * sin(root.t * 5deg));
+        rw: root.width * (0.72 + 0.08 * root.light.body);
+        rh: self.rw * 0.7;
+        light: Ui.stage-look.fill;
+        opacity: 0.19 + 0.22 * root.light.body;
+    }
+    Pool {
+        cx: root.art-x + root.art-size / 2 + root.width * 0.05 * sin(root.t * 13deg);
+        cy: root.art-y + root.art-size / 2 + root.height * 0.04 * cos(root.t * 11deg);
+        rw: root.art-size * (2.6 + 0.2 * root.light.body);
+        rh: self.rw;
+        light: Ui.stage-look.accent;
+        opacity: 0.16 + 0.18 * root.light.body + 0.06 * root.light.air;
+    }
+    Pool {
+        cx: root.width * (0.5 + 0.12 * sin(root.t * 4deg));
+        cy: root.height * 1.04;
+        rw: root.width * 1.5;
+        rh: root.height * (0.55 + 0.06 * root.light.bloom);
+        light: Ui.stage-look.key;
+        opacity: 0.12 + 0.14 * root.light.bloom + 0.06 * root.light.pulse;
+    }
+
+    // The ceiling: a lit band behind blinds and a strip light along the top edge, catching the
+    // treble as a faint shimmer.
+    Rectangle {
+        y: 0;
+        height: root.height * 0.22;
+        // Faded in the colours, not the element's opacity (which draws it offscreen).
+        property <float> lit: 0.55 + 0.45 * root.light.air;
+        background: @linear-gradient(180deg, Ui.stage-look.accent.with-alpha(0.16 * self.lit) 0%, Ui.stage-look.accent.with-alpha(0) 100%);
+        Image {
+            width: parent.width;
+            height: parent.height;
+            opacity: parent.lit;
+            source: @image-url("ribbing.png");
+            horizontal-tiling: repeat;
+            vertical-tiling: repeat;
+        }
+    }
+    Rectangle {
+        y: 0;
+        height: 2px;
+        background: @linear-gradient(90deg, #E9A15F00 0%, Ui.stage-look.accent.with-alpha(0.7) 50%, #E9A15F00 100%);
+        opacity: 0.35 + 0.65 * root.light.air;
+    }
+
+    // Grain against banding, a vignette, and shade under the lyrics so they always read.
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: Ui.stage-grain;
+        horizontal-tiling: repeat;
+        vertical-tiling: repeat;
+    }
+    Rectangle {
+        background: @radial-gradient(circle, #00000000 50%, #00000080 100%);
+    }
+    if root.has-lyrics: Rectangle {
+        x: root.portrait ? 0px : root.lyrics-x - root.width * 0.12;
+        y: root.portrait ? root.height * 0.24 : 0px;
+        width: root.portrait ? root.width : root.width - self.x;
+        height: root.portrait ? root.height - self.y : root.height;
+        background: root.portrait
+            ? @linear-gradient(180deg, #0B080700 0%, #0B08076B 18%, #0B08077A 100%)
+            : @linear-gradient(90deg, #0B080700 0%, #0B08076B 22%, #0B08077A 100%);
+    }
+
+    // ---- the song -----------------------------------------------------------------------------
+
+    // The artwork, lit in its own colour.
+    Rectangle {
+        x: root.art-x;
+        y: root.art-y;
+        width: root.art-size;
+        height: root.art-size;
+        border-radius: 12px;
+        background: Theme.smoke;
+        drop-shadow-blur: root.art-size * 0.22;
+        drop-shadow-offset-y: root.art-size * 0.05;
+        drop-shadow-color: Ui.stage-look.deep.with-alpha(0.85);
+        Art {
+            width: parent.width;
+            height: parent.height;
+            radius: 12px;
+            source: Ui.stage-art;
+        }
+        // A sheen along its top edge, like glass catching the room's light.
+        Rectangle {
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #FFF8EE1F;
+        }
+    }
+
+    // The title, the artist, and the song's own small visualizer beside them.
+    title-block := VerticalLayout {
+        property <bool> centred: !root.has-lyrics;
+        x: self.centred ? root.width * 0.15 : root.portrait ? root.art-x + root.art-size + root.width * 0.04 : root.art-x;
+        y: !root.has-lyrics || !root.portrait ? root.art-y + root.art-size + root.height * 0.04 : root.art-y + (root.art-size - self.preferred-height) / 2;
+        width: self.centred ? root.width * 0.7 : root.portrait ? root.width * 0.92 - self.x : max(root.art-size, root.lyrics-x - root.art-x - root.width * 0.05);
+        height: self.preferred-height;
+        spacing: root.title-size * 0.22;
+        HorizontalLayout {
+            alignment: title-block.centred ? center : start;
+            spacing: root.title-size * 0.5;
+            // The visualizer leads the title, in its colour; it rests low while paused.
+            Rectangle {
+                width: root.title-size * 0.8;
+                MiniVisualizer {
+                    y: (parent.height - self.height) / 2;
+                    width: root.title-size * 0.8;
+                    height: root.title-size * 0.8;
+                    playing: Ui.np.playing;
+                    levels: Ui.levels;
+                    bar-color: Ui.stage-look.accent;
+                    animate bar-color { duration: 1800ms; easing: ease-in-out; }
+                }
+            }
+            Text {
+                text: Ui.np.title;
+                font-size: root.title-size;
+                font-weight: 700;
+                color: Ui.stage-look.accent;
+                animate color { duration: 1800ms; easing: ease-in-out; }
+                overflow: elide;
+                letter-spacing: -0.01 * root.title-size;
+                horizontal-alignment: title-block.centred ? center : left;
+            }
+        }
+        Text {
+            text: Ui.np.artist;
+            font-size: root.title-size * 0.62;
+            font-weight: 500;
+            color: Theme.beige;
+            overflow: elide;
+            horizontal-alignment: title-block.centred ? center : left;
+        }
+    }
+
+    // ---- the lyrics -------------------------------------------------------------------------
+
+    // Synced: a column that glides so the sung line sits at `anchor`.
+    if root.synced: column := Rectangle {
+        x: root.lyrics-x;
+        width: root.lyrics-w;
+        // Arrives (a new song's lyrics) with a fade, in the lines' own colours.
+        property <float> intro: 0;
+        init => {
+            self.intro = 1;
+        }
+        animate intro { duration: 900ms; easing: ease-out; }
+        property <length> focus-y: 0px;
+        function reached(y: length, h: length) {
+            self.focus-y = y + min(h, root.lyric-size * 2.4) / 2;
+        }
+        // Jumps; the lines themselves glide after it (`StageLyric.trail`).
+        lines := VerticalLayout {
+            y: root.anchor - parent.focus-y;
+            width: parent.width;
+            spacing: root.lyric-size * 0.12;
+            for l[i] in Ui.stage-lines: StageLyric {
+                line: l;
+                index: i;
+                active: Ui.lyric-line;
+                size: root.lyric-size;
+                glow: Ui.stage-look.accent;
+                seekable: root.chrome;
+                target: lines.y;
+                intro: column.intro;
+                init => {
+                    if (self.live && !self.line.background) || self.waiting {
+                        column.reached(self.y, self.height);
+                    }
+                }
+                changed live => {
+                    if self.live && !self.line.background {
+                        column.reached(self.y, self.height);
+                    }
+                }
+                changed waiting => {
+                    if self.waiting {
+                        column.reached(self.y, self.height);
+                    }
+                }
+            }
+        }
+    }
+
+    // Lyrics without timing: shown as words to read, still, and scrollable; nothing pretends
+    // to follow the song.
+    if root.has-lyrics && !root.synced: Flickable {
+        x: root.lyrics-x;
+        y: root.portrait ? root.height * 0.26 : root.height * 0.12;
+        width: root.lyrics-w;
+        height: root.height * (root.portrait ? 0.62 : 0.76);
+        content-height: plain.preferred-height;
+        plain := VerticalLayout {
+            width: parent.width;
+            spacing: root.lyric-size * 0.2;
+            padding-bottom: root.height * 0.2;
+            for l in Ui.stage-lines: Text {
+                text: l.words.length > 0 ? l.words[0].text : "";
+                font-size: root.lyric-size * 0.56;
+                font-weight: 700;
+                color: Theme.ivory;
+                opacity: 0.78;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    // ---- controls -----------------------------------------------------------------------------
+
+    // Up while the mouse moves (or the keyboard is used), away again after a few quiet seconds.
+    // Hidden, they're gone: nothing invisible takes a click.
+    out property <bool> chrome: true;
+    property <float> chrome-o: root.chrome ? 1 : 0;
+    animate chrome-o { duration: 450ms; easing: ease-in-out; }
+    public function wake() {
+        root.chrome = true;
+        idle.running = false;
+        idle.running = true;
+    }
+    // Opening shows the controls for a moment, so it's clear how to leave.
+    changed visible => {
+        if self.visible {
+            root.wake();
+        }
+    }
+    idle := Timer {
+        interval: 2800ms;
+        running: true;
+        triggered => {
+            if !controls.busy {
+                root.chrome = false;
+                self.running = false;
+            }
+        }
+    }
+
+    // Under the controls: any movement over the stage wakes them, and the pointer hides with
+    // them.
+    TouchArea {
+        mouse-cursor: root.chrome ? MouseCursor.default : MouseCursor.none;
+        changed mouse-x => {
+            root.wake();
+        }
+        changed mouse-y => {
+            root.wake();
+        }
+        clicked => {
+            root.wake();
+        }
+        double-clicked => {
+            Ui.stage-toggle();
+        }
+    }
+
+    controls := StageControls {
+        visible: root.chrome-o > 0.01;
+        opacity: root.chrome-o;
+        width: min(1280px, root.width - 48px);
+        x: (root.width - self.width) / 2;
+        y: root.height - self.height - 28px + 12px * (1 - root.chrome-o);
+    }
+}
