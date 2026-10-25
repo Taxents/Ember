@@ -417,14 +417,6 @@ impl App {
         matches!(self.together, Some(Session::Listening(_)))
     }
 
-    /// Hosting: the invite code and how many are in (the host too), for Discord's invites.
-    pub(crate) fn together_party(&self) -> Option<(String, usize)> {
-        match &self.together {
-            Some(Session::Hosting(h)) => Some((h.link.code(), h.members.len() + 1)),
-            _ => None,
-        }
-    }
-
     fn together_session(&self) -> Option<u64> {
         match &self.together {
             Some(Session::Hosting(h)) => Some(h.session),

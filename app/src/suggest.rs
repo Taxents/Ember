@@ -26,6 +26,9 @@ pub(crate) struct Suggested {
     loading: bool,
     /// Refresh was asked for: the next set replaces this one when it comes.
     refreshing: bool,
+    /// Songs added from here (their `keys`), on every playlist this run: YouTube can take a
+    /// while to list them in the playlist, and suggests them meanwhile.
+    added: HashSet<String>,
 }
 
 /// What a song is known by: its video, and its title and artist, as YouTube suggests other
@@ -75,10 +78,12 @@ fn fill(
 impl App {
     /// The playlist's own songs (their `keys`).
     fn in_playlist(&self) -> HashSet<String> {
-        self.page_tracks[..self.main_len]
+        let mut have: HashSet<String> = self.page_tracks[..self.main_len]
             .iter()
             .flat_map(keys)
-            .collect()
+            .collect();
+        have.extend(self.suggested.added.iter().cloned());
+        have
     }
 
     /// A playlist has been laid out: fetch its recommendations, or show again the ones it had
@@ -89,6 +94,7 @@ impl App {
         }
         self.suggested = Suggested {
             generation: self.generation,
+            added: std::mem::take(&mut self.suggested.added),
             ..Default::default()
         };
         if from.is_some() {
@@ -169,7 +175,12 @@ impl App {
             ..Default::default()
         };
         self.push_row(RowRef::Heading(None), RowKind::Heading, heading);
-        self.push_row(RowRef::Columns, RowKind::Columns, TrackRow::default());
+        // `suggested` on the column titles: no "Plays" over the add buttons.
+        let columns = TrackRow {
+            suggested: true,
+            ..Default::default()
+        };
+        self.push_row(RowRef::Columns, RowKind::Columns, columns);
         for (n, t) in tracks.into_iter().enumerate() {
             let mut row = self.row_for(&t, current.as_deref() == Some(t.video_id.as_str()), false);
             row.number = n as i32 + 1;
@@ -253,6 +264,7 @@ impl App {
             }
         }
         self.suggested.shown.retain(|s| s.video_id != t.video_id);
+        self.suggested.added.extend(keys(&t));
         let id = t.video_id.clone();
         self.add_page_tracks(vec![t]);
         if self.suggested.shown.is_empty() {

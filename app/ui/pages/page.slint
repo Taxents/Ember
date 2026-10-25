@@ -409,6 +409,8 @@ export component ColumnTitle inherits Text {
 export component ColumnTitles inherits Rectangle {
     // A list with no albums: the title gets the album column's room.
     in property <bool> wide;
+    // Recommendations have an add button where the plays go.
+    in property <bool> plays: true;
     property <bool> album: Ui.collection.album;
     property <length> fixed: 12px + 16px + 30px + (root.album ? 0px : 44px + 14px) + 84px + 44px + 4 * 14px;
     property <length> flex: max(0px, root.width - root.fixed);
@@ -439,7 +441,7 @@ export component ColumnTitles inherits Rectangle {
 
         ColumnTitle {
             width: 84px;
-            text: "Plays";
+            text: root.plays ? "Plays" : "";
             horizontal-alignment: right;
         }
 
@@ -1290,6 +1292,7 @@ export component PageView inherits Rectangle {
             }
             if row.kind == RowKind.columns: ColumnTitles {
                 wide: row.wide;
+                plays: !row.suggested;
                 x: 24px;
                 width: parent.width - 48px;
             }
