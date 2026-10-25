@@ -191,7 +191,6 @@ export component SettingsPage inherits Rectangle {
 
             SettingRow {
                 title: "Listening history";
-                note: "Songs you play in Ember are counted for the stats on the Artists page. They stay on this PC, in listens.jsonl in the app folder.";
                 PillButton {
                     text: Ui.listening-history ? "On" : "Off";
                     primary: Ui.listening-history;
@@ -206,8 +205,7 @@ export component SettingsPage inherits Rectangle {
             }
 
             SettingRow {
-                title: Ui.history-size != "" ? "Clear listening history (" + Ui.history-size + ")" : "Clear listening history";
-                note: root.confirm-clear ? "Every play counted so far is forgotten, for good." : "";
+                title: "Clear listening history";
                 if !root.confirm-clear: PillButton {
                     text: "Clear";
                     primary: false;

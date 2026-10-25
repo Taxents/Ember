@@ -167,12 +167,6 @@ impl Log {
         }
     }
 
-    /// How big the file is, in bytes.
-    pub fn size() -> u64 {
-        let path = music_core::paths::config_dir().join(FILE);
-        std::fs::metadata(path).map_or(0, |m| m.len())
-    }
-
     /// Adds a play and appends it to the file.
     pub fn record(&mut self, t: &Track, at: u64, secs: u32) {
         use std::io::Write;
