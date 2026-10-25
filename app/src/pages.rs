@@ -357,8 +357,9 @@ pub fn load_more(client: &Client, m: More, hidden: &[String]) -> Result<(Extra, 
 
 /// The Artists page: what you've listened to in Ember over the period in the route (the top
 /// artists and their songs, the songs and albums you played most), who's rising and fading this
-/// month, then the artists in your library.
-pub fn artists(client: &Client, r: &Route, log: &stats::Log) -> Result<Loaded> {
+/// month, then the artists in your library. With `logging` off (Settings), it says nothing new
+/// is counted.
+pub fn artists(client: &Client, r: &Route, log: &stats::Log, logging: bool) -> Result<Loaded> {
     let library = if client.signed_in() {
         match client.library_artists() {
             Ok(f) => Some(f),
@@ -376,6 +377,20 @@ pub fn artists(client: &Client, r: &Route, log: &stats::Log) -> Result<Loaded> {
     let now = music_core::paths::unix_now();
     let mut l = stats_page(log, period, now, library.as_ref());
     l.title = Some(r.title.clone());
+    if !logging {
+        // Nothing yet, and nothing coming: no "songs add up here".
+        if log.plays.is_empty() {
+            l.blocks.clear();
+        }
+        l.blocks.insert(
+            0,
+            Block::Tracks {
+                title: "Listening history is off in Settings, so nothing new is counted.".into(),
+                more: None,
+                tracks: Vec::new(),
+            },
+        );
+    }
     if let Some(f) = library {
         let grid: Vec<Item> = f.shelves.into_iter().flat_map(|s| s.items).collect();
         if !grid.is_empty() {

@@ -540,6 +540,24 @@ fn wire(ui: &AppWindow) {
             a.save_later();
         });
     });
+    g.on_listening_history_changed(|on| {
+        with(|a| {
+            a.settings.listening_history = on;
+            if !on {
+                a.hearing = None;
+            }
+            a.forget_pages(PageKind::Artists);
+            a.save_later();
+        });
+    });
+    g.on_clear_history(|| {
+        with(|a| {
+            a.listens = Arc::new(stats::Log::default());
+            stats::Log::clear();
+            a.forget_pages(PageKind::Artists);
+            a.show_history_size();
+        });
+    });
     g.on_open_data_folder(|| {
         let _ = std::process::Command::new("explorer.exe")
             .arg(music_core::paths::config_dir())
@@ -756,6 +774,7 @@ impl App {
         g.set_volume(self.settings.volume);
         g.set_sidebar_collapsed(self.settings.sidebar_collapsed);
         g.set_lyrics_third_party(self.settings.lyrics_third_party);
+        g.set_listening_history(self.settings.listening_history);
         pages::THIRD_PARTY_LYRICS.store(
             self.settings.lyrics_third_party,
             std::sync::atomic::Ordering::Relaxed,
@@ -989,6 +1008,7 @@ impl App {
     /// Settings opened: what it shows that isn't kept up to date anyway.
     fn settings_opened(&mut self) {
         self.show_hidden_lists();
+        self.show_history_size();
         workers::run(
             || dir_size(&music_core::paths::cache_dir()),
             |size| {
@@ -1074,6 +1094,23 @@ fn clear_dir(dir: &std::path::Path) {
         } else {
             std::fs::remove_file(&p)
         };
+    }
+}
+
+impl App {
+    /// Settings' "1,204 plays, 64 KB" for the listening history.
+    fn show_history_size(&self) {
+        let n = self.listens.plays.len();
+        let text = if n == 0 {
+            String::new()
+        } else {
+            format!(
+                "{}, {}",
+                stats::plays(n as u32),
+                fmt_bytes(stats::Log::size())
+            )
+        };
+        self.ui().global::<Ui>().set_history_size(text.into());
     }
 }
 

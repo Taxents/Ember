@@ -238,6 +238,12 @@ export global Ui {
     // "Improved lyrics": lyrics from Unison and LRCLIB too.
     in-out property <bool> lyrics-third-party: true;
     callback lyrics-third-party-changed(bool);
+    // "Listening history": plays are logged for the Artists page's stats; what's kept so far
+    // ("1,204 plays, 64 KB"), and clearing it.
+    in-out property <bool> listening-history: true;
+    callback listening-history-changed(bool);
+    in property <string> history-size;
+    callback clear-history();
     in property <image> account-photo;
     in property <[SidebarPlaylist]> playlists;
     callback sign-in();

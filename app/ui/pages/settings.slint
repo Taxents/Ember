@@ -66,6 +66,7 @@ export component SettingsHeading inherits Text {
 // Settings: account, updates, playback, lyrics, sidebar, storage.
 export component SettingsPage inherits Rectangle {
     property <bool> hidden-open;
+    property <bool> confirm-clear;
     flick := Flickable {
         content-height: col.preferred-height;
         col := VerticalLayout {
@@ -176,6 +177,60 @@ export component SettingsPage inherits Rectangle {
                     clicked => {
                         Ui.lyrics-third-party = !Ui.lyrics-third-party;
                         Ui.lyrics-third-party-changed(Ui.lyrics-third-party);
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 24px;
+            }
+
+            SettingsHeading {
+                text: "LISTENING HISTORY";
+            }
+
+            SettingRow {
+                title: "Listening history";
+                note: "Songs you play in Ember are counted for the stats on the Artists page. They stay on this PC, in listens.jsonl in the app folder.";
+                PillButton {
+                    text: Ui.listening-history ? "On" : "Off";
+                    primary: Ui.listening-history;
+                    accessible-role: switch;
+                    accessible-checkable: true;
+                    accessible-checked: Ui.listening-history;
+                    clicked => {
+                        Ui.listening-history = !Ui.listening-history;
+                        Ui.listening-history-changed(Ui.listening-history);
+                    }
+                }
+            }
+
+            SettingRow {
+                title: Ui.history-size != "" ? "Clear listening history (" + Ui.history-size + ")" : "Clear listening history";
+                note: root.confirm-clear ? "Every play counted so far is forgotten, for good." : "";
+                if !root.confirm-clear: PillButton {
+                    text: "Clear";
+                    primary: false;
+                    clicked => {
+                        root.confirm-clear = true;
+                    }
+                }
+                if root.confirm-clear: HorizontalLayout {
+                    spacing: 8px;
+                    PillButton {
+                        text: "Cancel";
+                        primary: false;
+                        clicked => {
+                            root.confirm-clear = false;
+                        }
+                    }
+
+                    PillButton {
+                        text: "Clear history";
+                        clicked => {
+                            root.confirm-clear = false;
+                            Ui.clear-history();
+                        }
                     }
                 }
             }

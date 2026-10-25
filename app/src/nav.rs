@@ -133,13 +133,14 @@ impl App {
         let client = self.client.clone();
         let hidden = self.settings.hidden_playlists.clone();
         let listens = self.listens.clone();
+        let logging = self.settings.listening_history;
         workers::run_urgent(
             move || {
                 let t = std::time::Instant::now();
                 let res = if r.kind == PageKind::Radio {
                     radio::load(&r)
                 } else if r.kind == PageKind::Artists {
-                    pages::artists(&client, &r, &listens)
+                    pages::artists(&client, &r, &listens, logging)
                 } else {
                     pages::load(&client, &r, &hidden)
                 };

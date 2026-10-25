@@ -488,7 +488,7 @@ impl App {
     /// was. Live radio isn't logged.
     pub(crate) fn start_hearing(&mut self, id: &str, duration_ms: Option<u64>) {
         self.finish_hearing();
-        if !radio::is_station(id) {
+        if self.settings.listening_history && !radio::is_station(id) {
             self.hearing = Some(Hearing {
                 id: id.to_string(),
                 duration_ms,
