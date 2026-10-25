@@ -4,24 +4,18 @@
 use crate::*;
 
 impl App {
-    /// A song card plays with the other songs beside it.
-    pub(crate) fn play_shelf_track(&mut self, row: usize, i: usize, item: Item) {
-        let items: Vec<Item> = match &self.rows[row] {
-            RowRef::Shelf(items, _) => items.clone(),
-            _ => vec![item],
-        };
-        let start = items[..i.min(items.len())]
-            .iter()
-            .filter(|x| matches!(x, Item::Track(_)))
-            .count();
-        self.play_list(pages::tracks_of(items), Some(start), None);
+    /// A song card plays its radio, not the other cards beside it: a shelf isn't a list.
+    pub(crate) fn play_shelf_track(&mut self, item: Item) {
+        if let Item::Track(t) = item {
+            self.autoplay_from(t, None);
+        }
     }
 
     /// The play button on a card: it plays, opening nothing.
     pub(crate) fn card_play(&mut self, row: usize, i: usize) {
         match self.card_item(row, i).cloned() {
             Some(Item::Track(_)) if self.radio_card_clicked(row, i) => {}
-            Some(item @ Item::Track(_)) => self.play_shelf_track(row, i, item),
+            Some(item @ Item::Track(_)) => self.play_shelf_track(item),
             Some(item) => self.play_item(item, Mode::Play),
             None => {}
         }
@@ -74,11 +68,17 @@ impl App {
         let Some(ti) = self.track_at(i as usize) else {
             return;
         };
-        // From search or a song page, like YouTube Music: the song, then its radio, not the
-        // other results.
-        if matches!(
+        // Only a list meant to be played through (an album, a playlist, your library, an
+        // artist's top songs) queues what's beside the song. Anywhere else (Home, search, a
+        // song page) it's the song, then its radio.
+        if !matches!(
             self.history[self.at].kind,
-            PageKind::Search | PageKind::Song
+            PageKind::Album
+                | PageKind::Playlist
+                | PageKind::Radio
+                | PageKind::Liked
+                | PageKind::Songs
+                | PageKind::Artist
         ) {
             let t = self.page_tracks[ti].clone();
             // A music video found by search opens on its song page, the picture centred.
@@ -315,6 +315,15 @@ impl App {
         if ap.chips.is_empty() {
             ap.picked = w.chips.iter().position(|c| c.selected).unwrap_or(0);
             ap.chips = w.chips;
+            // The choice you last picked, asked for once the choices are known.
+            let mode = &self.settings.autoplay_mode;
+            let saved = ap.chips.iter().position(|c| !mode.is_empty() && c.label == *mode);
+            if let Some(i) = saved.filter(|i| *i != ap.picked) {
+                let watch = ap.chips[i].watch.clone();
+                if let Some(t) = self.known.get(&ap.seed).cloned() {
+                    return self.autoplay_from(t, Some((i, watch)));
+                }
+            }
         }
         let seed = ap.seed.clone();
         let rest: Vec<Track> = w
@@ -337,6 +346,10 @@ impl App {
         let Some(chip) = self.autoplay.as_ref().and_then(|a| a.chips.get(i)).cloned() else {
             return;
         };
+        if self.settings.autoplay_mode != chip.label {
+            self.settings.autoplay_mode = chip.label.clone();
+            self.settings.save();
+        }
         let current = self
             .player
             .current()

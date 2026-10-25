@@ -32,6 +32,8 @@ pub struct Settings {
     pub lyrics_third_party: bool,
     /// How the library's Albums are sorted and grouped.
     pub album_sort: crate::albums::AlbumSort,
+    /// The autoplay choice last picked ("Familiar", "Discover"…), by its label.
+    pub autoplay_mode: String,
 }
 
 impl Default for Settings {
@@ -50,6 +52,7 @@ impl Default for Settings {
             together_name: default_name(),
             lyrics_third_party: true,
             album_sort: Default::default(),
+            autoplay_mode: String::new(),
         }
     }
 }

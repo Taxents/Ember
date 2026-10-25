@@ -771,11 +771,11 @@ impl App {
             Item::Track(ref t) if t.kind == TrackKind::Video => {
                 let t = t.clone();
                 if self.player.current() != Some(t.video_id.as_str()) {
-                    self.play_shelf_track(row, i, item);
+                    self.play_shelf_track(item);
                 }
                 self.open_video(&t);
             }
-            Item::Track(_) => self.play_shelf_track(row, i, item),
+            Item::Track(_) => self.play_shelf_track(item),
             Item::Album(ref a) => {
                 let r = route(PageKind::Album, &a.id, &a.title);
                 self.opened_from = Some(item);
