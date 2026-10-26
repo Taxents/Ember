@@ -1,6 +1,6 @@
 # Ember
 
-Free modern music player for Windows
+Free optimized music player for Windows
 
 ![Home](docs/screenshots/home.webp)
 
