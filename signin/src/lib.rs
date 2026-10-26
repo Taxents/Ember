@@ -152,18 +152,24 @@ fn run(profile_dir: &std::path::Path) -> Result<Cookies, Error> {
         let cookies: ICoreWebView2CookieManager =
             webview.cast::<ICoreWebView2_2>()?.CookieManager()?;
 
-        // After each page load: once on YouTube Music with a session, take the cookies.
+        // After each page load: once on YouTube with a session, take the cookies. A Google
+        // interstitial (security checkup, recovery info) can drop the sign-in token on its way
+        // back, leaving www.youtube.com showing "There was an issue signing you in"; Google is
+        // signed in by then, so starting over passes straight through.
         let found = result.clone();
+        let retries = Rc::new(std::cell::Cell::new(0u32));
         let mut token = 0i64;
         webview.add_NavigationCompleted(
             &NavigationCompletedEventHandler::create(Box::new(move |sender, _args| {
                 let Some(sender) = sender else { return Ok(()) };
                 let mut uri = PWSTR::null();
                 sender.Source(&mut uri)?;
-                if !take_pwstr(uri).starts_with(COOKIE_URL) {
+                let uri = take_pwstr(uri);
+                if !is_youtube(&uri) {
                     return Ok(());
                 }
-                let found = found.clone();
+                let on_music = uri.starts_with(COOKIE_URL);
+                let (found, retries) = (found.clone(), retries.clone());
                 cookies.GetCookies(
                     &HSTRING::from(COOKIE_URL),
                     &GetCookiesCompletedHandler::create(Box::new(move |hr, list| {
@@ -176,6 +182,9 @@ fn run(profile_dir: &std::path::Path) -> Result<Cookies, Error> {
                         {
                             *found.borrow_mut() = Some(all);
                             let _ = DestroyWindow(hwnd);
+                        } else if !on_music && retries.get() < 2 {
+                            retries.set(retries.get() + 1);
+                            sender.Navigate(&HSTRING::from(SIGN_IN_URL))?;
                         }
                         Ok(())
                     })),
@@ -194,6 +203,13 @@ fn run(profile_dir: &std::path::Path) -> Result<Cookies, Error> {
         let _ = controller.Close();
     }
     result.borrow_mut().take().ok_or(Error::Cancelled)
+}
+
+/// Whether `uri` is an https page on youtube.com or one of its subdomains.
+fn is_youtube(uri: &str) -> bool {
+    let Some(rest) = uri.strip_prefix("https://") else { return false };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    host == "youtube.com" || host.ends_with(".youtube.com")
 }
 
 unsafe fn read_cookies(list: &ICoreWebView2CookieList) -> windows::core::Result<Cookies> {
