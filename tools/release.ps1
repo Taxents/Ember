@@ -42,7 +42,9 @@ git fetch origin main --quiet
 if ((git rev-parse HEAD) -ne (git rev-parse origin/main)) { throw "main isn't the same as origin/main; pull or push first" }
 
 $toml = "app/Cargo.toml"
-(Get-Content $toml) -replace '^version = ".*"', "version = `"$Version`"" | Set-Content $toml -Encoding utf8NoBOM
+# UTF-8 without a BOM, in Windows PowerShell 5.1 too (it has no -Encoding utf8NoBOM).
+$lines = (Get-Content $toml) -replace '^version = ".*"', "version = `"$Version`""
+[IO.File]::WriteAllLines((Resolve-Path $toml), $lines, [Text.UTF8Encoding]::new($false))
 cargo check -p music-app --quiet   # updates Cargo.lock
 git add $toml Cargo.lock
 git commit -m "Release $Version"
