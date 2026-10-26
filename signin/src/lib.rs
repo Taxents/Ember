@@ -207,7 +207,9 @@ fn run(profile_dir: &std::path::Path) -> Result<Cookies, Error> {
 
 /// Whether `uri` is an https page on youtube.com or one of its subdomains.
 fn is_youtube(uri: &str) -> bool {
-    let Some(rest) = uri.strip_prefix("https://") else { return false };
+    let Some(rest) = uri.strip_prefix("https://") else {
+        return false;
+    };
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
     host == "youtube.com" || host.ends_with(".youtube.com")
 }
