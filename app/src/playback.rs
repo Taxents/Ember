@@ -751,6 +751,7 @@ impl App {
         else {
             g.set_np(NowPlaying::default());
             self.discord_tick(&NowPlaying::default());
+            self.accent_song();
             return;
         };
         let px = self.px(BAR_ART);
@@ -775,6 +776,7 @@ impl App {
         g.set_np(np);
         self.reported_playing = None;
         self.stage_song();
+        self.accent_song();
         if let Some(m) = &self.media {
             let art_url = images::url_for(&t.thumbs, 300);
             let album = t.album.as_ref().map(|a| a.name.as_str()).unwrap_or("");
@@ -864,6 +866,12 @@ impl App {
                             g.set_stage_lines(ModelRc::from(f.stage.clone()));
                             g.set_stage_word_timed(lyric_view::word_timed(&f.lyrics));
                             g.set_lyrics_note(SharedString::default());
+                            if std::mem::take(&mut a.lyrics_moved_aside)
+                                && g.get_panel_open()
+                                && g.get_panel_tab() == 1
+                            {
+                                g.set_panel_tab(0);
+                            }
                             a.lyrics = Some(f);
                             a.lyrics_tick();
                         }
@@ -875,7 +883,7 @@ impl App {
     }
 
     /// The playing song has no lyrics: the lyrics controls dim, and a panel showing lyrics shows
-    /// the queue instead (it stays there until Lyrics is chosen again).
+    /// the queue instead (until a song with lyrics plays, or the panel is changed by hand).
     pub(crate) fn no_lyrics(&mut self) {
         let ui = self.ui();
         let g = ui.global::<Ui>();
@@ -883,6 +891,7 @@ impl App {
         g.set_lyrics_missing(true);
         if g.get_panel_open() && g.get_panel_tab() == 0 {
             g.set_panel_tab(1);
+            self.lyrics_moved_aside = true;
         }
     }
 

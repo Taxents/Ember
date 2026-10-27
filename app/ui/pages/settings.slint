@@ -63,7 +63,7 @@ export component SettingsHeading inherits Text {
     letter-spacing: 0.6px;
 }
 
-// Settings: account, updates, playback, lyrics, sidebar, storage.
+// Settings: account, updates, appearance, playback, lyrics, sidebar, storage.
 export component SettingsPage inherits Rectangle {
     property <bool> hidden-open;
     property <bool> confirm-clear;
@@ -134,6 +134,29 @@ export component SettingsPage inherits Rectangle {
                     primary: false;
                     clicked => {
                         Ui.check-updates();
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 24px;
+            }
+
+            SettingsHeading {
+                text: "APPEARANCE";
+            }
+
+            SettingRow {
+                title: "Accent from artwork";
+                PillButton {
+                    text: Ui.song-accent ? "On" : "Off";
+                    primary: Ui.song-accent;
+                    accessible-role: switch;
+                    accessible-checkable: true;
+                    accessible-checked: Ui.song-accent;
+                    clicked => {
+                        Ui.song-accent = !Ui.song-accent;
+                        Ui.song-accent-changed(Ui.song-accent);
                     }
                 }
             }

@@ -80,8 +80,9 @@ pub struct Query<'a> {
     pub third_party: bool,
 }
 
-/// Cache format; a change here invalidates old files.
-const CACHE_VERSION: u64 = 1;
+/// Cache format; a change here invalidates old files. 2: YouTube's lines without times were kept
+/// as line-timed, all at 0:00.
+const CACHE_VERSION: u64 = 2;
 /// Misses and line-timed finds are retried after a week (Unison grows); word-timed ones keep.
 const RETRY_SECS: u64 = 7 * 86_400;
 

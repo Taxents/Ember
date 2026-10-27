@@ -481,6 +481,18 @@ fn timed_lyrics() {
     assert_eq!(source, "Musixmatch");
 }
 
+#[test]
+fn timed_lyrics_without_times_are_not_timed() {
+    let line = |t: &str| serde_json::json!({"lyricLine": t, "cueRange": {}});
+    let v = serde_json::json!({"contents": {"elementRenderer": {"newElement": {"type": {
+        "componentType": {"model": {"timedLyricsModel": {"lyricsData": {
+            "timedLyricsData": [line("One"), line("Two")],
+            "sourceMessage": "Source: LyricFind",
+        }}}}
+    }}}}});
+    assert!(parse::timed_lyrics(&v).is_none());
+}
+
 /// A real Unison TTML file (word and syllable timed, with background vocals).
 #[test]
 fn unison_ttml() {

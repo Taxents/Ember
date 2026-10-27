@@ -115,6 +115,8 @@ impl App {
     pub(crate) fn panel_changed(&mut self) {
         let ui = self.ui();
         let g = ui.global::<Ui>();
+        // Changed by hand: it stays as chosen.
+        self.lyrics_moved_aside = false;
         self.settings.panel_open = g.get_panel_open();
         self.settings.panel_tab = g.get_panel_tab();
         self.save_later();

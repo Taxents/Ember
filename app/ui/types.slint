@@ -308,6 +308,9 @@ export global Ui {
     // "Show what you're listening to on Discord".
     in-out property <bool> discord: true;
     callback discord-changed(bool);
+    // "Accent from artwork": the accent follows the playing song's cover.
+    in-out property <bool> song-accent: true;
+    callback song-accent-changed(bool);
 
     // "Listening history": plays are logged for the Artists page's stats, and clearing them.
     in-out property <bool> listening-history: true;

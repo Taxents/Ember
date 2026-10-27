@@ -279,6 +279,10 @@ struct App {
     hearing: Option<playback::Hearing>,
     /// Lyrics were shown this session (see [`App::lyrics_wanted`]).
     lyrics_opened: bool,
+    /// A song without lyrics moved the panel from Lyrics to the queue; the next song with lyrics
+    /// moves it back (unless the panel was changed by hand since).
+    lyrics_moved_aside: bool,
+    accent: stage::Accent,
     /// A request failed on the network; `offline_timer` checks until one gets through.
     offline: bool,
     offline_timer: Timer,
@@ -403,6 +407,8 @@ fn main() {
         listens: Arc::new(stats::Log::load()),
         hearing: None,
         lyrics_opened: false,
+        lyrics_moved_aside: false,
+        accent: Default::default(),
         offline: false,
         offline_timer: Timer::default(),
         stage: Default::default(),
@@ -581,6 +587,13 @@ fn wire(ui: &AppWindow) {
             a.settings.discord = on;
             a.save_later();
             a.tick();
+        });
+    });
+    g.on_song_accent_changed(|on| {
+        with(|a| {
+            a.settings.song_accent = on;
+            a.save_later();
+            a.accent_song();
         });
     });
     g.on_listening_history_changed(|on| {
@@ -843,6 +856,7 @@ impl App {
             std::sync::atomic::Ordering::Relaxed,
         );
         g.set_discord(self.settings.discord);
+        g.set_song_accent(self.settings.song_accent);
         discord::set_enabled(self.settings.discord);
         g.set_panel_open(self.settings.panel_open);
         g.set_panel_tab(self.settings.panel_tab);

@@ -425,6 +425,137 @@ fn default_look(ui: &crate::AppWindow) -> StageLook {
     }
 }
 
+// ---- the app's accent ------------------------------------------------------------------------
+
+/// How long the accent takes to fade from one song's to the next.
+const ACCENT_FADE: Duration = Duration::from_millis(600);
+
+#[derive(Default)]
+pub(crate) struct Accent {
+    /// The song it's for (or being made for); empty when it's Ember's own.
+    song: String,
+    /// The fade: from, to, and when it began.
+    from: [f32; 3],
+    to: [f32; 3],
+    began: Option<Instant>,
+    timer: Timer,
+}
+
+impl App {
+    /// The accent follows the playing song's cover, when Settings says so; otherwise (and with
+    /// nothing playing) it's Ember's amber. The last song's stays until the new one's is made.
+    pub(crate) fn accent_song(&mut self) {
+        let t = self
+            .player
+            .current()
+            .filter(|_| self.settings.song_accent)
+            .and_then(|id| self.known.get(id))
+            .cloned();
+        let url = t
+            .as_ref()
+            .and_then(|t| images::url_for(&t.thumbs, self.px(crate::BAR_ART)));
+        let (Some(t), Some(url)) = (t, url) else {
+            self.accent.song.clear();
+            self.set_accent(TUNGSTEN);
+            return;
+        };
+        if self.accent.song == t.video_id {
+            return;
+        }
+        self.accent.song = t.video_id.clone();
+        let id = t.video_id;
+        workers::spawn_art(
+            move || {
+                let accent = images::decoded(&url).map_or(TUNGSTEN, |img| app_accent(&img));
+                let _ = slint::invoke_from_event_loop(move || {
+                    with(|a| {
+                        if a.accent.song == id {
+                            a.set_accent(accent);
+                        }
+                    });
+                });
+            },
+            true,
+        );
+    }
+
+    /// Fades the accent to `c` (at once, with reduced motion).
+    fn set_accent(&mut self, c: [f32; 3]) {
+        let now = self.ui().global::<Theme>().get_amber();
+        let now = [now.red(), now.green(), now.blue()].map(|x| x as f32 / 255.0);
+        if now == c.map(|x| (x.clamp(0.0, 1.0) * 255.0).round() / 255.0) {
+            return;
+        }
+        if win::reduced_motion() {
+            self.accent.timer.stop();
+            self.show_accent(c);
+            return;
+        }
+        self.accent.from = now;
+        self.accent.to = c;
+        self.accent.began = Some(Instant::now());
+        if !self.accent.timer.running() {
+            self.accent
+                .timer
+                .start(TimerMode::Repeated, Duration::from_millis(16), || {
+                    with(|a| a.accent_step());
+                });
+        }
+    }
+
+    fn accent_step(&mut self) {
+        let t = self
+            .accent
+            .began
+            .map_or(1.0, |b| {
+                b.elapsed().as_secs_f32() / ACCENT_FADE.as_secs_f32()
+            })
+            .min(1.0);
+        if t >= 1.0 {
+            self.accent.timer.stop();
+        }
+        // Ease in and out.
+        let e = t * t * (3.0 - 2.0 * t);
+        self.show_accent(mix(self.accent.from, self.accent.to, e));
+    }
+
+    fn show_accent(&self, c: [f32; 3]) {
+        let [r, g, b] = c.map(|x| (x.clamp(0.0, 1.0) * 255.0).round() as u8);
+        self.ui()
+            .global::<Theme>()
+            .set_amber(Color::from_rgb_u8(r, g, b));
+    }
+}
+
+/// The hue of the danger colour (#E8806A), which the accent keeps clear of.
+const DANGER_HUE: f32 = 10.0;
+
+/// The cover's accent made fit for the app: the stage's accent, kept off the danger colour's
+/// red and bright enough to read as text on the dark page.
+fn app_accent(img: &RgbaImage) -> [f32; 3] {
+    let ([_, _, accent, _], _) = palette(img);
+    let (h, s, v) = hsv(accent);
+    let mut c = if s > 0.15 && hue_apart(h, DANGER_HUE) < 22.0 {
+        // Reds go rose or amber, whichever they're nearer.
+        let away = if (h - DANGER_HUE).rem_euclid(360.0) > 180.0 {
+            340.0
+        } else {
+            32.0
+        };
+        from_hsv(away, s, v)
+    } else {
+        accent
+    };
+    let ivory = [241.0 / 255.0, 229.0 / 255.0, 210.0 / 255.0];
+    for _ in 0..10 {
+        if lum(c) >= 0.55 {
+            break;
+        }
+        c = mix(c, ivory, 0.15);
+    }
+    c
+}
+
 // ---- light ------------------------------------------------------------------------------------
 
 /// The music as light. Each band is measured against its own recent peak (so quiet songs light
@@ -852,6 +983,20 @@ mod tests {
         assert!(hsv(deep).2 < 0.2);
         assert!(hue_apart(hsv(key).0, hsv(fill).0) > 30.0);
         assert!(lum(accent) > 0.5);
+    }
+
+    #[test]
+    fn app_accent_reads_and_keeps_off_red() {
+        for rgb in [[200, 20, 20], [10, 20, 160], [30, 30, 30], [40, 200, 90]] {
+            let img = solid(64, 64, |x, _| if x < 32 { rgb } else { [15, 12, 10] });
+            let a = app_accent(&img);
+            assert!(lum(a) >= 0.55, "{rgb:?} gave {a:?}");
+            let (h, s, _) = hsv(a);
+            assert!(
+                s <= 0.15 || hue_apart(h, DANGER_HUE) >= 22.0,
+                "{rgb:?} gave {a:?}"
+            );
+        }
     }
 
     #[test]

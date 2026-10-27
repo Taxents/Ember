@@ -1256,7 +1256,8 @@ pub fn lyrics(v: &Value) -> Option<(String, String)> {
 /// A timed lyric line: start and end in milliseconds, and the words.
 pub type TimedLine = (u64, u64, String);
 
-/// The Android app's timed lyrics, in order, and their source ("Musixmatch").
+/// The Android app's timed lyrics, in order, and their source ("Musixmatch"). Lines given
+/// without times (it happens) aren't timed lyrics at all: `None`, for the plain ones to stand in.
 pub fn timed_lyrics(v: &Value) -> Option<(Vec<TimedLine>, String)> {
     let d = &v["contents"]["elementRenderer"]["newElement"]["type"]["componentType"]["model"]["timedLyricsModel"]
         ["lyricsData"];
@@ -1277,7 +1278,7 @@ pub fn timed_lyrics(v: &Value) -> Option<(Vec<TimedLine>, String)> {
             })
         })
         .collect();
-    if lines.is_empty() {
+    if !lines.iter().any(|l| l.1 > 0) {
         return None;
     }
     lines.sort_by_key(|l| l.0);
