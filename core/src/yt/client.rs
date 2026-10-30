@@ -10,7 +10,7 @@ use super::session::{ORIGIN, Session};
 use crate::{Error, Result, net};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 
 const API: &str = "https://music.youtube.com/youtubei/v1";
@@ -27,6 +27,9 @@ pub struct Client {
     session: RwLock<Option<Session>>,
     /// A signed-in call came back signed out (or 401): the session no longer works.
     expired: AtomicBool,
+    /// Counts session changes, so a late reply to a call made with an earlier session can't
+    /// mark the current one expired.
+    epoch: AtomicU64,
     /// "Not interested" token → the token that undoes it, from the pages seen.
     undo: Mutex<HashMap<String, String>>,
 }
@@ -44,6 +47,7 @@ impl Client {
         Client {
             session: RwLock::new(session),
             expired: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
             undo: Mutex::new(HashMap::new()),
         }
     }
@@ -58,14 +62,28 @@ impl Client {
     }
 
     pub fn set_session(&self, s: Option<Session>) {
-        *self.session.write().unwrap() = s;
+        let mut session = self.session.write().unwrap();
+        *session = s;
+        self.epoch.fetch_add(1, Ordering::Relaxed);
         self.expired.store(false, Ordering::Relaxed);
     }
 
-    /// A signed-in call found the session signed out (YouTube said `loggedOut`, or HTTP 401):
-    /// the cookies have expired or were revoked. Cleared by `set_session`.
+    /// A signed-in call found the session signed out (YouTube answered as to a guest, or HTTP
+    /// 401): the cookies have expired or were revoked. Cleared by `set_session`.
     pub fn session_expired(&self) -> bool {
         self.expired.load(Ordering::Relaxed)
+    }
+
+    /// Whether the session still signs in, asked of YouTube: its account menu shows an account.
+    /// When it does, the reply that seemed signed out was a false alarm, and is forgotten.
+    pub fn recheck(&self) -> bool {
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        let ok = self.account().is_ok();
+        let _current = self.session.read().unwrap();
+        if ok && self.epoch.load(Ordering::Relaxed) == epoch {
+            self.expired.store(false, Ordering::Relaxed);
+        }
+        ok
     }
 
     /// POST to `endpoint` with the client context added. `query` is appended to the URL
@@ -76,7 +94,10 @@ impl Client {
             "user": {},
         });
         let url = format!("{API}/{endpoint}?prettyPrint=false{query}");
-        let session = self.session.read().unwrap().clone();
+        let (session, epoch) = {
+            let s = self.session.read().unwrap();
+            (s.clone(), self.epoch.load(Ordering::Relaxed))
+        };
         let (cookie, auth);
         let mut headers: Vec<(&str, &str)> = vec![
             ("User-Agent", net::BROWSER_UA),
@@ -93,8 +114,14 @@ impl Client {
             headers.push(("X-Goog-AuthUser", "0"));
         }
         let r = net::post_json(&url, &headers, &body);
-        if session.is_some() && signed_out(&r) && !self.expired.swap(true, Ordering::Relaxed) {
-            log::warn!("youtube: the session is signed out ({endpoint})");
+        if session.is_some() && signed_out(&r) {
+            // Held so the session can't change between the check and the mark.
+            let _current = self.session.read().unwrap();
+            if self.epoch.load(Ordering::Relaxed) == epoch
+                && !self.expired.swap(true, Ordering::Relaxed)
+            {
+                log::warn!("youtube: the session is signed out ({endpoint})");
+            }
         }
         r
     }
@@ -736,10 +763,20 @@ fn watch_body(video_id: Option<&str>, playlist_id: Option<&str>, params: Option<
     body
 }
 
-/// A reply that shows the session no longer signs in: HTTP 401, or YouTube saying `loggedOut`.
+/// A reply that shows the session no longer signs in: HTTP 401, or YouTube answering as to a
+/// guest (`logged_in` 0 among its tracking params; `loggedOut` on www.youtube.com).
 fn signed_out(r: &Result<Value>) -> bool {
     match r {
-        Ok(v) => v["responseContext"]["mainAppWebResponseContext"]["loggedOut"] == true,
+        Ok(v) => {
+            let rc = &v["responseContext"];
+            rc["mainAppWebResponseContext"]["loggedOut"] == true
+                || rc["serviceTrackingParams"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|s| s["params"].as_array().into_iter().flatten())
+                    .any(|p| p["key"] == "logged_in" && p["value"] == "0")
+        }
         Err(Error::Net(m)) => m.starts_with("HTTP 401 "),
         Err(_) => false,
     }
@@ -824,6 +861,16 @@ mod tests {
         let ok = json!({"responseContext": {"mainAppWebResponseContext": {"loggedOut": false}}});
         assert!(signed_out(&Ok(out)));
         assert!(!signed_out(&Ok(ok)));
+        // YouTube Music's own replies say it among their tracking params.
+        let tracking = |v: &str| {
+            json!({"responseContext": {"serviceTrackingParams": [
+                {"service": "CSI", "params": [{"key": "c", "value": "WEB_REMIX"}]},
+                {"service": "GFEEDBACK", "params": [{"key": "logged_in", "value": v}]},
+            ]}})
+        };
+        assert!(signed_out(&Ok(tracking("0"))));
+        assert!(!signed_out(&Ok(tracking("1"))));
+        assert!(!signed_out(&Ok(json!({"responseContext": {}}))));
         assert!(signed_out(&Err(Error::Net(
             "HTTP 401 from music.youtube.com".into()
         ))));

@@ -358,6 +358,8 @@ impl App {
         if generation != self.generation {
             return;
         }
+        // YouTube answered as to a guest: the session has died since the last page.
+        let signed_out = self.session_check();
         let ui = self.ui();
         let g = ui.global::<Ui>();
         let mut page = g.get_page();
@@ -424,9 +426,7 @@ impl App {
                         self.went_offline();
                         "Couldn't load this page. Check your connection."
                     }
-                    _ if self.session_check() => {
-                        "YouTube signed you out. Sign in to see this page."
-                    }
+                    _ if signed_out => "YouTube signed you out. Sign in to see this page.",
                     _ => "Couldn't load this page.",
                 }
                 .into();

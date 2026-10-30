@@ -235,14 +235,16 @@ struct App {
     library_wish: Vec<(String, Option<PlaylistCard>)>,
     playlist_rows: Rc<VecModel<SidebarPlaylist>>,
     account: Option<Account>,
+    /// Bumped on each sign-in and sign-out: a renewal that finishes after one is ignored.
+    account_seq: u64,
+    /// The sign-in browser is renewing a session YouTube turned away.
+    renewing: bool,
 
     /// Seek to this once the restored track starts.
     resume_at: Option<u64>,
     minimized: bool,
     /// A pause (`false`) or resume (`true`) asked of the engine and when, shown until it's taken.
     toggled: Option<(bool, std::time::Instant)>,
-    /// The signed-out toast was shown for the current expiry.
-    told_expired: bool,
     /// Runs while skips come quickly; when it ends, the song they stopped at plays.
     skip_timer: Timer,
     /// Skips moved past songs without playing them (see [`App::skip`]).
@@ -369,6 +371,8 @@ fn main() {
         stats_timer: Timer::default(),
         play_seq: 0,
         playlists_seq: 0,
+        account_seq: 0,
+        renewing: false,
         library_wish: Vec::new(),
         page_cache: HashMap::new(),
         opened_from: None,
@@ -386,7 +390,6 @@ fn main() {
         resume_at: None,
         minimized: false,
         toggled: None,
-        told_expired: false,
         skip_timer: Timer::default(),
         skip_pending: false,
         waiting_since: None,
@@ -421,8 +424,13 @@ fn main() {
     workers::spawn(images::prune_disk);
     update::clean_up();
     update::watch(update::show);
-    // A sign-in that crashed or was killed leaves a browser profile holding Google cookies.
-    workers::spawn(|| signin::clean_up(&webview_dir()));
+    // Browser profiles hold Google cookies: only the one kept to renew a stored session stays
+    // (crashed sign-ins and earlier versions leave others).
+    let signed_in = with(|a| a.client.signed_in()).unwrap_or(false);
+    workers::spawn(move || match signed_in {
+        true => signin::clean_up(&webview_dir()),
+        false => signin::forget(&webview_dir()),
+    });
 
     // Window handle work needs the native window, which exists once the event loop runs.
     let _ = slint::invoke_from_event_loop(|| {

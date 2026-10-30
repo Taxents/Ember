@@ -85,6 +85,8 @@ impl App {
         let ui = self.ui();
         let g = ui.global::<Ui>();
         g.set_signing_in(true);
+        self.account_seq += 1;
+        self.renewing = false;
         let client = self.client.clone();
         // The sign-in window runs its own message loop on its own thread.
         std::thread::spawn(move || {
@@ -113,6 +115,9 @@ impl App {
     pub(crate) fn sign_out(&mut self) {
         Session::delete();
         self.client.set_session(None);
+        self.account_seq += 1;
+        self.renewing = false;
+        workers::spawn(|| signin::forget(&webview_dir()));
         self.account_changed();
         self.navigate(Route {
             kind: PageKind::Home,
@@ -150,7 +155,10 @@ impl App {
                         a.account = Some(acc);
                         a.account_images();
                     }
-                    Err(e) => log::warn!("account: {e}"),
+                    Err(e) => {
+                        log::warn!("account: {e}");
+                        a.session_check();
+                    }
                 });
             },
         );
@@ -345,9 +353,8 @@ impl App {
         retry: Option<toast::Then>,
     ) {
         log::warn!("{what}: {e}");
-        if self.session_check() {
-            return;
-        }
+        // A session YouTube turned away gets renewed: Retry works again once it has.
+        self.session_check();
         let msg = match e {
             music_core::Error::Net(_) => {
                 self.went_offline();
@@ -407,18 +414,71 @@ impl App {
         );
     }
 
-    /// YouTube has signed this session out (cookies expired or revoked): say so once, with a
-    /// way to sign in again. True when it has.
+    /// YouTube has turned this session away (its cookies expired or were revoked): the sign-in
+    /// browser renews it unseen. True when the session is out of use.
     pub(crate) fn session_check(&mut self) -> bool {
         if !self.client.session_expired() {
-            self.told_expired = false;
             return false;
         }
-        if !self.told_expired {
-            self.told_expired = true;
-            self.notify_with("YouTube signed you out", "Sign in", |a| a.sign_in());
+        if !self.renewing {
+            self.renew_session();
         }
         true
+    }
+
+    /// Has the browser kept from signing in renew the session's cookies, and takes them once
+    /// YouTube accepts them (showing your account and the page again). When it can't, the
+    /// session is forgotten, so the app shows you signed out rather than signed in with nothing
+    /// to show, and a toast offers to sign in again.
+    fn renew_session(&mut self) {
+        self.renewing = true;
+        let seq = self.account_seq;
+        let client = self.client.clone();
+        // The browser runs its own message loop on its own thread.
+        std::thread::spawn(move || {
+            // Your account still showing: one odd reply, not the session dying.
+            let r = if client.recheck() {
+                Ok(None)
+            } else {
+                signin::renew(&webview_dir())
+                    .map_err(|e| e.to_string())
+                    .and_then(|c| Session::new(c).map_err(|e| e.to_string()))
+                    .and_then(|s| {
+                        Client::new(Some(s.clone()))
+                            .account()
+                            .map_err(|e| format!("still turned away: {e}"))?;
+                        Ok(Some(s))
+                    })
+            };
+            let _ = slint::invoke_from_event_loop(move || {
+                with(|a| {
+                    // Signed in or out meanwhile: that's the session now.
+                    if seq != a.account_seq {
+                        return;
+                    }
+                    a.renewing = false;
+                    match r {
+                        Ok(None) => {}
+                        Ok(Some(s)) => {
+                            log::info!("session renewed");
+                            if let Err(e) = s.save() {
+                                log::warn!("session: {e}");
+                            }
+                            a.client.set_session(Some(s));
+                            a.account_changed();
+                            a.reload();
+                        }
+                        Err(e) => {
+                            log::warn!("session renewal: {e}");
+                            Session::delete();
+                            a.client.set_session(None);
+                            a.account_changed();
+                            a.notify_with("YouTube signed you out", "Sign in", |a| a.sign_in());
+                        }
+                    }
+                });
+            });
+        });
     }
 
     /// One of the sidebar's playlists that you made (its byline is your name).
