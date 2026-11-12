@@ -956,13 +956,13 @@ mod tests {
     fn atmosphere_stays_dark() {
         let img = solid(300, 300, |_, _| [255, 255, 255]);
         let (colors, layout) = palette(&img);
-        let a = atmosphere(Some(&img), None, &colors, layout);
+        let a = atmosphere(Some(&img), &colors, layout);
         assert_eq!(a.dimensions(), (BACK_W, BACK_H));
         assert!(
             a.pixels()
                 .all(|p| p.0[0] <= 132 && p.0[1] <= 132 && p.0[2] <= 132)
         );
-        let none = atmosphere(None, None, &colors, layout);
+        let none = atmosphere(None, &colors, layout);
         assert_eq!(none.dimensions(), (BACK_W, BACK_H));
     }
 
