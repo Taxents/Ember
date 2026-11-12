@@ -35,12 +35,6 @@ static LOGO: Kind = Kind {
     cache: Mutex::new(None),
     pick: best_logo,
 };
-/// Wide photos of the artist, behind the stage.
-static BACKDROP: Kind = Kind {
-    file: "backdrops-v1.json",
-    cache: Mutex::new(None),
-    pick: best_backdrop,
-};
 
 impl Kind {
     fn cache(&self) -> std::sync::MutexGuard<'_, Option<Cache>> {
@@ -61,12 +55,6 @@ pub fn known(name: &str, channel: Option<&str>) -> Option<Option<String>> {
 /// The logo's URL for an artist, if there is one. Blocks (network); call on a worker.
 pub fn find(name: &str, channel: Option<&str>) -> Option<String> {
     find_in(&LOGO, name, channel)
-}
-
-/// A wide photo of the artist (fanart.tv's `artistbackground`), if there is one, found the same
-/// sure way as logos. Blocks (network); call on a worker.
-pub fn backdrop(name: &str, channel: Option<&str>) -> Option<String> {
-    find_in(&BACKDROP, name, channel)
 }
 
 fn known_in(kind: &Kind, name: &str, channel: Option<&str>) -> Option<Option<String>> {
@@ -168,25 +156,6 @@ fn best_logo(v: &Value) -> Option<String> {
             })
     };
     pick("hdmusiclogo").or_else(|| pick("musiclogo"))
-}
-
-/// The best liked of the artist's wide photos (with likes equal, the newest): unlike logos,
-/// photos vary a lot, and the liked ones are the good ones.
-fn best_backdrop(v: &Value) -> Option<String> {
-    let n = |l: &Value, k: &str| {
-        l[k].as_str()
-            .and_then(|n| n.parse::<u64>().ok())
-            .unwrap_or(0)
-    };
-    v["artistbackground"]
-        .as_array()?
-        .iter()
-        .max_by_key(|l| (n(l, "likes"), n(l, "id")))
-        .and_then(|l| l["url"].as_str())
-        .map(|u| match u.strip_prefix("http://") {
-            Some(rest) => format!("https://{rest}"),
-            None => u.to_string(),
-        })
 }
 
 fn loose(s: &str) -> String {

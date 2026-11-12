@@ -2,14 +2,12 @@
 //!
 //! The window itself becomes the stage: frameless over one display's work area (the taskbar
 //! stays, and nothing is exclusive full screen), and back where it was on leaving. Its room is lit
-//! by the song: the artwork (and, when fanart.tv has one, a photo of the artist) made into a soft
+//! by the song: the artwork made into a soft
 //! field of colour on a worker, a palette for the lights, and the engine's four meter bands turned
 //! into slow, musical light (see [`Light`]). Lyrics are the window's own (`lyric_view`), shown
 //! word by word.
 
-use crate::{
-    App, StageLight, StageLook, Theme, Ui, image_loaded, images, logos, win, with, workers,
-};
+use crate::{App, StageLight, StageLook, Theme, Ui, image_loaded, images, win, with, workers};
 use image::RgbaImage;
 use slint::{
     Color, ComponentHandle, Image, Model, Rgba8Pixel, SharedPixelBuffer, Timer, TimerMode,
@@ -35,8 +33,8 @@ pub struct Stage {
     look_for: String,
     /// The large artwork asked for.
     art_url: Option<String>,
-    /// Looks made lately, newest last: (video id, look, made with the artist's photo).
-    looks: Vec<(String, Look, bool)>,
+    /// Looks made lately, newest last: (video id, look).
+    looks: Vec<(String, Look)>,
     light: Light,
     last_step: Option<Instant>,
     /// Draws the stage once per refresh of its display while the song plays (see `stage_frame`).
@@ -231,54 +229,24 @@ impl App {
         }
         self.stage.look_for = t.video_id.clone();
         if let Some(i) = self.stage.looks.iter().position(|l| l.0 == t.video_id) {
-            let (id, look, full) = self.stage.looks.remove(i);
+            let (id, look) = self.stage.looks.remove(i);
             self.stage_show(&look);
-            self.stage.looks.push((id, look, full));
-            if full {
-                return;
-            }
+            self.stage.looks.push((id, look));
+            return;
         }
         let id = t.video_id.clone();
-        let cover = url;
-        let artist = t.artists.first().cloned().or(t.channel.clone());
-        let c = cover.clone();
-        let first = id.clone();
-        // The artwork alone first (quick); then, when there's a photo of the artist, again with it.
         workers::spawn_art(
             move || {
-                let made = make(c.as_deref(), None);
+                let made = make(url.as_deref());
                 let _ = slint::invoke_from_event_loop(move || {
-                    with(|a| a.stage_made(&first, made, false));
+                    with(|a| a.stage_made(&id, made));
                 });
             },
             true,
         );
-        let Some(artist) = artist else {
-            return;
-        };
-        workers::run_background(
-            move || logos::backdrop(&artist.name, artist.id.as_deref()),
-            move |found| {
-                let Some(photo) = found else {
-                    return;
-                };
-                if with(|a| a.stage.look_for == id) != Some(true) {
-                    return;
-                }
-                workers::spawn_art(
-                    move || {
-                        let made = make(cover.as_deref(), Some(&photo));
-                        let _ = slint::invoke_from_event_loop(move || {
-                            with(|a| a.stage_made(&id, made, true));
-                        });
-                    },
-                    false,
-                );
-            },
-        );
     }
 
-    fn stage_made(&mut self, id: &str, made: Made, full: bool) {
+    fn stage_made(&mut self, id: &str, made: Made) {
         let c = |k: usize| {
             let [r, g, b] = made.colors[k].map(|x| (x.clamp(0.0, 1.0) * 255.0).round() as u8);
             Color::from_rgb_u8(r, g, b)
@@ -292,7 +260,7 @@ impl App {
             layout: made.layout,
         };
         self.stage.looks.retain(|l| l.0 != id);
-        self.stage.looks.push((id.to_string(), look.clone(), full));
+        self.stage.looks.push((id.to_string(), look.clone()));
         if self.stage.looks.len() > LOOKS_KEPT {
             self.stage.looks.remove(0);
         }
@@ -640,11 +608,10 @@ impl Light {
 
 // ---- the look -------------------------------------------------------------------------------
 
-/// The atmosphere and palette from the cover at `cover` (and the artist's photo at `photo`).
+/// The atmosphere and palette from the cover at `cover`.
 /// Without a cover (none, or it didn't load) the room is made from Ember's own colours.
-fn make(cover: Option<&str>, photo: Option<&str>) -> Made {
+fn make(cover: Option<&str>) -> Made {
     let cover = cover.and_then(images::decoded);
-    let photo = photo.and_then(images::decoded);
     let (colors, layout) = match &cover {
         Some(c) => palette(c),
         None => (
@@ -652,7 +619,7 @@ fn make(cover: Option<&str>, photo: Option<&str>) -> Made {
             0,
         ),
     };
-    let back = atmosphere(cover.as_ref(), photo.as_ref(), &colors, layout);
+    let back = atmosphere(cover.as_ref(), &colors, layout);
     Made {
         back: SharedPixelBuffer::clone_from_slice(back.as_raw(), back.width(), back.height()),
         colors,
@@ -833,15 +800,9 @@ fn palette(img: &RgbaImage) -> ([[f32; 3]; 4], i32) {
     ([light(key), light(fill), accent, deep], layout)
 }
 
-/// The cover as a dark room's worth of soft colour, 16:9, with the artist's photo faintly in it
-/// when there is one (tinted by the key light, as if lit by it). Dark enough that white words
+/// The cover as a dark room's worth of soft colour, 16:9. Dark enough that white words
 /// always read over it, vignetted, and dithered so its gradients don't band.
-fn atmosphere(
-    cover: Option<&RgbaImage>,
-    photo: Option<&RgbaImage>,
-    colors: &[[f32; 3]; 4],
-    layout: i32,
-) -> RgbaImage {
+fn atmosphere(cover: Option<&RgbaImage>, colors: &[[f32; 3]; 4], layout: i32) -> RgbaImage {
     use image::imageops::{FilterType, blur, crop_imm, resize};
     let n = (BACK_W * BACK_H) as usize;
     let mut out: Vec<[f32; 3]> = match cover {
@@ -877,25 +838,6 @@ fn atmosphere(
     for c in &mut out {
         let l = lum(*c);
         *c = [0, 1, 2].map(|i| ((l + (c[i] - l) * 1.3) * gain).clamp(0.0, 0.5));
-    }
-    if let Some(p) = photo {
-        // Cut to 16:9 keeping the upper part (where faces are), slightly softened.
-        let (w, h) = p.dimensions();
-        let (cw, ch) = if w * 9 > h * 16 {
-            (h * 16 / 9, h)
-        } else {
-            (w, w * 9 / 16)
-        };
-        let crop = crop_imm(p, (w - cw) / 2, (h - ch) / 4, cw.max(1), ch.max(1)).to_image();
-        let photo = blur(&resize(&crop, BACK_W, BACK_H, FilterType::Triangle), 1.2);
-        let tint = colors[0];
-        for (c, q) in out.iter_mut().zip(photo.pixels()) {
-            let l = lum([0, 1, 2].map(|i| q.0[i] as f32 / 255.0)).powf(1.3);
-            for i in 0..3 {
-                let lit = l * (0.32 * tint[i] + 0.12);
-                c[i] = (c[i] * 0.72 + lit).min(0.5);
-            }
-        }
     }
     let mut seed = 0x2545_F491u32;
     let mut img = RgbaImage::new(BACK_W, BACK_H);
